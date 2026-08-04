@@ -1,0 +1,1239 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<meta name="robots" content="noindex, nofollow">
+<title>Starmap — BlueSpace</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='13' fill='none' stroke='%232563eb' stroke-width='2.5'/%3E%3Ccircle cx='16' cy='16' r='4' fill='%232563eb'/%3E%3C/svg%3E">
+<style>
+/* ---------------------------------------------------------------------------
+   Starmap — the captain's cockpit. Calm by default, loud only when something
+   needs a human. Light and dark are both first-class.
+   --------------------------------------------------------------------------- */
+:root {
+  --bg: #f6f7f9;
+  --bg-sub: #eef0f3;
+  --surface: #ffffff;
+  --surface-2: #f9fafb;
+  --border: #e2e5ea;
+  --border-strong: #cfd4dc;
+  --text: #10151b;
+  --text-2: #4a5462;
+  --text-3: #78828f;
+  --accent: #2563eb;
+  --accent-soft: #e7eeff;
+  --focus: #2563eb;
+  --shadow: 0 1px 2px rgba(16,21,27,.05), 0 4px 16px rgba(16,21,27,.05);
+  --shadow-lift: 0 2px 4px rgba(16,21,27,.06), 0 12px 32px rgba(16,21,27,.10);
+
+  --s-queued: #7b8794;
+  --s-dispatched: #6366f1;
+  --s-working: #2563eb;
+  --s-awaiting: #d97706;
+  --s-verifying: #8b5cf6;
+  --s-rework: #ea580c;
+  --s-ready: #0d9488;
+  --s-landed: #16a34a;
+  --s-failed: #dc2626;
+  --s-cancelled: #9aa3ad;
+
+  --add-bg: #e8f7ee;
+  --add-fg: #10693a;
+  --add-gut: #b6e3c8;
+  --del-bg: #fdeced;
+  --del-fg: #a3212a;
+  --del-gut: #f3bcc0;
+
+  --radius: 12px;
+  --radius-sm: 8px;
+  /* Measured at runtime; the fallback matches the unwrapped desktop header. */
+  --chrome-h: 100px;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  --sans: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, "Helvetica Neue", Arial, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0c0f13;
+    --bg-sub: #11151a;
+    --surface: #151a20;
+    --surface-2: #1a2027;
+    --border: #262d36;
+    --border-strong: #38414c;
+    --text: #e7ebef;
+    --text-2: #a3adb9;
+    --text-3: #7b8593;
+    --accent: #6f9dff;
+    --accent-soft: #17233c;
+    --focus: #6f9dff;
+    --shadow: 0 1px 2px rgba(0,0,0,.4), 0 4px 16px rgba(0,0,0,.3);
+    --shadow-lift: 0 2px 4px rgba(0,0,0,.45), 0 12px 32px rgba(0,0,0,.45);
+
+    --s-queued: #8b95a1;
+    --s-dispatched: #8b8dfb;
+    --s-working: #62a0ff;
+    --s-awaiting: #f0b429;
+    --s-verifying: #b18cff;
+    --s-rework: #fb923c;
+    --s-ready: #2dd4bf;
+    --s-landed: #4ade80;
+    --s-failed: #f87171;
+    --s-cancelled: #6b7684;
+
+    --add-bg: #102a1b;
+    --add-fg: #6ee7a0;
+    --add-gut: #1d5334;
+    --del-bg: #2d1417;
+    --del-fg: #ff9ba2;
+    --del-gut: #5a2126;
+  }
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  overflow-wrap: anywhere;
+}
+button, input, textarea, select { font: inherit; color: inherit; }
+:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; border-radius: 4px; }
+::selection { background: var(--accent-soft); }
+
+/* ---- header ----------------------------------------------------------------
+   Header and tabs stick together as one block. Sticking them separately at
+   top:0 would stack them on top of each other the moment the page scrolled.
+   `--chrome-h` is measured at runtime so sticky content below can clear it. */
+.chrome { position: sticky; top: 0; z-index: 40; }
+.top {
+  display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+  padding: 12px max(16px, env(safe-area-inset-left)) 12px max(16px, env(safe-area-inset-right));
+  background: color-mix(in srgb, var(--bg) 88%, transparent);
+  backdrop-filter: saturate(180%) blur(12px);
+  border-bottom: 1px solid var(--border);
+}
+.brand { display: flex; align-items: center; gap: 10px; margin-right: auto; min-width: 0; }
+.brand .glyph {
+  width: 22px; height: 22px; border-radius: 50%;
+  border: 2.5px solid var(--accent); position: relative; flex: none;
+}
+.brand .glyph::after {
+  content: ""; position: absolute; inset: 4.5px; border-radius: 50%; background: var(--accent);
+}
+.brand h1 { font-size: 15px; font-weight: 650; letter-spacing: -0.01em; margin: 0; white-space: nowrap; }
+.brand .sub { color: var(--text-3); font-size: 12px; white-space: nowrap; }
+@media (max-width: 560px) { .brand .sub { display: none; } }
+
+.stats { display: flex; align-items: stretch; gap: 8px; flex-wrap: wrap; }
+.stat {
+  display: flex; flex-direction: column; gap: 1px;
+  padding: 5px 12px; border: 1px solid var(--border); border-radius: 10px;
+  background: var(--surface); min-width: 84px;
+}
+.stat .k { font-size: 10.5px; letter-spacing: .05em; text-transform: uppercase; color: var(--text-3); }
+.stat .v { font-size: 15px; font-weight: 620; font-variant-numeric: tabular-nums; letter-spacing: -0.01em; }
+.stat.alert { border-color: color-mix(in srgb, var(--s-awaiting) 55%, var(--border)); background: color-mix(in srgb, var(--s-awaiting) 10%, var(--surface)); }
+.stat.alert .v { color: var(--s-awaiting); }
+.stat.live .v { color: var(--s-working); }
+
+.conn { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-3); padding: 0 2px; }
+.conn .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--s-cancelled); flex: none; }
+.conn[data-mode="live"] .dot { background: var(--s-landed); box-shadow: 0 0 0 3px color-mix(in srgb, var(--s-landed) 22%, transparent); }
+.conn[data-mode="poll"] .dot { background: var(--s-awaiting); }
+.conn[data-mode="down"] .dot { background: var(--s-failed); }
+@media (max-width: 700px) { .conn span.label { display: none; } }
+
+/* ---- tabs ----------------------------------------------------------------- */
+.tabs {
+  display: flex; gap: 2px; overflow-x: auto; scrollbar-width: none;
+  padding: 0 max(10px, env(safe-area-inset-left));
+  background: var(--bg-sub); border-bottom: 1px solid var(--border);
+}
+.tabs::-webkit-scrollbar { display: none; }
+.tab {
+  appearance: none; background: none; border: 0; cursor: pointer;
+  padding: 11px 14px 9px; margin-bottom: -1px;
+  color: var(--text-2); font-size: 13.5px; font-weight: 520; white-space: nowrap;
+  border-bottom: 2px solid transparent; display: flex; align-items: center; gap: 7px;
+}
+.tab:hover { color: var(--text); }
+.tab[aria-selected="true"] { color: var(--text); border-bottom-color: var(--accent); font-weight: 600; }
+.tab .badge {
+  min-width: 18px; padding: 0 5px; height: 18px; border-radius: 9px;
+  background: var(--border); color: var(--text-2);
+  font-size: 11px; font-weight: 650; display: inline-flex; align-items: center; justify-content: center;
+  font-variant-numeric: tabular-nums;
+}
+.tab .badge.hot { background: var(--s-awaiting); color: #fff; }
+.tab .num { color: var(--text-3); font-size: 11.5px; font-weight: 500; font-variant-numeric: tabular-nums; }
+
+main { padding: 20px max(16px, env(safe-area-inset-left)) 64px max(16px, env(safe-area-inset-right)); max-width: 1400px; margin: 0 auto; }
+.view[hidden] { display: none; }
+
+/* ---- shared bits ---------------------------------------------------------- */
+.card {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius); box-shadow: var(--shadow);
+}
+.chip {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 2px 8px; border-radius: 999px; font-size: 11.5px; font-weight: 560;
+  background: var(--bg-sub); color: var(--text-2); border: 1px solid var(--border);
+  white-space: nowrap;
+}
+.chip .dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; flex: none; }
+.chip[data-state] { color: var(--sc); border-color: color-mix(in srgb, var(--sc) 32%, var(--border)); background: color-mix(in srgb, var(--sc) 9%, var(--surface)); }
+.chip.pulse .dot { animation: pulse 1.6s ease-in-out infinite; }
+@keyframes pulse { 0%,100% { opacity: 1; transform: scale(1); } 50% { opacity: .35; transform: scale(.8); } }
+@media (prefers-reduced-motion: reduce) { .chip.pulse .dot { animation: none; } }
+
+.btn {
+  appearance: none; cursor: pointer; border-radius: var(--radius-sm);
+  border: 1px solid var(--border-strong); background: var(--surface); color: var(--text);
+  padding: 7px 12px; font-size: 13px; font-weight: 540;
+  transition: background .12s ease, border-color .12s ease, transform .06s ease;
+}
+.btn:hover { background: var(--surface-2); border-color: var(--text-3); }
+.btn:active { transform: translateY(1px); }
+.btn[disabled] { opacity: .5; cursor: default; transform: none; }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.btn.primary:hover { background: color-mix(in srgb, var(--accent) 86%, #000); border-color: color-mix(in srgb, var(--accent) 86%, #000); }
+.btn.ghost { border-color: transparent; background: transparent; color: var(--text-2); padding: 6px 8px; }
+.btn.ghost:hover { background: var(--bg-sub); color: var(--text); }
+.btn.danger:hover { color: var(--s-failed); border-color: color-mix(in srgb, var(--s-failed) 50%, var(--border)); background: color-mix(in srgb, var(--s-failed) 8%, var(--surface)); }
+.btn.sm { padding: 4px 9px; font-size: 12px; }
+
+.field {
+  width: 100%; padding: 9px 11px; border-radius: var(--radius-sm);
+  border: 1px solid var(--border-strong); background: var(--surface-2); color: var(--text);
+  font-size: 13.5px; resize: vertical;
+}
+.field::placeholder { color: var(--text-3); }
+.field:focus { outline: none; border-color: var(--accent); background: var(--surface); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 16%, transparent); }
+
+.muted { color: var(--text-2); }
+.dim { color: var(--text-3); }
+.mono { font-family: var(--mono); font-size: 12.5px; }
+.num { font-variant-numeric: tabular-nums; }
+.section-head {
+  display: flex; align-items: baseline; gap: 10px; margin: 0 0 12px;
+}
+.section-head h2 { font-size: 13px; font-weight: 650; letter-spacing: .04em; text-transform: uppercase; color: var(--text-2); margin: 0; }
+.section-head .count { font-size: 12px; color: var(--text-3); font-variant-numeric: tabular-nums; }
+.hint { font-size: 12.5px; color: var(--text-3); }
+
+.empty {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  text-align: center; padding: 72px 24px; gap: 10px;
+}
+.empty .ring {
+  width: 44px; height: 44px; border-radius: 50%;
+  border: 2px solid color-mix(in srgb, var(--s-landed) 45%, var(--border));
+  display: grid; place-items: center; margin-bottom: 4px;
+}
+.empty .ring::after { content: ""; width: 12px; height: 12px; border-radius: 50%; background: color-mix(in srgb, var(--s-landed) 70%, transparent); }
+.empty h3 { margin: 0; font-size: 17px; font-weight: 600; letter-spacing: -.01em; }
+.empty p { margin: 0; color: var(--text-2); max-width: 40ch; font-size: 13.5px; }
+
+/* ---- inbox ---------------------------------------------------------------- */
+.inbox { display: grid; gap: 14px; max-width: 860px; }
+.decision { padding: 18px 18px 16px; border-left: 3px solid var(--s-awaiting); }
+.decision .meta { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+.decision .wait { color: var(--text-3); font-size: 12px; font-variant-numeric: tabular-nums; }
+.decision .wait.warm { color: var(--s-awaiting); font-weight: 560; }
+.decision .wait.hot { color: var(--s-failed); font-weight: 600; }
+.decision .q { font-size: 17px; font-weight: 600; line-height: 1.4; letter-spacing: -.011em; margin: 0 0 8px; }
+.decision .context {
+  white-space: pre-wrap; font-family: var(--mono); font-size: 12.5px; line-height: 1.55;
+  background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius-sm);
+  padding: 10px 12px; margin: 0 0 14px; color: var(--text-2);
+  max-height: 15em; overflow: auto;
+}
+.decision .context.clamped { max-height: 7.5em; }
+.opts { display: grid; gap: 8px; margin-bottom: 12px; }
+.opt {
+  display: flex; flex-direction: column; align-items: flex-start; gap: 3px; text-align: left;
+  width: 100%; padding: 10px 13px; cursor: pointer;
+  border: 1px solid var(--border-strong); border-radius: var(--radius-sm);
+  background: var(--surface); transition: border-color .12s, background .12s, transform .06s;
+}
+.opt:hover { border-color: var(--accent); background: var(--accent-soft); }
+.opt:active { transform: translateY(1px); }
+.opt .label { font-weight: 570; font-size: 14px; }
+.opt .detail { font-size: 12.5px; color: var(--text-2); line-height: 1.45; }
+.freeform { display: flex; gap: 8px; align-items: flex-start; }
+.freeform .field { flex: 1; }
+.answered { display: flex; align-items: center; gap: 8px; color: var(--text-3); font-size: 13px; padding: 4px 0; }
+
+/* ---- fleet ----------------------------------------------------------------
+   A board, not a stack: state groups flow as columns so a fleet of a dozen
+   tasks stays on one screen. Priority still reads left-to-right, top-to-bottom. */
+.board { display: grid; gap: 20px 16px; grid-template-columns: repeat(auto-fill, minmax(290px, 1fr)); align-items: start; }
+.group { margin: 0; min-width: 0; }
+.group .section-head { margin-bottom: 9px; }
+.grid { display: grid; gap: 10px; grid-template-columns: 1fr; }
+/* min-width:0 everywhere a nowrap child could otherwise stretch its grid item. */
+.task { padding: 13px 14px; display: flex; flex-direction: column; gap: 9px; min-width: 0; border-top: 2px solid var(--sc, var(--border)); }
+.task .row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.task .title { font-weight: 585; font-size: 14px; line-height: 1.35; letter-spacing: -.008em; }
+.task .facts { display: flex; gap: 12px; flex-wrap: wrap; font-size: 12px; color: var(--text-2); font-variant-numeric: tabular-nums; }
+.task .facts b { font-weight: 580; color: var(--text); }
+.task .activity {
+  font-family: var(--mono); font-size: 11.5px; color: var(--text-3);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; max-width: 100%;
+  border-left: 2px solid var(--border); padding-left: 8px;
+}
+.task .deps { display: flex; gap: 6px; flex-wrap: wrap; font-size: 11.5px; }
+.dep { display: inline-flex; align-items: center; gap: 5px; padding: 1px 7px; border-radius: 999px; border: 1px dashed var(--border-strong); color: var(--text-2); }
+.dep.met { border-style: solid; border-color: color-mix(in srgb, var(--s-landed) 40%, var(--border)); color: var(--s-landed); }
+.dep.blocked { border-color: color-mix(in srgb, var(--s-awaiting) 45%, var(--border)); color: var(--s-awaiting); }
+.task .controls { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 1px; }
+.steer { display: grid; gap: 7px; }
+.bar { height: 3px; border-radius: 2px; background: var(--border); overflow: hidden; }
+.bar > i { display: block; height: 100%; background: var(--s-failed); }
+
+/* ---- diff ----------------------------------------------------------------- */
+.diff-wrap { display: grid; grid-template-columns: 268px minmax(0, 1fr); gap: 16px; align-items: start; }
+/* Without min-width:0 a grid item sizes to max-content, so the rail's and the
+   code's own `overflow-x: auto` never engages and the whole PAGE scrolls. */
+.diff-wrap > * { min-width: 0; }
+@media (max-width: 900px) { .diff-wrap { grid-template-columns: minmax(0, 1fr); } }
+/* No `overflow:hidden` here — it would turn this into a scroll container and
+   silently break the sticky file bars inside it. Corners are rounded per-child. */
+.diff-pane { overflow: visible; }
+.diff-pane > .diff-head { border-radius: var(--radius) var(--radius) 0 0; }
+.diff-pane .file:last-child .lines, .diff-pane .file:last-child .collapsed-note { border-radius: 0 0 var(--radius) var(--radius); }
+.rail { display: flex; flex-direction: column; gap: 4px; padding: 6px; max-height: calc(100vh - var(--chrome-h) - 44px); overflow: auto; position: sticky; top: calc(var(--chrome-h) + 20px); }
+@media (max-width: 900px) {
+  .rail { flex-direction: row; overflow-x: auto; max-height: none; position: static; }
+  .rail .rail-item { min-width: 190px; }
+}
+.rail-item {
+  display: flex; flex-direction: column; gap: 3px; text-align: left; cursor: pointer;
+  padding: 8px 10px; border-radius: var(--radius-sm); border: 1px solid transparent; background: none;
+}
+.rail-item:hover { background: var(--surface-2); }
+.rail-item[aria-current="true"] { background: var(--accent-soft); border-color: color-mix(in srgb, var(--accent) 35%, transparent); }
+.rail-item .t { font-size: 13px; font-weight: 550; line-height: 1.3; }
+.rail-item .s { font-size: 11.5px; color: var(--text-3); display: flex; gap: 6px; align-items: center; }
+.rail-item .s .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--sc); flex: none; }
+
+.diff-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 12px 14px; border-bottom: 1px solid var(--border); }
+.diff-head .path { font-family: var(--mono); font-size: 12px; color: var(--text-3); }
+.stat-add { color: var(--add-fg); font-weight: 600; font-variant-numeric: tabular-nums; }
+.stat-del { color: var(--del-fg); font-weight: 600; font-variant-numeric: tabular-nums; }
+.file { border-top: 1px solid var(--border); }
+.file:first-of-type { border-top: 0; }
+.file-bar {
+  position: sticky; top: var(--chrome-h); z-index: 5;
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 8px 14px; background: var(--surface-2); border-bottom: 1px solid var(--border);
+  cursor: pointer; user-select: none;
+}
+.file-bar .fp { font-family: var(--mono); font-size: 12.5px; font-weight: 550; overflow-wrap: anywhere; }
+.file-bar .tag { font-size: 10.5px; text-transform: uppercase; letter-spacing: .04em; color: var(--text-3); border: 1px solid var(--border-strong); border-radius: 4px; padding: 0 4px; }
+.file-bar .caret { color: var(--text-3); font-size: 11px; margin-left: auto; }
+.lines { font-family: var(--mono); font-size: 12.25px; line-height: 1.55; overflow-x: auto; }
+.ln { display: grid; grid-template-columns: 48px 48px 1fr; white-space: pre; min-width: max-content; }
+.ln > .g { text-align: right; padding: 0 8px; color: var(--text-3); user-select: none; background: var(--surface-2); border-right: 1px solid var(--border); font-size: 11px; }
+.ln > .c { padding: 0 10px 0 8px; }
+.ln.add { background: var(--add-bg); }
+.ln.add > .g { background: var(--add-gut); color: color-mix(in srgb, var(--add-fg) 80%, var(--text)); border-right-color: transparent; }
+.ln.del { background: var(--del-bg); }
+.ln.del > .g { background: var(--del-gut); color: color-mix(in srgb, var(--del-fg) 80%, var(--text)); border-right-color: transparent; }
+.ln.hunk { background: color-mix(in srgb, var(--accent) 8%, var(--surface)); color: var(--text-3); }
+.ln.hunk > .g, .ln.hunk > .c { color: color-mix(in srgb, var(--accent) 70%, var(--text-3)); }
+.ln.note { color: var(--text-3); font-style: italic; }
+.collapsed-note { padding: 10px 14px; color: var(--text-3); font-size: 12.5px; }
+
+/* ---- timeline ------------------------------------------------------------- */
+.tl-legend { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; font-size: 11.5px; color: var(--text-2); }
+.tl-legend span { display: inline-flex; align-items: center; gap: 5px; }
+.tl-legend i { width: 9px; height: 9px; border-radius: 2px; display: inline-block; }
+.tl-scroll { overflow-x: auto; padding-bottom: 4px; }
+.tl { min-width: 620px; position: relative; }
+.tl-axis { position: relative; height: 22px; margin-left: var(--label-w); border-bottom: 1px solid var(--border); }
+.tl-tick { position: absolute; top: 0; bottom: 0; border-left: 1px solid var(--border); }
+.tl-tick span { position: absolute; top: 2px; left: 4px; font-size: 10.5px; color: var(--text-3); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.tl-row { display: grid; grid-template-columns: var(--label-w) 1fr; align-items: center; gap: 0; height: 28px; }
+.tl-row:hover { background: var(--surface-2); }
+.tl-label { padding-right: 10px; font-size: 12px; display: flex; align-items: center; gap: 6px; min-width: 0; }
+.tl-label .end { width: 7px; height: 7px; border-radius: 50%; background: var(--sc); flex: none; }
+.tl-label button { background: none; border: 0; padding: 0; cursor: pointer; font: inherit; color: inherit; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: block; text-align: left; }
+.tl-label button:hover { color: var(--accent); }
+.tl-track { position: relative; height: 100%; border-left: 1px solid var(--border); }
+.tl-grid { position: absolute; inset: 0; pointer-events: none; }
+.tl-seg { position: absolute; top: 7px; height: 14px; border-radius: 3px; background: var(--sc); min-width: 2px; opacity: .92; }
+.tl-seg:hover { opacity: 1; outline: 1px solid var(--text); }
+.tl-now { position: absolute; top: 0; bottom: 0; width: 1px; background: color-mix(in srgb, var(--s-failed) 65%, transparent); pointer-events: none; }
+.tl-insight { display: flex; gap: 18px; flex-wrap: wrap; margin-bottom: 14px; font-size: 12.5px; color: var(--text-2); }
+.tl-insight b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+
+/* ---- toasts --------------------------------------------------------------- */
+.toasts { position: fixed; bottom: 16px; right: 16px; z-index: 100; display: grid; gap: 8px; max-width: min(380px, calc(100vw - 32px)); }
+.toast {
+  padding: 10px 13px; border-radius: var(--radius-sm); font-size: 13px;
+  background: var(--surface); border: 1px solid var(--border); box-shadow: var(--shadow-lift);
+  animation: rise .18s ease-out;
+}
+.toast.err { border-color: color-mix(in srgb, var(--s-failed) 45%, var(--border)); color: var(--s-failed); }
+.toast.ok { border-color: color-mix(in srgb, var(--s-landed) 45%, var(--border)); }
+@keyframes rise { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+.skeleton { color: var(--text-3); padding: 40px 0; text-align: center; font-size: 13.5px; }
+</style>
+</head>
+<body>
+
+<div class="chrome" id="chrome">
+<header class="top">
+  <div class="brand">
+    <div class="glyph" aria-hidden="true"></div>
+    <h1>Starmap</h1>
+    <span class="sub">BlueSpace fleet control</span>
+  </div>
+  <div class="conn" id="conn" data-mode="down" title="Live connection status">
+    <span class="dot"></span><span class="label" id="conn-label">connecting</span>
+  </div>
+  <div class="stats">
+    <div class="stat" id="stat-spend"><span class="k">Spend</span><span class="v" id="v-spend">$0.00</span></div>
+    <div class="stat" id="stat-crew"><span class="k">Active crew</span><span class="v" id="v-crew">0</span></div>
+    <div class="stat" id="stat-dec"><span class="k">Needs you</span><span class="v" id="v-dec">0</span></div>
+  </div>
+</header>
+
+<nav class="tabs" role="tablist" aria-label="Views">
+  <button class="tab" role="tab" data-act="tab" data-view="inbox" aria-selected="true">Inbox <span class="badge" id="tab-dec">0</span></button>
+  <button class="tab" role="tab" data-act="tab" data-view="fleet" aria-selected="false">Fleet <span class="num" id="tab-fleet">0</span></button>
+  <button class="tab" role="tab" data-act="tab" data-view="diff" aria-selected="false">Diff</button>
+  <button class="tab" role="tab" data-act="tab" data-view="timeline" aria-selected="false">Timeline</button>
+</nav>
+</div>
+
+<main id="root">
+  <section class="view" id="view-inbox" role="tabpanel"><div class="skeleton">Loading…</div></section>
+  <section class="view" id="view-fleet" role="tabpanel" hidden></section>
+  <section class="view" id="view-diff" role="tabpanel" hidden></section>
+  <section class="view" id="view-timeline" role="tabpanel" hidden></section>
+</main>
+
+<div class="toasts" id="toasts" aria-live="polite"></div>
+
+<script>
+'use strict';
+/* ===========================================================================
+   Starmap client. No framework, no build step, no network beyond this origin.
+   Data flow: bootstrap over fetch -> live deltas over SSE -> polling if SSE
+   dies. Rendering is a throttled full re-render of the active view, deferred
+   while the captain is typing so we never eat a keystroke.
+   =========================================================================== */
+
+const STATES = ['awaiting_decision','working','verifying','needs_rework','dispatched','queued','ready','landed','failed','cancelled'];
+const STATE_LABEL = {
+  queued: 'Queued', dispatched: 'Dispatched', working: 'Working',
+  awaiting_decision: 'Awaiting you', verifying: 'Verifying', needs_rework: 'Needs rework',
+  ready: 'Ready', landed: 'Landed', failed: 'Failed', cancelled: 'Cancelled',
+};
+const STATE_VAR = {
+  queued: '--s-queued', dispatched: '--s-dispatched', working: '--s-working',
+  awaiting_decision: '--s-awaiting', verifying: '--s-verifying', needs_rework: '--s-rework',
+  ready: '--s-ready', landed: '--s-landed', failed: '--s-failed', cancelled: '--s-cancelled',
+};
+const TERMINAL = new Set(['landed','failed','cancelled']);
+const ACTIVE = new Set(['dispatched','working','verifying']);
+
+const app = {
+  view: 'inbox',
+  tasks: [], decisions: [], allDecisions: [], projects: [],
+  cost: { totalUsd: 0, byTask: {}, byModel: {} },
+  events: [], seq: 0, now: Date.now(),
+  loaded: false,
+  conn: 'down',           // live | poll | down
+  selected: null,         // task id for the diff view
+  diff: { id: null, loading: false, data: null, error: null },
+  collapsed: new Set(),   // collapsed diff files
+  steering: new Set(),    // task ids with the steer box open
+  drafts: new Map(),      // free-text answers / steer messages
+  busy: new Set(),        // in-flight ids (decision or task)
+  expandedContext: new Set(),
+};
+
+const MAX_EVENTS = 40000;
+const el = (id) => document.getElementById(id);
+const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
+const attr = (s) => esc(s).replace(/\n/g, '&#10;');
+const sc = (state) => `--sc: var(${STATE_VAR[state] || '--s-queued'})`;
+
+/* ---- formatting ---------------------------------------------------------- */
+function money(n) {
+  const v = Number(n) || 0;
+  if (v === 0) return '$0.00';
+  if (v < 0.01) return '<$0.01';
+  if (v < 100) return '$' + v.toFixed(2);
+  return '$' + Math.round(v).toLocaleString();
+}
+function dur(ms) {
+  if (!Number.isFinite(ms) || ms < 0) ms = 0;
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return s + 's';
+  const m = Math.floor(s / 60);
+  if (m < 60) return m + 'm ' + (s % 60) + 's';
+  const h = Math.floor(m / 60);
+  if (h < 24) return h + 'h ' + (m % 60) + 'm';
+  return Math.floor(h / 24) + 'd ' + (h % 24) + 'h';
+}
+function durShort(ms) {
+  if (!Number.isFinite(ms) || ms < 0) ms = 0;
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return s + 's';
+  const m = Math.floor(s / 60);
+  if (m < 60) return m + 'm';
+  const h = Math.floor(m / 60);
+  if (h < 48) return h + 'h';
+  return Math.floor(h / 24) + 'd';
+}
+function clock(t) {
+  const d = new Date(t);
+  return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+}
+function truncate(s, n) {
+  s = String(s == null ? '' : s).replace(/\s+/g, ' ').trim();
+  return s.length > n ? s.slice(0, n - 1) + '…' : s;
+}
+
+/* ---- derived lookups ------------------------------------------------------ */
+const taskById = () => new Map(app.tasks.map((t) => [t.id, t]));
+function projectName(id) {
+  const p = app.projects.find((x) => x.id === id);
+  return p ? p.name : (id ? String(id).slice(0, 8) : 'unknown project');
+}
+function activeCrewCount() { return app.tasks.filter((t) => ACTIVE.has(t.state)).length; }
+
+/** Newest crew signal per task — what the Crew is doing right now, in one line. */
+function lastActivity() {
+  const crewToTask = new Map();
+  const out = new Map();
+  for (const e of app.events) {
+    if (e.type === 'crew.spawned' || e.type === 'task.dispatched') crewToTask.set(e.crewId, e.taskId);
+    let taskId = e.taskId;
+    if (!taskId && e.crewId) taskId = crewToTask.get(e.crewId);
+    if (!taskId) continue;
+    let line = null;
+    if (e.type === 'crew.tool_use') line = e.name + (e.inputPreview ? ' · ' + truncate(e.inputPreview, 70) : '');
+    else if (e.type === 'crew.text') line = truncate(e.text, 90);
+    else if (e.type === 'crew.thinking') line = 'thinking…';
+    else if (e.type === 'sentinel.started') line = 'sentinel reviewing the diff';
+    else if (e.type === 'sentinel.verdict') line = (e.pass ? 'verdict: pass — ' : 'verdict: fail — ') + truncate(e.reasoning, 70);
+    else if (e.type === 'crew.exited') line = 'crew exited' + (e.reason ? ' · ' + truncate(e.reason, 50) : '');
+    if (line) out.set(taskId, { line, at: e.at });
+  }
+  return out;
+}
+
+/* ---- transport ------------------------------------------------------------ */
+async function api(path, opts) {
+  const res = await fetch(path, Object.assign({ headers: { 'Content-Type': 'application/json' } }, opts || {}));
+  let body = null;
+  try { body = await res.json(); } catch { /* non-JSON body */ }
+  if (!res.ok) throw new Error((body && body.error) || ('request failed (' + res.status + ')'));
+  return body;
+}
+
+async function loadState() {
+  const s = await api('/api/state');
+  app.tasks = s.tasks || [];
+  app.decisions = s.decisions || [];
+  app.allDecisions = s.allDecisions || app.decisions;
+  app.projects = s.projects || [];
+  app.cost = s.cost || app.cost;
+  app.now = s.now || Date.now();
+  app.loaded = true;
+  paint();
+}
+
+/**
+ * Pulls every event we do not have yet. `app.seq` is the high-water mark of
+ * what we HOLD, never what the server has — advancing it from /api/state would
+ * skip the backlog on first load and leave the timeline empty.
+ */
+async function loadEvents() {
+  const r = await api('/api/events?since=' + app.seq);
+  ingest(r.events || []);
+}
+
+function ingest(list) {
+  let added = false;
+  for (const e of list) {
+    if (!e || typeof e.seq !== 'number') continue;
+    if (e.seq <= app.seq) continue;
+    app.events.push(e);
+    app.seq = e.seq;
+    added = true;
+  }
+  if (app.events.length > MAX_EVENTS) app.events.splice(0, app.events.length - MAX_EVENTS);
+  return added;
+}
+
+let source = null, pollTimer = null, refreshTimer = null, reviveTimer = null;
+
+function setConn(mode) {
+  if (app.conn === mode) return;
+  app.conn = mode;
+  const node = el('conn');
+  node.dataset.mode = mode;
+  el('conn-label').textContent = mode === 'live' ? 'live' : mode === 'poll' ? 'polling' : 'offline';
+  node.title = mode === 'live' ? 'Streaming events live'
+    : mode === 'poll' ? 'Event stream unavailable — polling every 3s'
+    : 'Not connected to the Starmap server';
+}
+
+function connect() {
+  if (!window.EventSource) { startPolling(); return; }
+  try { source = new EventSource('/api/stream?since=' + app.seq); }
+  catch { startPolling(); return; }
+
+  source.onopen = () => { stopPolling(); setConn('live'); };
+  source.onmessage = (ev) => {
+    let e = null;
+    try { e = JSON.parse(ev.data); } catch { return; }
+    if (ingest([e])) { scheduleRefresh(); paint(); }
+  };
+  source.addEventListener('hello', () => { stopPolling(); setConn('live'); });
+  source.onerror = () => {
+    // EventSource retries on its own; polling covers the gap either way.
+    if (source && source.readyState === EventSource.CLOSED) {
+      source = null;
+      clearTimeout(reviveTimer);
+      reviveTimer = setTimeout(connect, 8000);
+    }
+    startPolling();
+  };
+}
+
+function startPolling() {
+  setConn(app.loaded ? 'poll' : 'down');
+  if (pollTimer) return;
+  pollTimer = setInterval(() => {
+    loadState().then(loadEvents).then(() => { if (!source || source.readyState !== 1) setConn('poll'); })
+      .catch(() => setConn('down'));
+  }, 3000);
+}
+function stopPolling() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
+
+/** Projections live on the server; a new event just means "ask again, soon". */
+function scheduleRefresh() {
+  if (refreshTimer) return;
+  refreshTimer = setTimeout(() => {
+    refreshTimer = null;
+    loadState().catch(() => setConn('down'));
+  }, 260);
+}
+
+/* ---- render scheduling ---------------------------------------------------- */
+let painting = false, pendingPaint = false, retimer = null;
+function typing() {
+  const a = document.activeElement;
+  return !!a && (a.tagName === 'INPUT' || a.tagName === 'TEXTAREA');
+}
+function paint() {
+  if (painting) { pendingPaint = true; return; }
+  if (typing()) { clearTimeout(retimer); retimer = setTimeout(paint, 900); return; }
+  painting = true;
+  requestAnimationFrame(() => {
+    try { render(); } finally {
+      painting = false;
+      if (pendingPaint) { pendingPaint = false; paint(); }
+    }
+  });
+}
+
+/* ---- header + chrome ------------------------------------------------------ */
+function renderHeader() {
+  el('v-spend').textContent = money(app.cost.totalUsd);
+  const crew = activeCrewCount();
+  el('v-crew').textContent = String(crew);
+  el('stat-crew').classList.toggle('live', crew > 0);
+  const open = app.decisions.length;
+  el('v-dec').textContent = String(open);
+  el('stat-dec').classList.toggle('alert', open > 0);
+  const badge = el('tab-dec');
+  badge.textContent = String(open);
+  badge.classList.toggle('hot', open > 0);
+  el('tab-fleet').textContent = String(app.tasks.length);
+  document.title = (open > 0 ? '(' + open + ') ' : '') + 'Starmap — BlueSpace';
+}
+
+function render() {
+  renderHeader();
+  for (const v of ['inbox','fleet','diff','timeline']) {
+    const node = el('view-' + v);
+    const on = app.view === v;
+    node.hidden = !on;
+    if (!on) continue;
+    if (v === 'inbox') node.innerHTML = renderInbox();
+    else if (v === 'fleet') node.innerHTML = renderFleet();
+    else if (v === 'diff') node.innerHTML = renderDiff();
+    else node.innerHTML = renderTimeline();
+  }
+  for (const t of document.querySelectorAll('.tab')) {
+    t.setAttribute('aria-selected', String(t.dataset.view === app.view));
+  }
+  restoreDrafts();
+}
+
+function restoreDrafts() {
+  for (const node of document.querySelectorAll('[data-draft]')) {
+    const key = node.dataset.draft;
+    if (app.drafts.has(key)) node.value = app.drafts.get(key);
+  }
+}
+
+/* ---- 1. inbox ------------------------------------------------------------- */
+function renderInbox() {
+  const open = app.decisions.slice().sort((a, b) => (a.openedAt || 0) - (b.openedAt || 0));
+  if (!app.loaded) return '<div class="skeleton">Loading…</div>';
+  if (open.length === 0) {
+    const crew = activeCrewCount();
+    const queued = app.tasks.filter((t) => t.state === 'queued').length;
+    let line = 'The fleet has nothing to ask you. A card lands here the moment a Crew needs a call.';
+    if (crew === 0 && app.tasks.length === 0) line = 'No tasks yet. Talk to Helm and the fleet will show up here.';
+    else if (crew === 0 && queued === 0) line = 'Everything is parked. Nothing is burning budget right now.';
+    return `<div class="empty">
+      <div class="ring" aria-hidden="true"></div>
+      <h3>Nothing needs you</h3>
+      <p>${esc(line)}</p>
+      <p class="hint num">${crew} crew working · ${queued} queued · ${money(app.cost.totalUsd)} spent</p>
+    </div>`;
+  }
+
+  const map = taskById();
+  const cards = open.map((d) => {
+    const t = map.get(d.taskId);
+    const waited = Math.max(0, app.now - (d.openedAt || app.now));
+    const heat = waited > 30 * 60000 ? 'hot' : waited > 5 * 60000 ? 'warm' : '';
+    const busy = app.busy.has(d.id);
+    const opts = (d.options || []).map((o) => `
+      <button class="opt" data-act="answer" data-id="${attr(d.id)}" data-answer="${attr(o.id)}" ${busy ? 'disabled' : ''}>
+        <span class="label">${esc(o.label)}</span>
+        ${o.detail ? `<span class="detail">${esc(o.detail)}</span>` : ''}
+      </button>`).join('');
+    const long = d.context && d.context.length > 420;
+    const expanded = app.expandedContext.has(d.id);
+    return `<article class="card decision">
+      <div class="meta">
+        ${t ? `<span class="chip" style="${sc(t.state)}" data-state><span class="dot"></span>${esc(STATE_LABEL[t.state] || t.state)}</span>` : ''}
+        <span class="muted">${esc(t ? t.title : 'task ' + String(d.taskId).slice(0, 8))}</span>
+        <span class="dim">·</span>
+        <span class="dim">${esc(t ? projectName(t.projectId) : '')}</span>
+        <span class="wait ${heat}" style="margin-left:auto">waiting ${dur(waited)}</span>
+      </div>
+      <h3 class="q">${esc(d.question)}</h3>
+      ${d.context ? `<div class="context ${long && !expanded ? 'clamped' : ''}">${esc(d.context)}</div>
+        ${long ? `<button class="btn ghost sm" data-act="ctx" data-id="${attr(d.id)}" style="margin:-8px 0 12px">${expanded ? 'Show less' : 'Show more'}</button>` : ''}` : ''}
+      ${opts ? `<div class="opts">${opts}</div>` : ''}
+      ${busy ? '<div class="answered">Sending…</div>' : `
+      <div class="freeform">
+        <input class="field" type="text" data-draft="d:${attr(d.id)}" data-act-key="answer-free" data-id="${attr(d.id)}"
+               placeholder="${opts ? 'Or answer in your own words…' : 'Type your answer…'}" aria-label="Free-text answer">
+        <button class="btn primary" data-act="answer-free" data-id="${attr(d.id)}">Send</button>
+      </div>`}
+    </article>`;
+  }).join('');
+
+  return `<div class="section-head"><h2>Decision inbox</h2><span class="count">${open.length} open · oldest first</span></div>
+    <div class="inbox">${cards}</div>`;
+}
+
+/* ---- 2. fleet ------------------------------------------------------------- */
+function renderFleet() {
+  if (!app.loaded) return '<div class="skeleton">Loading…</div>';
+  if (app.tasks.length === 0) {
+    return `<div class="empty"><div class="ring" aria-hidden="true"></div><h3>No tasks yet</h3>
+      <p>Helm creates tasks; the orchestrator dispatches them. Everything the fleet does will appear here.</p></div>`;
+  }
+  const map = taskById();
+  const activity = lastActivity();
+  const dependents = new Map();
+  for (const t of app.tasks) for (const d of (t.dependsOn || [])) {
+    if (!dependents.has(d)) dependents.set(d, []);
+    dependents.get(d).push(t);
+  }
+
+  const groups = STATES.map((state) => {
+    const list = app.tasks.filter((t) => t.state === state)
+      .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+    if (!list.length) return '';
+    const cards = list.map((t) => taskCard(t, map, dependents, activity)).join('');
+    return `<section class="group">
+      <div class="section-head">
+        <h2 style="${sc(state)};color:var(--sc)">${esc(STATE_LABEL[state] || state)}</h2>
+        <span class="count">${list.length}</span>
+      </div>
+      <div class="grid">${cards}</div>
+    </section>`;
+  }).join('');
+  return `<div class="board">${groups}</div>`;
+}
+
+function taskCard(t, map, dependents, activity) {
+  const busy = app.busy.has(t.id);
+  const live = ACTIVE.has(t.state);
+  const act = activity.get(t.id);
+  const deps = (t.dependsOn || []).map((id) => {
+    const d = map.get(id);
+    const met = d && d.state === 'landed';
+    const cls = met ? 'met' : (d && TERMINAL.has(d.state) ? '' : 'blocked');
+    return `<span class="dep ${cls}" title="${attr(d ? d.title : id)}">↑ ${esc(d ? truncate(d.title, 24) : String(id).slice(0, 8))}</span>`;
+  }).join('');
+  const blocks = dependents.get(t.id) || [];
+  const elapsed = TERMINAL.has(t.state)
+    ? 'ran ' + dur((t.updatedAt || t.createdAt) - t.createdAt)
+    : dur(app.now - (t.createdAt || app.now));
+  const rework = t.reworkCount > 0
+    ? `<span title="Sentinel sent this back ${t.reworkCount}×">rework <b>${t.reworkCount}</b></span>` : '';
+
+  return `<article class="card task" style="${sc(t.state)}">
+    <div class="row">
+      <span class="chip ${live ? 'pulse' : ''}" style="${sc(t.state)}" data-state><span class="dot"></span>${esc(STATE_LABEL[t.state] || t.state)}</span>
+      ${t.kind === 'recon' ? '<span class="chip">recon</span>' : ''}
+      <span class="dim" style="margin-left:auto;font-size:11.5px">${esc(projectName(t.projectId))}</span>
+    </div>
+    <div class="title">${esc(t.title)}</div>
+    <div class="facts">
+      <span title="Accumulated cost for this task">cost <b>${money(t.costUsd)}</b></span>
+      <span title="${TERMINAL.has(t.state) ? 'Total lifetime' : 'Since created'}">${esc(elapsed)}</span>
+      ${rework}
+    </div>
+    ${deps || blocks.length ? `<div class="deps">
+      ${deps}
+      ${blocks.length ? `<span class="dep" title="${attr(blocks.map((b) => b.title).join(', '))}">↓ blocks ${blocks.length}</span>` : ''}
+    </div>` : ''}
+    ${act ? `<div class="activity" title="${attr(act.line)}">${esc(truncate(act.line, 110))}</div>` : ''}
+    <div class="controls">
+      <button class="btn ghost sm" data-act="open-diff" data-id="${attr(t.id)}">Diff</button>
+      ${!TERMINAL.has(t.state) ? `
+        <button class="btn ghost sm" data-act="steer-toggle" data-id="${attr(t.id)}">${app.steering.has(t.id) ? 'Close' : 'Steer'}</button>
+        <button class="btn ghost sm danger" data-act="cancel" data-id="${attr(t.id)}" ${busy ? 'disabled' : ''}>${busy ? '…' : 'Cancel'}</button>` : ''}
+    </div>
+    ${app.steering.has(t.id) ? `<div class="steer">
+      <textarea class="field" rows="2" data-draft="s:${attr(t.id)}" placeholder="Message to the Crew — course correction, extra context, a constraint…"></textarea>
+      <div><button class="btn primary sm" data-act="steer-send" data-id="${attr(t.id)}">Send to Crew</button></div>
+    </div>` : ''}
+  </article>`;
+}
+
+/* ---- 3. diff -------------------------------------------------------------- */
+function renderDiff() {
+  if (!app.loaded) return '<div class="skeleton">Loading…</div>';
+  if (app.tasks.length === 0) {
+    return `<div class="empty"><div class="ring" aria-hidden="true"></div><h3>Nothing to review</h3>
+      <p>When a Crew changes code, its diff shows up here — no click-through to anywhere else.</p></div>`;
+  }
+  const order = app.tasks.slice().sort((a, b) => {
+    const rank = (t) => (t.worktree ? 0 : 1);
+    return rank(a) - rank(b) || (b.updatedAt || 0) - (a.updatedAt || 0);
+  });
+  if (!app.selected || !order.some((t) => t.id === app.selected)) {
+    const first = order[0];
+    app.selected = first ? first.id : null;
+  }
+  const rail = order.map((t) => `
+    <button class="rail-item" data-act="select-task" data-id="${attr(t.id)}" style="${sc(t.state)}" aria-current="${t.id === app.selected}">
+      <span class="t">${esc(truncate(t.title, 60))}</span>
+      <span class="s"><span class="dot"></span>${esc(STATE_LABEL[t.state] || t.state)} · ${esc(projectName(t.projectId))}</span>
+    </button>`).join('');
+
+  const task = app.tasks.find((t) => t.id === app.selected);
+  let pane;
+  if (!task) pane = '<div class="skeleton">Select a task.</div>';
+  else if (app.diff.id !== task.id || app.diff.loading) {
+    pane = '<div class="skeleton">Reading the worktree…</div>';
+    if (app.diff.id !== task.id) loadDiff(task.id);
+  } else if (app.diff.error) {
+    pane = `<div class="empty"><h3>Could not read the diff</h3><p>${esc(app.diff.error)}</p></div>`;
+  } else if (!app.diff.data || !app.diff.data.diff) {
+    const reason = (app.diff.data && app.diff.data.reason) || 'nothing to show yet';
+    pane = `<div class="empty"><div class="ring" aria-hidden="true"></div><h3>No diff</h3><p>${esc(reason)}.</p>
+      ${app.diff.data && app.diff.data.path ? `<p class="hint mono">${esc(app.diff.data.path)}</p>` : ''}</div>`;
+  } else {
+    pane = renderDiffBody(task, app.diff.data);
+  }
+
+  return `<div class="diff-wrap">
+    <aside class="card rail" aria-label="Tasks">${rail}</aside>
+    <div class="card diff-pane">${pane}</div>
+  </div>`;
+}
+
+function renderDiffBody(task, data) {
+  const files = parseDiff(data.diff);
+  const adds = files.reduce((n, f) => n + f.adds, 0);
+  const dels = files.reduce((n, f) => n + f.dels, 0);
+  const head = `<div class="diff-head">
+    <strong>${esc(task.title)}</strong>
+    <span class="chip" style="${sc(task.state)}" data-state><span class="dot"></span>${esc(STATE_LABEL[task.state] || task.state)}</span>
+    <span class="dim num">${files.length} file${files.length === 1 ? '' : 's'}</span>
+    <span class="stat-add num">+${adds}</span><span class="stat-del num">−${dels}</span>
+    ${data.base ? `<span class="path">vs ${esc(data.base)}</span>` : ''}
+    <button class="btn ghost sm" data-act="reload-diff" style="margin-left:auto">Reload</button>
+  </div>`;
+
+  const body = files.map((f, i) => {
+    const key = task.id + '::' + f.path;
+    const heavy = f.lines > 1200;
+    const collapsed = app.collapsed.has(key) || (heavy && !app.collapsed.has('!' + key));
+    const bar = `<div class="file-bar" data-act="toggle-file" data-key="${attr(key)}" data-heavy="${heavy}">
+      <span class="fp">${esc(f.path)}</span>
+      ${f.tag ? `<span class="tag">${esc(f.tag)}</span>` : ''}
+      <span class="stat-add num">+${f.adds}</span><span class="stat-del num">−${f.dels}</span>
+      <span class="caret">${collapsed ? '▸ show' : '▾ hide'}</span>
+    </div>`;
+    const lines = collapsed
+      ? `<div class="collapsed-note">${f.lines} lines hidden${heavy ? ' (large file)' : ''} — click the header to expand.</div>`
+      : `<div class="lines">${f.hunks.map(hunkHtml).join('')}</div>`;
+    return `<section class="file" data-i="${i}">${bar}${lines}</section>`;
+  }).join('');
+
+  return head + (files.length ? body : '<div class="collapsed-note">Diff produced no file sections.</div>')
+    + (data.truncated ? '<div class="collapsed-note">Diff was truncated by the server — open the worktree for the rest.</div>' : '');
+}
+
+function hunkHtml(h) {
+  const rows = [`<div class="ln hunk"><span class="g"></span><span class="g"></span><span class="c">${esc(h.head)}</span></div>`];
+  for (const l of h.lines) {
+    const mark = l.t === 'add' ? '+' : l.t === 'del' ? '−' : ' ';
+    rows.push(`<div class="ln ${l.t}"><span class="g">${l.o == null ? '' : l.o}</span><span class="g">${l.n == null ? '' : l.n}</span><span class="c">${esc(mark + l.s)}</span></div>`);
+  }
+  return rows.join('');
+}
+
+/** Unified-diff parser. Deliberately syntax-neutral: structure, not highlighting. */
+function parseDiff(text) {
+  const files = [];
+  let cur = null, oldNo = 0, newNo = 0;
+  for (const line of String(text).split('\n')) {
+    // A real unified-diff line always carries a marker (' ', '+', '-', '\'), so
+    // a bare empty string is only ever the artefact of the trailing newline.
+    if (line === '') continue;
+    if (line.startsWith('diff --git ')) {
+      cur = { path: gitPath(line), hunks: [], adds: 0, dels: 0, lines: 0, tag: '' };
+      files.push(cur);
+      continue;
+    }
+    if (!cur) {
+      cur = { path: '(diff)', hunks: [], adds: 0, dels: 0, lines: 0, tag: '' };
+      files.push(cur);
+    }
+    if (line.startsWith('@@')) {
+      const m = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line);
+      oldNo = m ? +m[1] : 0;
+      newNo = m ? +m[2] : 0;
+      cur.hunks.push({ head: line, lines: [] });
+      continue;
+    }
+    const h = cur.hunks[cur.hunks.length - 1];
+    if (!h) {
+      if (line.startsWith('new file')) cur.tag = 'new';
+      else if (line.startsWith('deleted file')) cur.tag = 'deleted';
+      else if (line.startsWith('rename ')) cur.tag = 'renamed';
+      else if (line.startsWith('Binary files')) { cur.tag = 'binary'; cur.hunks.push({ head: line, lines: [] }); }
+      continue;
+    }
+    cur.lines++;
+    if (line.startsWith('+')) { h.lines.push({ t: 'add', o: null, n: newNo++, s: line.slice(1) }); cur.adds++; }
+    else if (line.startsWith('-')) { h.lines.push({ t: 'del', o: oldNo++, n: null, s: line.slice(1) }); cur.dels++; }
+    else if (line.startsWith('\\')) { h.lines.push({ t: 'note', o: null, n: null, s: line }); }
+    else { h.lines.push({ t: 'ctx', o: oldNo++, n: newNo++, s: line.slice(1) }); }
+  }
+  return files;
+}
+function gitPath(header) {
+  const m = / b\/(.+)$/.exec(header);
+  let p = m ? m[1] : header.replace('diff --git ', '');
+  if (p.startsWith('"') && p.endsWith('"')) p = p.slice(1, -1);
+  return p;
+}
+
+async function loadDiff(id) {
+  app.diff = { id, loading: true, data: null, error: null };
+  paint();
+  try {
+    const data = await api('/api/diff/' + encodeURIComponent(id));
+    if (app.diff.id !== id) return;
+    app.diff = { id, loading: false, data, error: null };
+  } catch (err) {
+    if (app.diff.id !== id) return;
+    app.diff = { id, loading: false, data: null, error: err.message };
+  }
+  paint();
+}
+
+/* ---- 4. timeline ---------------------------------------------------------- */
+function buildTimeline() {
+  const rec = new Map();
+  for (const t of app.tasks) rec.set(t.id, { task: t, created: t.createdAt, points: [] });
+  for (const e of app.events) {
+    const r = e.taskId ? rec.get(e.taskId) : null;
+    if (!r) continue;
+    if (e.type === 'task.created') r.created = Math.min(r.created || e.at, e.at);
+    else if (e.type === 'task.state_changed') r.points.push({ at: e.at, to: e.to });
+  }
+  const now = Date.now();
+  const rows = [];
+  for (const r of rec.values()) {
+    const start = r.created || (r.points.length ? r.points[0].at : now);
+    const points = r.points.slice().sort((a, b) => a.at - b.at);
+    const segs = [];
+    let cursor = start, state = 'queued';
+    for (const p of points) {
+      if (p.at > cursor) segs.push({ state, from: cursor, to: p.at });
+      cursor = Math.max(cursor, p.at);
+      state = p.to;
+    }
+    const terminal = TERMINAL.has(state);
+    const end = terminal ? Math.max(cursor, start + 1) : now;
+    if (!terminal || segs.length === 0) segs.push({ state, from: cursor, to: end });
+    rows.push({ task: r.task, start, end, segs, state });
+  }
+  rows.sort((a, b) => a.start - b.start);
+  return { rows, now };
+}
+
+function renderTimeline() {
+  if (!app.loaded) return '<div class="skeleton">Loading…</div>';
+  const { rows, now } = buildTimeline();
+  if (!rows.length) {
+    return `<div class="empty"><div class="ring" aria-hidden="true"></div><h3>No history yet</h3>
+      <p>Once tasks run, this shows where the fleet ran in parallel, where it serialized, and where it waited on you.</p></div>`;
+  }
+  const t0 = rows.reduce((m, r) => Math.min(m, r.start), Infinity);
+  const t1 = Math.max(rows.reduce((m, r) => Math.max(m, r.end), -Infinity), now);
+  const span = Math.max(1, t1 - t0);
+  const pad = span * 0.02;
+  const lo = t0 - pad, hi = t1 + pad, width = hi - lo;
+  const pct = (t) => ((t - lo) / width) * 100;
+
+  // Insight line: the three things the captain actually wants from a timeline.
+  let waited = 0, peak = 0;
+  const edges = [];
+  for (const r of rows) for (const s of r.segs) {
+    if (s.state === 'awaiting_decision') waited += s.to - s.from;
+    if (ACTIVE.has(s.state)) { edges.push([s.from, 1], [s.to, -1]); }
+  }
+  edges.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  let cur = 0;
+  for (const [, d] of edges) { cur += d; if (cur > peak) peak = cur; }
+
+  const step = niceStep(width);
+  const tickAt = [];
+  for (let t = Math.ceil(lo / step) * step; t < hi; t += step) {
+    // Drop ticks hugging the right edge — their label would clip.
+    if (pct(t) < 95) tickAt.push(t);
+  }
+  const ticks = tickAt.map((t) => `<div class="tl-tick" style="left:${pct(t).toFixed(3)}%"><span>${esc(clock(t))}</span></div>`);
+  const grid = tickAt.map((t) => `<div class="tl-tick" style="left:${pct(t).toFixed(3)}%"></div>`).join('');
+
+  const body = rows.map((r) => {
+    const segs = r.segs.map((s) => {
+      const left = pct(s.from), right = pct(s.to);
+      const w = Math.max(0.25, right - left);
+      return `<div class="tl-seg" style="${sc(s.state)};left:${left.toFixed(3)}%;width:${w.toFixed(3)}%"
+        title="${attr((STATE_LABEL[s.state] || s.state) + ' · ' + dur(s.to - s.from) + ' · ' + clock(s.from))}"></div>`;
+    }).join('');
+    return `<div class="tl-row">
+      <div class="tl-label" style="${sc(r.state)}">
+        <span class="end" title="${attr(STATE_LABEL[r.state] || r.state)}"></span>
+        <button data-act="open-diff" data-id="${attr(r.task.id)}" title="${attr(r.task.title + ' — ' + (STATE_LABEL[r.state] || r.state))}">${esc(truncate(r.task.title, 40))}</button>
+      </div>
+      <div class="tl-track"><div class="tl-grid">${grid}</div>${segs}
+        <div class="tl-now" style="left:${pct(now).toFixed(3)}%"></div></div>
+    </div>`;
+  }).join('');
+
+  const legend = STATES.filter((s) => rows.some((r) => r.segs.some((g) => g.state === s)))
+    .map((s) => `<span><i style="${sc(s)};background:var(--sc)"></i>${esc(STATE_LABEL[s] || s)}</span>`).join('');
+
+  return `<div class="section-head"><h2>Timeline</h2><span class="count">${rows.length} tasks · ${dur(t1 - t0)} span</span></div>
+    <div class="tl-insight">
+      <span>peak parallel crew <b>${peak}</b></span>
+      <span>waited on you <b>${dur(waited)}</b></span>
+      <span>first dispatch <b>${esc(clock(t0))}</b></span>
+    </div>
+    <div class="tl-legend">${legend}</div>
+    <div class="card tl-scroll" style="padding:12px 14px">
+      <div class="tl" style="--label-w:190px">
+        <div class="tl-axis">${ticks.join('')}</div>
+        ${body}
+      </div>
+    </div>`;
+}
+
+function niceStep(span) {
+  const targets = [1e3, 5e3, 15e3, 30e3, 60e3, 3e5, 6e5, 9e5, 18e5, 36e5, 108e5, 216e5, 432e5, 864e5];
+  for (const t of targets) if (span / t <= 12) return t;
+  return 864e5;
+}
+
+/* ---- actions -------------------------------------------------------------- */
+function toast(msg, kind) {
+  const node = document.createElement('div');
+  node.className = 'toast ' + (kind || '');
+  node.textContent = msg;
+  el('toasts').appendChild(node);
+  setTimeout(() => node.remove(), kind === 'err' ? 7000 : 3500);
+}
+
+async function answer(decisionId, text) {
+  if (!text || app.busy.has(decisionId)) return;
+  app.busy.add(decisionId);
+  paint();
+  try {
+    await api('/api/decision/' + encodeURIComponent(decisionId), { method: 'POST', body: JSON.stringify({ answer: text }) });
+    app.drafts.delete('d:' + decisionId);
+    toast('Answered.', 'ok');
+    await loadState();
+  } catch (err) {
+    toast(err.message, 'err');
+  } finally {
+    app.busy.delete(decisionId);
+    paint();
+  }
+}
+
+async function cancelTask(id) {
+  const t = app.tasks.find((x) => x.id === id);
+  if (!confirm('Cancel "' + (t ? t.title : id) + '"? The Crew stops and the worktree is torn down.')) return;
+  app.busy.add(id);
+  paint();
+  try {
+    await api('/api/task/' + encodeURIComponent(id) + '/cancel', { method: 'POST' });
+    toast('Cancelled.', 'ok');
+    await loadState();
+  } catch (err) {
+    toast(err.message, 'err');
+  } finally {
+    app.busy.delete(id);
+    paint();
+  }
+}
+
+async function steer(id) {
+  const msg = (app.drafts.get('s:' + id) || '').trim();
+  if (!msg) { toast('Write a message first.', 'err'); return; }
+  try {
+    await api('/api/task/' + encodeURIComponent(id) + '/steer', { method: 'POST', body: JSON.stringify({ message: msg }) });
+    app.drafts.delete('s:' + id);
+    app.steering.delete(id);
+    toast('Sent to the Crew.', 'ok');
+    paint();
+  } catch (err) {
+    toast(err.message, 'err');
+  }
+}
+
+function setView(v) {
+  if (!['inbox','fleet','diff','timeline'].includes(v)) v = 'inbox';
+  app.view = v;
+  const hash = v === 'diff' && app.selected ? '#diff/' + app.selected : '#' + v;
+  if (location.hash !== hash) history.replaceState(null, '', hash);
+  paint();
+  window.scrollTo({ top: 0 });
+}
+
+document.addEventListener('click', (ev) => {
+  const node = ev.target.closest('[data-act]');
+  if (!node) return;
+  const { act, id, view, key, answer: ans } = node.dataset;
+  if (act === 'tab') { setView(view); return; }
+  if (act === 'answer') { answer(id, ans); return; }
+  if (act === 'answer-free') { answer(id, (app.drafts.get('d:' + id) || '').trim()); return; }
+  if (act === 'ctx') { app.expandedContext.has(id) ? app.expandedContext.delete(id) : app.expandedContext.add(id); paint(); return; }
+  if (act === 'cancel') { cancelTask(id); return; }
+  if (act === 'steer-toggle') { app.steering.has(id) ? app.steering.delete(id) : app.steering.add(id); paint(); return; }
+  if (act === 'steer-send') { steer(id); return; }
+  if (act === 'open-diff') { app.selected = id; setView('diff'); return; }
+  if (act === 'select-task') { app.selected = id; history.replaceState(null, '', '#diff/' + id); paint(); return; }
+  if (act === 'reload-diff') { if (app.selected) loadDiff(app.selected); return; }
+  if (act === 'toggle-file') {
+    const heavy = node.dataset.heavy === 'true';
+    // Heavy files start collapsed, so their "expanded" marker is the negated key.
+    if (heavy) {
+      if (app.collapsed.has('!' + key)) { app.collapsed.delete('!' + key); }
+      else { app.collapsed.delete(key); app.collapsed.add('!' + key); }
+    } else {
+      app.collapsed.has(key) ? app.collapsed.delete(key) : app.collapsed.add(key);
+    }
+    paint();
+  }
+});
+
+document.addEventListener('input', (ev) => {
+  const node = ev.target.closest('[data-draft]');
+  if (node) app.drafts.set(node.dataset.draft, node.value);
+});
+
+document.addEventListener('keydown', (ev) => {
+  if (typing()) {
+    if (ev.key === 'Enter' && ev.target.dataset.actKey === 'answer-free') {
+      ev.preventDefault();
+      answer(ev.target.dataset.id, (app.drafts.get('d:' + ev.target.dataset.id) || '').trim());
+    }
+    if (ev.key === 'Enter' && (ev.metaKey || ev.ctrlKey) && ev.target.dataset.draft && ev.target.dataset.draft.startsWith('s:')) {
+      ev.preventDefault();
+      steer(ev.target.dataset.draft.slice(2));
+    }
+    return;
+  }
+  const map = { '1': 'inbox', '2': 'fleet', '3': 'diff', '4': 'timeline' };
+  if (map[ev.key]) setView(map[ev.key]);
+});
+
+window.addEventListener('hashchange', applyHash);
+function applyHash() {
+  const h = location.hash.replace(/^#/, '');
+  if (h.startsWith('diff/')) { app.selected = decodeURIComponent(h.slice(5)); app.view = 'diff'; }
+  else if (['inbox','fleet','diff','timeline'].includes(h)) app.view = h;
+  paint();
+}
+
+/* ---- keep --chrome-h honest so sticky content clears the header ----------- */
+function measureChrome() {
+  const node = el('chrome');
+  const h = node && node.offsetHeight ? node.offsetHeight : 100;
+  document.documentElement.style.setProperty('--chrome-h', h + 'px');
+}
+if (window.ResizeObserver) {
+  try { new ResizeObserver(measureChrome).observe(el('chrome')); } catch { /* older engine */ }
+}
+window.addEventListener('resize', measureChrome);
+measureChrome();
+
+/* ---- clock: elapsed times stay honest without a full re-render ------------- */
+setInterval(() => {
+  app.now = Date.now();
+  if (app.view === 'timeline' || app.view === 'inbox') { if (!typing()) paint(); }
+}, 1000);
+
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) { loadState().catch(() => {}); }
+});
+
+/* ---- boot ----------------------------------------------------------------- */
+applyHash();
+loadState()
+  .then(loadEvents)
+  .then(() => { connect(); paint(); })
+  .catch((err) => {
+    setConn('down');
+    el('view-inbox').innerHTML = `<div class="empty"><h3>Cannot reach the Starmap server</h3>
+      <p>${esc(err.message)}</p><p class="hint">Retrying every 3 seconds.</p></div>`;
+    startPolling();
+  });
+</script>
+</body>
+</html>

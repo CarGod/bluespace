@@ -1,0 +1,13 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": ".",
+    "types": ["node"]
+  },
+  // The base config excludes tests (it emits dist/ from src/ only); an inherited
+  // `exclude` outranks this file's `include`, so it has to be cleared or the
+  // typecheck would silently skip every test it names.
+  "exclude": ["node_modules", "dist"],
+  "include": ["src/**/*.ts", "tests/**/*.ts"]
+}

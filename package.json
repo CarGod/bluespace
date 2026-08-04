@@ -1,0 +1,37 @@
+{
+  "name": "bluespace",
+  "version": "0.1.0",
+  "description": "A captain and an AI crew. One conversation in, a fleet of agents out.",
+  "type": "module",
+  "bin": {
+    "blue": "./dist/cli/index.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsc -w -p tsconfig.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit -p tsconfig.test.json",
+    "blue": "node --enable-source-maps dist/cli/index.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.221",
+    "better-sqlite3": "^13.0.2",
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.11",
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  },
+  "license": "MIT",
+  "files": [
+    "dist",
+    "web",
+    "README.md"
+  ]
+}

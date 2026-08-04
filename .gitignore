@@ -1,0 +1,17 @@
+# dependencies
+node_modules/
+
+# build output
+dist/
+
+# the Blackbox and any other local sqlite
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# BlueSpace's data directory, if it is kept next to the repo
+.bluespace/
+
+# macOS
+.DS_Store
