@@ -30,6 +30,7 @@
  * claude-agent-sdk/sdk.d.ts` (v0.3.221), which is the authority.
  */
 
+import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import {
   createSdkMcpServer,
@@ -849,63 +850,93 @@ class ClaudeConversation implements Conversation {
 // Adapter
 // ---------------------------------------------------------------------------
 
-/** Raised when no API key is available. Carries operator-facing guidance. */
-export class MissingApiKeyError extends Error {
-  constructor() {
+/** Raised when the `claude` executable cannot be found or will not answer. */
+export class ClaudeCliUnavailableError extends Error {
+  constructor(detail: string) {
     super(
-      'ANTHROPIC_API_KEY is not set.\n\n' +
-        'BlueSpace is an agent built on the Claude Agent SDK, and Anthropic requires\n' +
-        'SDK-built agents to authenticate with an API key rather than a claude.ai\n' +
-        'login. Running it on a subscription login is not permitted and risks your\n' +
-        'account, so BlueSpace refuses to start rather than quietly using whatever\n' +
-        'credential happens to be lying around.\n\n' +
-        'Get a key at https://console.anthropic.com/settings/keys, then:\n' +
-        '  export ANTHROPIC_API_KEY=sk-ant-...\n\n' +
-        'If you understand the above and want BlueSpace to use whatever credential\n' +
-        'the SDK finds anyway, that is your call to make for your own account:\n' +
-        '  export BLUESPACE_INHERIT_AUTH=1',
+      `Claude Code is not usable: ${detail}\n\n` +
+        'BlueSpace runs its crews through your own installed Claude CLI, using the\n' +
+        'login you already have — there is no separate key to manage. It needs the\n' +
+        '`claude` command on PATH and signed in.\n\n' +
+        '  1. install:  https://claude.com/claude-code\n' +
+        '  2. sign in:  run `claude` once and complete the login\n' +
+        '  3. check:    `claude --version` should print a version\n\n' +
+        'If `claude` lives somewhere unusual, point BlueSpace at it:\n' +
+        '  export CLAUDE_CLI_PATH=/full/path/to/claude',
     );
-    this.name = 'MissingApiKeyError';
+    this.name = 'ClaudeCliUnavailableError';
   }
 }
 
-/** The deliberate, un-guessable opt-out. Not a config key: see below. */
-export const INHERIT_AUTH_ENV = 'BLUESPACE_INHERIT_AUTH';
+/** Override for a `claude` binary that is not on PATH. */
+export const CLI_PATH_ENV = 'CLAUDE_CLI_PATH';
 
 export type AuthMode =
-  | { kind: 'api-key'; key: string }
-  /** Whatever credential the SDK finds — the captain accepted the risk explicitly. */
-  | { kind: 'inherited' };
+  /** The captain's own Claude CLI login — the default, and what most people have. */
+  | { kind: 'cli-login' }
+  /** An explicit key in the environment, which the SDK will prefer on its own. */
+  | { kind: 'api-key'; key: string };
 
 /**
- * Decide how a run authenticates.
+ * Report how this run will authenticate.
  *
- * Default: an explicit API key, because BlueSpace is a third-party agent built on
- * the Claude Agent SDK and Anthropic's SDK docs require API-key auth for those
- * rather than a claude.ai login. Left alone the SDK resolves whatever credential
- * it can find, and on a machine with Claude Code installed that is usually a
- * subscription — so a silent fallback would quietly put the captain's account on
- * the wrong side of that line.
+ * BlueSpace drives the Claude CLI the captain already installed and signed into,
+ * so the normal path needs no configuration at all: whatever `claude` is logged
+ * in as is what the crews run as. An `ANTHROPIC_API_KEY` in the environment is
+ * honoured too — the SDK prefers it — which is what makes headless and CI runs
+ * possible without a login.
  *
- * Escape hatch: setting BLUESPACE_INHERIT_AUTH=1 hands credential resolution back
- * to the SDK. It is an environment variable and not a config key on purpose —
- * config files get committed, copied between machines, and inherited by teammates
- * and by anyone who clones an open-source fork. A risk one person accepted for
- * themselves should not travel to other people's accounts in a JSON file.
+ * This function only reports; it never throws. What can actually fail is the CLI
+ * being absent or signed out, and that is `assertClaudeCliAvailable`'s job.
  */
 export function resolveAuth(env: NodeJS.ProcessEnv = process.env): AuthMode {
   const key = env['ANTHROPIC_API_KEY']?.trim();
   if (key !== undefined && key !== '') return { kind: 'api-key', key };
-  const inherit = env[INHERIT_AUTH_ENV]?.trim();
-  if (inherit === '1' || inherit?.toLowerCase() === 'true') return { kind: 'inherited' };
-  throw new MissingApiKeyError();
+  return { kind: 'cli-login' };
 }
 
-/** Back-compat helper for callers that only need the key. */
-export function assertApiKeyAuth(env: NodeJS.ProcessEnv = process.env): string {
-  const auth = resolveAuth(env);
-  if (auth.kind !== 'api-key') throw new MissingApiKeyError();
-  return auth.key;
+export interface CliInfo {
+  /** What we invoke: an absolute path when overridden, otherwise plain `claude`. */
+  path: string;
+  version: string;
+}
+
+/**
+ * Prove the CLI exists and answers before anything is dispatched.
+ *
+ * The SDK spawns `claude` lazily, so without this check a missing or signed-out
+ * CLI surfaces as a dead session partway through a task — after a worktree has
+ * been created and the captain has been told work started. Checking up front
+ * turns that into one sentence at startup, which is the entire difference
+ * between a tool that feels solid and one that feels haunted.
+ */
+export function assertClaudeCliAvailable(env: NodeJS.ProcessEnv = process.env): CliInfo {
+  const bin = env[CLI_PATH_ENV]?.trim() || 'claude';
+  try {
+    const version = execFileSync(bin, ['--version'], {
+      encoding: 'utf8',
+      timeout: 15_000,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+      .trim()
+      .split('\n')[0];
+    if (version === undefined || version === '') {
+      throw new ClaudeCliUnavailableError(`\`${bin} --version\` printed nothing`);
+    }
+    return { path: bin, version };
+  } catch (e: unknown) {
+    if (e instanceof ClaudeCliUnavailableError) throw e;
+    const code = (e as { code?: string }).code;
+    if (code === 'ENOENT') {
+      throw new ClaudeCliUnavailableError(`\`${bin}\` was not found on PATH`);
+    }
+    if (code === 'ETIMEDOUT') {
+      throw new ClaudeCliUnavailableError(`\`${bin} --version\` timed out`);
+    }
+    throw new ClaudeCliUnavailableError(
+      (e as Error).message.split('\n')[0] ?? 'unknown failure',
+    );
+  }
 }
 
 export class ClaudeAdapter implements HarnessAdapter {
@@ -915,20 +946,22 @@ export class ClaudeAdapter implements HarnessAdapter {
   private readonly executablePath: string | undefined;
 
   constructor(opts?: { executablePath?: string }) {
-    this.executablePath = opts?.executablePath;
+    // An explicit argument wins; otherwise honour the same override the startup
+    // check uses, so "BlueSpace found my claude" and "BlueSpace runs my claude"
+    // can never disagree about which binary that is.
+    this.executablePath = opts?.executablePath ?? process.env[CLI_PATH_ENV]?.trim() ?? undefined;
   }
 
   /**
    * The environment handed to every SDK run.
    *
-   * With an API key we pin it so the SDK cannot silently fall back to something
-   * else. Under the explicit opt-out we pass the ambient environment through
-   * untouched and let the SDK resolve credentials however it likes.
+   * Passed through as-is: BlueSpace drives the captain's own Claude CLI, so the
+   * credential it uses is whatever that CLI is signed in as. An ANTHROPIC_API_KEY
+   * already present in the environment rides along and the SDK prefers it, which
+   * is how a headless or CI run works without a login.
    */
   private authEnv(): Record<string, string | undefined> {
-    const auth = resolveAuth();
-    if (auth.kind === 'inherited') return { ...process.env };
-    return { ...process.env, ANTHROPIC_API_KEY: auth.key };
+    return { ...process.env };
   }
 
   async spawn(req: SpawnRequest): Promise<Session> {

@@ -44,38 +44,33 @@ npm run build
 npm link          # optional: puts `blue` on your PATH
 ```
 
-## Authentication — use an API key
+## Credentials — your own Claude CLI
+
+BlueSpace runs its crews through the [Claude CLI](https://claude.com/claude-code) you
+already have, signed in as you already are. There is nothing extra to configure:
 
 ```bash
-export ANTHROPIC_API_KEY=sk-ant-...     # https://console.anthropic.com/settings/keys
+claude --version     # installed?
+claude               # run once and sign in, if you have not
 ```
 
-BlueSpace is a third-party agent built on the Claude Agent SDK, and Anthropic's SDK
-documentation is explicit about what those may authenticate with:
-
-> Unless previously approved, Anthropic does not allow third party developers to offer
-> claude.ai login or rate limits for their products, including agents built on the Claude
-> Agent SDK. Use the API key authentication methods described in the Quickstart instead.
-
-Left alone, the SDK resolves whatever credential it can find — and on a machine with
-Claude Code installed that is usually a claude.ai subscription login. So BlueSpace
-**refuses to start** rather than quietly using it. Nothing about running on a
-subscription *fails*; it works fine right up until it becomes your problem, which is
-exactly why the guard is a refusal and not a warning.
-
-If you have read the above and want to make that call for your own account:
+If `claude` lives somewhere off your `PATH`, point BlueSpace at it:
 
 ```bash
-export BLUESPACE_INHERIT_AUTH=1
+export CLAUDE_CLI_PATH=/full/path/to/claude
 ```
 
-It is an environment variable rather than a config key on purpose. Config files get
-committed, copied between machines, and inherited by teammates and by anyone who clones
-a fork — a risk one person accepted for themselves should not travel to other people's
-accounts inside a JSON file. BlueSpace prints a warning on every start while it is set.
+BlueSpace checks the CLI answers **before** it dispatches anything. The SDK spawns it
+lazily, so without that check a missing or signed-out CLI shows up as a crew dying
+partway through a task — after a worktree exists and you have been told work started.
+One sentence at startup is the whole difference between a tool that feels solid and one
+that feels haunted.
+
+An `ANTHROPIC_API_KEY` in the environment is used if present, which is how a headless or
+CI run works with no login at all. You do not need one otherwise.
 
 Everything that only reads the Blackbox — `blue ps`, `blue log`, `blue inbox`,
-`blue config`, and `blue map` without `--orchestrate` — needs no credentials at all.
+`blue config`, and `blue map` without `--orchestrate` — needs no credentials and no CLI.
 
 ## Quickstart
 

@@ -18,7 +18,7 @@ import * as path from 'node:path';
 import * as readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
 
-import { INHERIT_AUTH_ENV, createClaudeAdapter, resolveAuth } from '../adapters/claude.js';
+import { assertClaudeCliAvailable, createClaudeAdapter } from '../adapters/claude.js';
 import { requireCapability, type HarnessAdapter } from '../adapters/types.js';
 import { Blackbox, projectCrewLog } from '../blackbox/index.js';
 import { ProjectRegistry, configPath, loadConfig, saveConfig } from '../config/index.js';
@@ -78,29 +78,18 @@ function errorMessage(e: unknown): string {
 /**
  * Gate every path that will actually run an agent.
  *
- * BlueSpace is a third-party agent built on the Claude Agent SDK, and Anthropic
- * requires those to authenticate with an API key rather than a claude.ai login.
- * The SDK will happily resolve a subscription login if one is lying around, so
- * refusing here — loudly, before anything spawns — is the only way to be sure a
- * captain never runs the fleet on a credential that is not allowed to run it.
+ * BlueSpace runs its crews through the captain's own Claude CLI, so the one hard
+ * requirement is that the CLI is installed and signed in. The SDK spawns it
+ * lazily, which means a missing or signed-out CLI would otherwise surface as a
+ * dead crew partway through a task — after a worktree exists and the captain has
+ * been told work started. Checking here turns that into one sentence at startup.
  *
- * Returns false (already having printed the reason) rather than throwing, so the
+ * Returns false (having already printed the reason) rather than throwing, so the
  * caller exits with a clean status instead of a stack trace.
  */
-function requireApiKey(): boolean {
+function requireClaudeCli(): boolean {
   try {
-    const auth = resolveAuth();
-    if (auth.kind === 'inherited') {
-      // Opted in deliberately. Say so every single time: a warning you stop
-      // seeing is a warning that has stopped working.
-      errOut(
-        yellow(
-          `${INHERIT_AUTH_ENV}=1 — using whatever credential the SDK finds, not an API key.`,
-        ),
-      );
-      errOut(dim('  Anthropic asks SDK-built agents to use an API key. Your account, your call.'));
-      errOut('');
-    }
+    assertClaudeCliAvailable();
     return true;
   } catch (e: unknown) {
     errOut(red(errorMessage(e)));
@@ -815,10 +804,10 @@ async function cmdMap(b: Boot, flags: Flags): Promise<number> {
     return 1;
   }
 
-  // Viewing the map needs no credentials; running the dispatch loop does.
+  // Viewing the map needs no Claude CLI; running the dispatch loop does.
   const orchestrate = flagBool(flags, 'orchestrate');
   if (orchestrate) {
-    if (!requireApiKey()) return 1;
+    if (!requireClaudeCli()) return 1;
     b.orch.start();
   }
 
@@ -882,10 +871,10 @@ const HELM_BANNER = [
 ].join('\n');
 
 async function runHelm(): Promise<number> {
-  // Nothing here is worth booting without credentials, and the failure must be a
+  // Nothing here is worth booting without a usable CLI, and the failure must be a
   // sentence rather than a stack trace. Local read-only commands (ps, config,
   // projects, log) deliberately do NOT go through this — they never spawn an agent.
-  if (!requireApiKey()) return 1;
+  if (!requireClaudeCli()) return 1;
 
   const b = boot();
 
