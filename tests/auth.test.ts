@@ -123,16 +123,29 @@ describe('assertClaudeCliAvailable', () => {
     );
   });
 
-  it('falls back to plain `claude` on PATH when no override is set', () => {
-    // No assertion on the outcome: whether a real CLI is installed is a property
-    // of the machine, not of the code. What must hold is that the absent case is
-    // still the typed, actionable error and never a raw spawn failure.
+  it('resolves PATH to an absolute binary, so the CLI we verify is the CLI that runs', () => {
+    // Whether a CLI is installed is a property of the machine, not of the code,
+    // so both outcomes are legal. What must hold in each: a found CLI reports an
+    // ABSOLUTE path — a bare `claude` would let the SDK quietly substitute the
+    // copy bundled inside its own package, which is a different (SDK-pinned)
+    // version from the one the captain installed — and an absent CLI still
+    // produces the typed, actionable error rather than a raw spawn failure.
     try {
       const info = assertClaudeCliAvailable(env());
-      expect(info.path).toBe('claude');
+      expect(path.isAbsolute(info.path)).toBe(true);
       expect(info.version.length).toBeGreaterThan(0);
     } catch (e) {
       expect(e).toBeInstanceOf(ClaudeCliUnavailableError);
     }
+  });
+
+  it('prefers an explicit override over anything on PATH', () => {
+    const dir = tempDir();
+    const bin = path.join(dir, 'claude');
+    fs.writeFileSync(bin, '#!/bin/sh\necho "0.0.1-override"\n', { mode: 0o755 });
+
+    const info = assertClaudeCliAvailable(env({ [CLI_PATH_ENV]: bin }));
+    expect(info.path).toBe(bin);
+    expect(info.version).toBe('0.0.1-override');
   });
 });

@@ -910,8 +910,35 @@ export interface CliInfo {
  * turns that into one sentence at startup, which is the entire difference
  * between a tool that feels solid and one that feels haunted.
  */
+/**
+ * Turn `claude` into the absolute path it actually resolves to.
+ *
+ * This matters more than it looks. Left unset, the SDK runs a copy of the CLI it
+ * ships inside its own package rather than the one the captain installed — same
+ * product, but a version the SDK pins, not the version they chose and updated.
+ * Resolving here means the binary we verified at startup is the binary that runs,
+ * instead of two things that merely happen to agree today.
+ */
+function resolveOnPath(name: string): string {
+  try {
+    const found = execFileSync(process.platform === 'win32' ? 'where' : 'which', [name], {
+      encoding: 'utf8',
+      timeout: 10_000,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    })
+      .trim()
+      .split('\n')[0]
+      ?.trim();
+    if (found !== undefined && found !== '') return found;
+  } catch {
+    /* fall through: let the --version probe below produce the real error */
+  }
+  return name;
+}
+
 export function assertClaudeCliAvailable(env: NodeJS.ProcessEnv = process.env): CliInfo {
-  const bin = env[CLI_PATH_ENV]?.trim() || 'claude';
+  const override = env[CLI_PATH_ENV]?.trim();
+  const bin = override !== undefined && override !== '' ? override : resolveOnPath('claude');
   try {
     const version = execFileSync(bin, ['--version'], {
       encoding: 'utf8',
@@ -946,10 +973,24 @@ export class ClaudeAdapter implements HarnessAdapter {
   private readonly executablePath: string | undefined;
 
   constructor(opts?: { executablePath?: string }) {
-    // An explicit argument wins; otherwise honour the same override the startup
-    // check uses, so "BlueSpace found my claude" and "BlueSpace runs my claude"
-    // can never disagree about which binary that is.
-    this.executablePath = opts?.executablePath ?? process.env[CLI_PATH_ENV]?.trim() ?? undefined;
+    // Resolve the CLI the same way the startup check does, so "BlueSpace verified
+    // my claude" and "BlueSpace runs my claude" are the same binary.
+    //
+    // Without this the SDK falls back to a copy of the CLI bundled inside its own
+    // package — a version it pins rather than the one the captain installed and
+    // updates. That divergence is silent and only shows up as the fleet behaving
+    // unlike the `claude` they just upgraded, which is a miserable thing to debug.
+    if (opts?.executablePath !== undefined) {
+      this.executablePath = opts.executablePath;
+      return;
+    }
+    try {
+      this.executablePath = assertClaudeCliAvailable().path;
+    } catch {
+      // No usable CLI. Leave it undefined and let the caller's startup check
+      // produce the actionable error rather than throwing from a constructor.
+      this.executablePath = undefined;
+    }
   }
 
   /**
