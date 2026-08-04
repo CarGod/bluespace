@@ -18,7 +18,7 @@ import * as path from 'node:path';
 import * as readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
 
-import { createClaudeAdapter } from '../adapters/claude.js';
+import { INHERIT_AUTH_ENV, createClaudeAdapter, resolveAuth } from '../adapters/claude.js';
 import { requireCapability, type HarnessAdapter } from '../adapters/types.js';
 import { Blackbox, projectCrewLog } from '../blackbox/index.js';
 import { ProjectRegistry, configPath, loadConfig, saveConfig } from '../config/index.js';
@@ -73,6 +73,39 @@ const errOut = (s = ''): void => {
 
 function errorMessage(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
+}
+
+/**
+ * Gate every path that will actually run an agent.
+ *
+ * BlueSpace is a third-party agent built on the Claude Agent SDK, and Anthropic
+ * requires those to authenticate with an API key rather than a claude.ai login.
+ * The SDK will happily resolve a subscription login if one is lying around, so
+ * refusing here — loudly, before anything spawns — is the only way to be sure a
+ * captain never runs the fleet on a credential that is not allowed to run it.
+ *
+ * Returns false (already having printed the reason) rather than throwing, so the
+ * caller exits with a clean status instead of a stack trace.
+ */
+function requireApiKey(): boolean {
+  try {
+    const auth = resolveAuth();
+    if (auth.kind === 'inherited') {
+      // Opted in deliberately. Say so every single time: a warning you stop
+      // seeing is a warning that has stopped working.
+      errOut(
+        yellow(
+          `${INHERIT_AUTH_ENV}=1 — using whatever credential the SDK finds, not an API key.`,
+        ),
+      );
+      errOut(dim('  Anthropic asks SDK-built agents to use an API key. Your account, your call.'));
+      errOut('');
+    }
+    return true;
+  } catch (e: unknown) {
+    errOut(red(errorMessage(e)));
+    return false;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -782,8 +815,12 @@ async function cmdMap(b: Boot, flags: Flags): Promise<number> {
     return 1;
   }
 
+  // Viewing the map needs no credentials; running the dispatch loop does.
   const orchestrate = flagBool(flags, 'orchestrate');
-  if (orchestrate) b.orch.start();
+  if (orchestrate) {
+    if (!requireApiKey()) return 1;
+    b.orch.start();
+  }
 
   const opts: { blackbox: Blackbox; orch: Orchestrator; port?: number } = {
     blackbox: b.blackbox,
@@ -845,6 +882,11 @@ const HELM_BANNER = [
 ].join('\n');
 
 async function runHelm(): Promise<number> {
+  // Nothing here is worth booting without credentials, and the failure must be a
+  // sentence rather than a stack trace. Local read-only commands (ps, config,
+  // projects, log) deliberately do NOT go through this — they never spawn an agent.
+  if (!requireApiKey()) return 1;
+
   const b = boot();
 
   const helm = await import('../agents/helm/index.js');

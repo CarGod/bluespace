@@ -44,10 +44,38 @@ npm run build
 npm link          # optional: puts `blue` on your PATH
 ```
 
-Crews and Sentinels run through the Claude Agent SDK, so you need credentials in the
-environment the way the `claude` CLI expects them (`ANTHROPIC_API_KEY`, or an existing
-Claude Code login). Everything that only reads the Blackbox — `blue ps`, `blue log`,
-`blue inbox`, `blue config`, `blue map` — works with no credentials at all.
+## Authentication — use an API key
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...     # https://console.anthropic.com/settings/keys
+```
+
+BlueSpace is a third-party agent built on the Claude Agent SDK, and Anthropic's SDK
+documentation is explicit about what those may authenticate with:
+
+> Unless previously approved, Anthropic does not allow third party developers to offer
+> claude.ai login or rate limits for their products, including agents built on the Claude
+> Agent SDK. Use the API key authentication methods described in the Quickstart instead.
+
+Left alone, the SDK resolves whatever credential it can find — and on a machine with
+Claude Code installed that is usually a claude.ai subscription login. So BlueSpace
+**refuses to start** rather than quietly using it. Nothing about running on a
+subscription *fails*; it works fine right up until it becomes your problem, which is
+exactly why the guard is a refusal and not a warning.
+
+If you have read the above and want to make that call for your own account:
+
+```bash
+export BLUESPACE_INHERIT_AUTH=1
+```
+
+It is an environment variable rather than a config key on purpose. Config files get
+committed, copied between machines, and inherited by teammates and by anyone who clones
+a fork — a risk one person accepted for themselves should not travel to other people's
+accounts inside a JSON file. BlueSpace prints a warning on every start while it is set.
+
+Everything that only reads the Blackbox — `blue ps`, `blue log`, `blue inbox`,
+`blue config`, and `blue map` without `--orchestrate` — needs no credentials at all.
 
 ## Quickstart
 

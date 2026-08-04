@@ -849,6 +849,65 @@ class ClaudeConversation implements Conversation {
 // Adapter
 // ---------------------------------------------------------------------------
 
+/** Raised when no API key is available. Carries operator-facing guidance. */
+export class MissingApiKeyError extends Error {
+  constructor() {
+    super(
+      'ANTHROPIC_API_KEY is not set.\n\n' +
+        'BlueSpace is an agent built on the Claude Agent SDK, and Anthropic requires\n' +
+        'SDK-built agents to authenticate with an API key rather than a claude.ai\n' +
+        'login. Running it on a subscription login is not permitted and risks your\n' +
+        'account, so BlueSpace refuses to start rather than quietly using whatever\n' +
+        'credential happens to be lying around.\n\n' +
+        'Get a key at https://console.anthropic.com/settings/keys, then:\n' +
+        '  export ANTHROPIC_API_KEY=sk-ant-...\n\n' +
+        'If you understand the above and want BlueSpace to use whatever credential\n' +
+        'the SDK finds anyway, that is your call to make for your own account:\n' +
+        '  export BLUESPACE_INHERIT_AUTH=1',
+    );
+    this.name = 'MissingApiKeyError';
+  }
+}
+
+/** The deliberate, un-guessable opt-out. Not a config key: see below. */
+export const INHERIT_AUTH_ENV = 'BLUESPACE_INHERIT_AUTH';
+
+export type AuthMode =
+  | { kind: 'api-key'; key: string }
+  /** Whatever credential the SDK finds — the captain accepted the risk explicitly. */
+  | { kind: 'inherited' };
+
+/**
+ * Decide how a run authenticates.
+ *
+ * Default: an explicit API key, because BlueSpace is a third-party agent built on
+ * the Claude Agent SDK and Anthropic's SDK docs require API-key auth for those
+ * rather than a claude.ai login. Left alone the SDK resolves whatever credential
+ * it can find, and on a machine with Claude Code installed that is usually a
+ * subscription — so a silent fallback would quietly put the captain's account on
+ * the wrong side of that line.
+ *
+ * Escape hatch: setting BLUESPACE_INHERIT_AUTH=1 hands credential resolution back
+ * to the SDK. It is an environment variable and not a config key on purpose —
+ * config files get committed, copied between machines, and inherited by teammates
+ * and by anyone who clones an open-source fork. A risk one person accepted for
+ * themselves should not travel to other people's accounts in a JSON file.
+ */
+export function resolveAuth(env: NodeJS.ProcessEnv = process.env): AuthMode {
+  const key = env['ANTHROPIC_API_KEY']?.trim();
+  if (key !== undefined && key !== '') return { kind: 'api-key', key };
+  const inherit = env[INHERIT_AUTH_ENV]?.trim();
+  if (inherit === '1' || inherit?.toLowerCase() === 'true') return { kind: 'inherited' };
+  throw new MissingApiKeyError();
+}
+
+/** Back-compat helper for callers that only need the key. */
+export function assertApiKeyAuth(env: NodeJS.ProcessEnv = process.env): string {
+  const auth = resolveAuth(env);
+  if (auth.kind !== 'api-key') throw new MissingApiKeyError();
+  return auth.key;
+}
+
 export class ClaudeAdapter implements HarnessAdapter {
   readonly name = 'claude';
   readonly capabilities: AdapterCapabilities = CLAUDE_CAPABILITIES;
@@ -857,6 +916,19 @@ export class ClaudeAdapter implements HarnessAdapter {
 
   constructor(opts?: { executablePath?: string }) {
     this.executablePath = opts?.executablePath;
+  }
+
+  /**
+   * The environment handed to every SDK run.
+   *
+   * With an API key we pin it so the SDK cannot silently fall back to something
+   * else. Under the explicit opt-out we pass the ambient environment through
+   * untouched and let the SDK resolve credentials however it likes.
+   */
+  private authEnv(): Record<string, string | undefined> {
+    const auth = resolveAuth();
+    if (auth.kind === 'inherited') return { ...process.env };
+    return { ...process.env, ANTHROPIC_API_KEY: auth.key };
   }
 
   async spawn(req: SpawnRequest): Promise<Session> {
@@ -870,6 +942,7 @@ export class ClaudeAdapter implements HarnessAdapter {
 
     const options: ClaudeOptions = {
       cwd: req.cwd,
+      env: this.authEnv(),
       abortController: controller,
       permissionMode: toSdkPermissionMode(profile.permissionMode),
     };
@@ -950,6 +1023,7 @@ export class ClaudeAdapter implements HarnessAdapter {
     const options: ClaudeOptions = {
       sessionId: id,
       systemPrompt: req.systemPrompt,
+      env: this.authEnv(),
       mcpServers: { [CONVERSATION_SERVER_NAME]: server },
       abortController: controller,
       permissionMode: toSdkPermissionMode(profile.permissionMode),
