@@ -885,6 +885,15 @@ async function runHelm(): Promise<number> {
   let atLineStart = true;
   let exitCode = 0;
   let finished = false;
+  /**
+   * stdin reached EOF while there was still work to do.
+   *
+   * A pipe delivers its buffered lines and then closes immediately, so `close`
+   * lands while the first turn is still running. Shutting down there would
+   * discard the answer the captain piped in and asked for. Instead we remember
+   * that no more input is coming and exit once the queue has drained.
+   */
+  let inputClosed = false;
   let resolveDone: (code: number) => void = () => undefined;
   const done = new Promise<number>((resolve) => {
     resolveDone = resolve;
@@ -914,6 +923,11 @@ async function runHelm(): Promise<number> {
     if (finished) return;
     const nudge = decisionNudge(b.orch.openDecisions());
     if (nudge !== undefined) out(nudge);
+    // Piped input: the queue is empty and stdin is gone, so this was the last turn.
+    if (inputClosed) {
+      shutdown(0);
+      return;
+    }
     rl.resume();
     rl.prompt();
   };
@@ -1047,7 +1061,13 @@ async function runHelm(): Promise<number> {
   });
 
   rl.on('close', () => {
-    if (!finished) shutdown(0);
+    if (finished) return;
+    // Work still in flight (a pipe, or Ctrl-D mid-turn): let it finish, then exit.
+    if (busy || queued.length > 0) {
+      inputClosed = true;
+      return;
+    }
+    shutdown(0);
   });
 
   // readline swallows SIGINT when the terminal is attached, so listen on both.
