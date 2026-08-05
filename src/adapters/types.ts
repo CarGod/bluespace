@@ -88,11 +88,33 @@ export interface ToolDef {
   handler(input: Record<string, unknown>): Promise<string>;
 }
 
+/**
+ * Which on-disk configuration scopes a run inherits.
+ *
+ *   user    ~/.claude/  — CLAUDE.md, rules, skills, settings.json (and its hooks)
+ *   project <cwd>/      — CLAUDE.md, .claude/rules, .claude/skills, .claude/settings.json
+ *   local   <cwd>/      — CLAUDE.local.md, .claude/settings.local.json
+ *
+ * BlueSpace always states this explicitly. Omitting it is NOT "inherit nothing":
+ * the harness treats an absent value as all three scopes, so leaving it unset
+ * means every Crew silently runs the captain's personal interactive-session
+ * hooks, and the set of things loaded changes whenever the captain edits a file
+ * nobody was thinking about. A dispatch decision this load-bearing belongs in
+ * the code that makes it, not in a default.
+ *
+ * Note that some inputs are read no matter what this says — the global
+ * `~/.claude.json` and auto-memory under `~/.claude/projects/` among them.
+ * `[]` narrows the blast radius; it does not produce a hermetic run.
+ */
+export type SettingScope = 'user' | 'project' | 'local';
+
 export interface ConversationRequest {
   systemPrompt: string;
   tools: ToolDef[];
   cwd?: string;
   profile: DispatchProfile;
+  /** On-disk scopes to inherit. Required: see {@link SettingScope}. */
+  settingScopes: readonly SettingScope[];
   signal?: AbortSignal;
 }
 
@@ -118,8 +140,17 @@ export interface SpawnRequest {
   /** The opening message — for a Crew, its brief. */
   prompt: string;
   profile: DispatchProfile;
-  /** Extra instructions appended to the harness's own system prompt. */
-  systemPromptAppend?: string;
+  /** On-disk scopes to inherit. Required: see {@link SettingScope}. */
+  settingScopes: readonly SettingScope[];
+  /**
+   * Extra instructions appended to the harness's own system prompt.
+   *
+   * Load-bearing beyond its own text: supplying it is also what selects the
+   * harness's native system prompt. A run that omits it gets the harness's
+   * minimal prompt instead — the tools, but not the operating instructions
+   * that make them behave like the product. Every worker passes one.
+   */
+  systemPromptAppend: string;
   /** Constrain the final result to this JSON Schema. Requires `structuredOutput`. */
   outputSchema?: unknown;
   /** Resume a prior session instead of starting fresh. Requires `fork`. */

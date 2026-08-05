@@ -899,6 +899,11 @@ async function runHelm(): Promise<number> {
     tools: helm.helmTools(b.orch, b.registry),
     cwd: process.cwd(),
     profile,
+    // Helm is the control plane, and `cwd` here is wherever the captain happened
+    // to type `blue` — which is not necessarily a registered project and may be
+    // no repo at all. Inheriting a CLAUDE.md from a directory chosen by accident
+    // would let the working directory silently change how the fleet is routed.
+    settingScopes: [],
     signal: abort.signal,
   });
 

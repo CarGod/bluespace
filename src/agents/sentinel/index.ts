@@ -142,6 +142,12 @@ export async function runSentinel(input: RunSentinelInput): Promise<Verdict> {
       prompt,
       profile: sentinelProfile(profile),
       systemPromptAppend: SENTINEL_SYSTEM_PROMPT,
+      // Nothing. The Sentinel's whole value is that it judges the brief and the
+      // diff and has no other input; a CLAUDE.md is exactly the kind of "but we
+      // always do it this way here" context that talks a verifier into a pass.
+      // The Crew inherits the repo's conventions so it writes to them — the
+      // Sentinel must not, or the two are no longer independent.
+      settingScopes: [],
       outputSchema: VERDICT_SCHEMA,
     });
 

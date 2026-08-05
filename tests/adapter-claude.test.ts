@@ -177,7 +177,7 @@ function within<T>(p: Promise<T>, ms = 2000): Promise<T> {
 }
 
 const converse = (tools: ToolDef[] = []) =>
-  new ClaudeAdapter().converse({ systemPrompt: 'you are helm', tools, profile: PROFILE });
+  new ClaudeAdapter().converse({ systemPrompt: 'you are helm', tools, profile: PROFILE, settingScopes: [] });
 
 const types = (events: AdapterEvent[]): string[] => events.map((e) => e.type);
 

@@ -1033,13 +1033,19 @@ export class ClaudeAdapter implements HarnessAdapter {
     if (profile.maxBudgetUsd !== undefined) options.maxBudgetUsd = profile.maxBudgetUsd;
     if (this.executablePath !== undefined) options.pathToClaudeCodeExecutable = this.executablePath;
 
-    if (req.systemPromptAppend !== undefined) {
-      options.systemPrompt = {
-        type: 'preset',
-        preset: 'claude_code',
-        append: req.systemPromptAppend,
-      };
-    }
+    // Always the preset, never the SDK's minimal prompt. `systemPrompt` left
+    // unset means the worker gets Claude Code's tools without Claude Code's
+    // instructions — which reads as a subtly worse model rather than as a
+    // missing option, so it is not a mistake anyone finds by looking at output.
+    options.systemPrompt = {
+      type: 'preset',
+      preset: 'claude_code',
+      append: req.systemPromptAppend,
+    };
+
+    // Stated, never inferred. An absent `settingSources` means all three
+    // scopes, so the only way to not inherit the captain's own hooks is to say so.
+    options.settingSources = [...req.settingScopes];
 
     if (req.outputSchema !== undefined) {
       options.outputFormat = { type: 'json_schema', schema: asJsonSchema(req.outputSchema) };
@@ -1106,6 +1112,8 @@ export class ClaudeAdapter implements HarnessAdapter {
       // the read-only three — anything that changes the world goes through a
       // ToolDef, where the caller can see it.
       tools: ['Read', 'Glob', 'Grep'],
+      // Same reasoning as spawn(): stated, never inferred.
+      settingSources: [...req.settingScopes],
     };
 
     // Same paired safety interlock as spawn(): the SDK refuses one without the other.

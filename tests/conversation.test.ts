@@ -293,6 +293,7 @@ describe('Conversation contract', () => {
       systemPrompt: 'you are helm',
       tools: [echoTool(calls)],
       profile: PROFILE,
+      settingScopes: [],
     });
 
     const first = await collect(convo.send('ping once'));
@@ -326,6 +327,7 @@ describe('Conversation contract', () => {
       systemPrompt: 'you are helm',
       tools: [],
       profile: PROFILE,
+      settingScopes: [],
     });
 
     const seen: string[] = [];
@@ -342,6 +344,7 @@ describe('Conversation contract', () => {
       systemPrompt: 'you are helm',
       tools: [],
       profile: PROFILE,
+      settingScopes: [],
     });
 
     const inFlight = convo.send('first');
@@ -370,6 +373,7 @@ describe('Conversation contract', () => {
       systemPrompt: 'you are helm',
       tools: [],
       profile: PROFILE,
+      settingScopes: [],
     });
 
     await convo.close();
@@ -382,7 +386,7 @@ describe('Conversation contract', () => {
     const calls: string[] = [];
     const adapter = new FakeAdapter();
     const tools = [echoTool(calls)];
-    await adapter.converse({ systemPrompt: 'p', tools, profile: PROFILE, cwd: '/tmp/x' });
+    await adapter.converse({ systemPrompt: 'p', tools, profile: PROFILE, settingScopes: [], cwd: '/tmp/x' });
 
     const request = adapter.conversations[0]?.request;
     expect(request?.tools).toBe(tools);
@@ -395,7 +399,7 @@ describe('Conversation contract', () => {
     adapter.capabilities.conversation = false;
     expect(() => requireCapability(adapter, 'conversation')).toThrow(UnsupportedCapabilityError);
     await expect(
-      adapter.converse({ systemPrompt: 'p', tools: [], profile: PROFILE }),
+      adapter.converse({ systemPrompt: 'p', tools: [], profile: PROFILE, settingScopes: [] }),
     ).rejects.toThrow(UnsupportedCapabilityError);
   });
 });

@@ -30,7 +30,7 @@ import {
   type HarnessAdapter,
   type Session,
 } from '../adapters/types.js';
-import { NEEDS_DECISION_MARKER, buildBrief } from '../agents/crew/index.js';
+import { CREW_SYSTEM_PROMPT, NEEDS_DECISION_MARKER, buildBrief } from '../agents/crew/index.js';
 import { runSentinel } from '../agents/sentinel/index.js';
 import { projectOpenDecisions, projectTask, projectTasks, type Blackbox } from '../blackbox/index.js';
 import type { BlueConfig, ProjectRegistry } from '../config/index.js';
@@ -526,6 +526,13 @@ export class Orchestrator {
       cwd: worktree.path,
       prompt,
       profile,
+      systemPromptAppend: CREW_SYSTEM_PROMPT,
+      // The repo's conventions, not the captain's. `project` resolves against
+      // cwd — the worktree — so this is the checked-in CLAUDE.md, rules and
+      // skills of the code being edited. `user` is withheld: those hooks and
+      // settings were written for an interactive session, and firing them once
+      // per Crew is both wrong and, for anything that blocks, a hang.
+      settingScopes: ['project'],
     });
 
     this.#deps.blackbox.appendMany([

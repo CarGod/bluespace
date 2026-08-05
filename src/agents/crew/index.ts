@@ -6,10 +6,19 @@
  * the Blackbox — it is a pure string builder, so the wording of a brief can be
  * unit-tested and diffed like any other artefact.
  *
- * The brief is the ONLY context a Crew starts with. It therefore has to carry
- * everything a competent worker would otherwise ask a human for: where it is,
- * what branch it is on, what "done" means, how to escalate a decision instead
- * of guessing, and how to report without burning the captain's attention.
+ * The brief is the only context BlueSpace itself supplies. It therefore has to
+ * carry everything a competent worker would otherwise ask a human for: where it
+ * is, what branch it is on, what "done" means, how to escalate a decision
+ * instead of guessing, and how to report without burning the captain's
+ * attention.
+ *
+ * It is not, however, the only context the Crew has. Dispatch inherits the
+ * `project` setting scope, so the repo's own CLAUDE.md, rules and skills are in
+ * play too — deliberately, because a worker that ignores the conventions of the
+ * repo it is editing produces diffs the Sentinel is right to reject. What it
+ * does NOT inherit is the `user` scope: the captain's personal hooks and
+ * settings are written for a session someone is sitting in front of, and this
+ * is not one. See SpawnRequest.settingScopes.
  */
 
 import type { Project, Task } from '../../types/domain.js';
@@ -25,6 +34,23 @@ import type { Worktree } from '../../worktree/index.js';
  * from this module.
  */
 export const NEEDS_DECISION_MARKER = 'NEEDS-DECISION:';
+
+/**
+ * Appended to the harness's own system prompt for every Crew run.
+ *
+ * Kept short on purpose. The brief carries the task; this carries only the two
+ * facts that are true of every Crew and that the harness's default prompt
+ * assumes the opposite of — that nobody is watching, and that the working copy
+ * is disposable. Everything else a worker needs belongs in the brief, where it
+ * can be diffed per task.
+ */
+export const CREW_SYSTEM_PROMPT = [
+  'You are running unattended inside a disposable git worktree on a throwaway',
+  'branch. No human will see this session while it is happening; the only',
+  'things that reach the captain are your final report and any',
+  `${NEEDS_DECISION_MARKER} line you emit. Asking a question you could answer`,
+  'by reading the repo costs a full round trip through a human, so do not.',
+].join(' ');
 
 export interface BuildBriefInput {
   task: Task;
