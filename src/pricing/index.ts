@@ -185,7 +185,15 @@ export interface PriceResult {
  */
 export function resolveModelRate(model: string | undefined): RateResolution {
   if (model !== undefined && model !== '') {
-    const exact = MODEL_RATES[model];
+    // OWN properties only. A plain-object lookup answers `toString`,
+    // `constructor` and `__proto__` with something inherited from
+    // Object.prototype, which is not undefined and not a rate — it would be
+    // reported as an `exact` match and then price every token at NaN, which
+    // the caller floors to $0. A model string is parsed JSON off disk, so the
+    // only thing standing between that and a free run is this check.
+    const exact = Object.prototype.hasOwnProperty.call(MODEL_RATES, model)
+      ? MODEL_RATES[model]
+      : undefined;
     if (exact !== undefined) {
       return { rate: exact, match: 'exact', pricedAs: model };
     }

@@ -341,12 +341,39 @@ export class Orchestrator {
    *
    * The answer reaches the SAME session where possible, so the Crew keeps every
    * bit of context it built before it stopped to ask.
+   *
+   * REFUSES when this process is not the one holding that Crew. `#live` is
+   * per-process and unprojectable, so a `blue` invocation that never dispatched
+   * anything — `blue inbox`, a view-only `blue map` — has no session to deliver
+   * into and no way to reach the one that does. It used to record the answer
+   * anyway and then fail the task with `crew_lost`, which meant the inbox
+   * printed "✓ answered" and killed a healthy task in the same breath. Throwing
+   * before anything is appended leaves the decision open, so it can still be
+   * answered from the process that owns the fleet. `steer()` has always refused
+   * the same way; this is that rule applied to the other half of the protocol.
    */
   async resolveDecision(id: DecisionId, answer: string): Promise<void> {
     const decision = projectOpenDecisions(this.#deps.blackbox.read()).find((d) => d.id === id);
     if (!decision) throw new Error(`decision ${id} is not open`);
 
     const taskId = decision.taskId;
+
+    // Abandoning needs no session — it stops the task rather than talking to it,
+    // and it is the captain's way out when the Crew really is gone.
+    const abandoning =
+      answer.trim().toLowerCase() === ABANDON_OPTION_ID &&
+      decision.options.some((o) => o.id === ABANDON_OPTION_ID);
+
+    const current = this.task(taskId);
+    if (!abandoning && current && !isTerminal(current.state) && !this.#live.has(taskId)) {
+      throw new Error(
+        `cannot deliver this answer: task ${taskId} has no Crew running in this process. ` +
+          `Answer it where the fleet is running — Helm's answer_decision in the Claude Code ` +
+          `window serving \`blue mcp\`, or the Starmap started with \`blue map --orchestrate\`. ` +
+          `If that process is gone the Crew went with it, and the task has to be cancelled.`,
+      );
+    }
+
     this.#deps.blackbox.append({
       type: 'decision.resolved',
       decisionId: id,
@@ -357,10 +384,7 @@ export class Orchestrator {
     // An explicit abandon option is the captain's exit hatch out of a task that
     // has already proven it cannot converge. Only honoured when the decision
     // actually offered it.
-    const abandoned =
-      answer.trim().toLowerCase() === ABANDON_OPTION_ID &&
-      decision.options.some((o) => o.id === ABANDON_OPTION_ID);
-    if (abandoned) {
+    if (abandoning) {
       await this.#teardown(taskId, { removeWorktree: false });
       this.#failTask(taskId, 'abandoned_by_captain');
       return;
@@ -922,7 +946,13 @@ export class Orchestrator {
     this.#setState(live.taskId, 'awaiting_decision', 'crew_requested_decision');
   }
 
-  /** Get a message to a task's Crew, restarting it cold if the session is gone. */
+  /**
+   * Get a message to a task's Crew, restarting it cold if the session is gone.
+   *
+   * Only ever called for a task this process holds — callers check first — so
+   * reaching the `!live` branch means the crew was torn down underneath us,
+   * which is a genuine loss rather than the cross-process case above.
+   */
   async #deliver(taskId: TaskId, message: string, reason: string): Promise<void> {
     const live = this.#live.get(taskId);
     if (live && !live.closed && this.#deps.adapter.capabilities.steer) {
@@ -955,6 +985,15 @@ export class Orchestrator {
    *
    * The worktree survives the swap, so a cold restart loses the Crew's reasoning
    * but never its work.
+   *
+   * THE OUTGOING SESSION IS CLOSED FIRST, and that ordering is not tidiness.
+   * A restart happens because `send()` threw, and a throw from `send()` is not
+   * proof the worker is dead — a transient tmux failure raises it against a
+   * Crew that is alive and mid-turn. Dropping the handle instead of closing it
+   * would leave that worker running with nobody reading its transcript: real
+   * tokens spent that no `crew.usage` event records and no budget ceiling can
+   * see, a window the reaper cannot attribute, and — worst of the three — two
+   * Crews editing one worktree.
    */
   async #restart(live: LiveCrew, addendum: string): Promise<void> {
     const task = this.task(live.taskId);
@@ -966,6 +1005,14 @@ export class Orchestrator {
       worktree: live.worktree,
       baseBranch: live.baseBranch,
     })}\n\n---\n\n${addendum}`;
+
+    // Best-effort: a session that is genuinely gone throws here, and that is
+    // the common case rather than the exception.
+    try {
+      await live.session.close();
+    } catch (err) {
+      this.#log(`restart close ${live.taskId}`, err);
+    }
 
     const { session, crewId } = await this.#spawnCrew({
       task,
@@ -1002,6 +1049,13 @@ export class Orchestrator {
    * the turn (see `src/adapters/claude-cli.ts`, header 6). It is a ceiling with
    * overshoot, not a hard stop, and calling it anything else would be a lie the
    * captain pays for.
+   *
+   * WHAT IT MAY NOT DO IS FAIL QUIETLY. `overBudget` is latched, so this runs
+   * once per task; if the one interrupt it sends is swallowed, nothing tries
+   * again and the Crew keeps spending until the turn timeout hours later —
+   * a ceiling that logged a line and stopped nothing. So a failed interrupt
+   * escalates to closing the session outright, which the wait loop sees
+   * immediately.
    */
   #enforceBudget(live: LiveCrew): void {
     const cap = this.#deps.config.maxBudgetUsdPerTask;
@@ -1013,9 +1067,21 @@ export class Orchestrator {
     this.#track(
       (async () => {
         try {
-          if (this.#deps.adapter.capabilities.interrupt) await live.session.interrupt();
+          if (this.#deps.adapter.capabilities.interrupt) {
+            await live.session.interrupt();
+            return;
+          }
         } catch (err) {
           this.#log(`budget interrupt ${live.taskId}`, err);
+        }
+        // Either the adapter cannot interrupt, or the interrupt failed. Killing
+        // the session is the blunter instrument and the only one left; the
+        // stream still drains and the exit is still reported honestly, because
+        // `overBudget` is what `#afterExit` reads, not the exit reason.
+        try {
+          await live.session.close();
+        } catch (err) {
+          this.#log(`budget close ${live.taskId}`, err);
         }
       })(),
     );

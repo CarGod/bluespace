@@ -111,7 +111,10 @@ export interface ReadTranscriptOptions {
   /** Absolute path to the `.jsonl`. Use {@link findTranscript} to get one. */
   path: string;
   price: PriceFn;
-  /** Stop tailing. The generator returns cleanly; it does not throw. */
+  /**
+   * Stop tailing. The generator drains to EOF one last time, flushes the held
+   * usage, and returns cleanly; it does not throw. Abort is "drain and stop".
+   */
   signal?: AbortSignal;
   /** Tail for appended records (default). `false` reads to EOF and stops. */
   follow?: boolean;
@@ -388,7 +391,13 @@ export async function* readTranscript(
     let resyncing = false;
 
     for (;;) {
-      if (aborted()) break;
+      // Sampled BEFORE the read pass and acted on AFTER it: an abort means
+      // "drain what is there, then stop", never "stop". The difference is a
+      // dropped bill — the abort arrives from a watcher that has just seen the
+      // Stop hook, and the records the turn was still writing are on disk by
+      // then. Bounded: the drain below runs against a size sampled once, so a
+      // file that keeps growing costs one extra pass, not an unbounded loop.
+      const stopping = aborted();
 
       const size = (await handle.stat()).size;
       // A shrunken file means it was truncated or replaced (a resumed session gets
@@ -441,7 +450,7 @@ export async function* readTranscript(
       }
 
       if (!follow) break;
-      if (aborted()) break;
+      if (stopping) break;
       await waker.wait(pollIntervalMs);
     }
 
@@ -467,6 +476,12 @@ export async function* readTranscript(
  * A run's transcript does not exist until the CLI writes its first record, so a
  * caller that starts the reader at spawn time races it every single time.
  * Returns undefined if the wait was aborted; throws only on a real timeout.
+ *
+ * THE OPEN IS ATTEMPTED BEFORE THE ABORT IS CHECKED. An abort is a reason to
+ * stop WAITING for a file, never a reason to refuse one that already exists —
+ * checking first would mean a reader whose signal fired while it was starting up
+ * returns zero events for a transcript sitting complete on disk, which is a whole
+ * turn billed at nothing.
  */
 async function openWhenReady(
   transcriptPath: string,
@@ -479,12 +494,12 @@ async function openWhenReady(
 ): Promise<fs.FileHandle | undefined> {
   const deadline = Date.now() + o.waitForFileMs;
   for (;;) {
-    if (o.signal?.aborted === true) return undefined;
     try {
       return await fs.open(transcriptPath, 'r');
     } catch (e: unknown) {
       if (!isMissingFile(e)) throw e;
     }
+    if (o.signal?.aborted === true) return undefined;
     if (Date.now() >= deadline) throw new TranscriptNotFoundError(transcriptPath, o.waitForFileMs);
     // Poll rather than watch the parent: the directory may not exist yet either,
     // and a watch on a path that appears later is not portable.
@@ -794,7 +809,15 @@ function* flushUsageEvent(
   const inputTokens = pending.usage.input_tokens ?? 0;
   const outputTokens = pending.usage.output_tokens ?? 0;
   const cacheReadTokens = pending.usage.cache_read_input_tokens ?? 0;
-  const cacheCreationTokens = pending.usage.cache_creation_input_tokens ?? 0;
+  // The TTL split, not just the total. `src/pricing` bills whichever is larger
+  // (a split that exceeds its total is trusted as-is), so reading only the
+  // total here would let a block that IS billed be dropped as empty, and would
+  // report zero cache-creation tokens for a cost the captain was charged.
+  const split = pending.usage.cache_creation;
+  const cacheCreationTokens = Math.max(
+    pending.usage.cache_creation_input_tokens ?? 0,
+    (split?.ephemeral_1h_input_tokens ?? 0) + (split?.ephemeral_5m_input_tokens ?? 0),
+  );
 
   // An all-zero block bills nothing and reports nothing. It is also what the
   // `<synthetic>` model records (CLI-injected API errors) carry, which is the

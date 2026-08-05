@@ -10,9 +10,11 @@
  * prescriptive triggers are what actually improve tool selection.
  *
  * Nothing in this file knows which harness runs it. A tool is a `ToolDef`: a name,
- * a description, a JSON Schema, and a handler returning text. The adapter turns
- * that into whatever its SDK wants — including catching a throw and reporting it
- * to the model as a tool error, which is why these handlers throw freely.
+ * a description, a JSON Schema, and a handler returning text. The transport turns
+ * that into whatever its protocol wants — including catching a throw and reporting
+ * it to the model as a tool error, which is why these handlers throw freely. Today
+ * that transport is `src/mcp/server.ts`, which returns a throw as `{isError: true}`
+ * so Helm can read the message and correct itself.
  */
 
 import type { ToolDef } from '../../adapters/types.js';
@@ -199,8 +201,9 @@ function countByState(tasks: Task[]): Record<string, number> {
 /**
  * Helm's nine tools, described vendor-neutrally.
  *
- * Hand them to `adapter.converse({ tools: helmTools(orch, registry), … })`; the
- * adapter is the only thing that knows how a harness wants them expressed.
+ * `src/mcp/run.ts` hands them straight to the stdio server, which is what puts
+ * them in the captain's Claude Code window as `mcp__bluespace__*`. Nothing here
+ * knows that; a second transport would need no change on this side.
  */
 export function helmTools(orch: Orchestrator, registry: ProjectRegistry): ToolDef[] {
   const nameOf = (projectId: string): string | undefined => registry.get(projectId)?.name;
@@ -273,6 +276,20 @@ export function helmTools(orch: Orchestrator, registry: ProjectRegistry): ToolDe
       const title = requireString(input, 'title');
       const brief = requireString(input, 'brief');
       const dependsOn = optionalStringArray(input, 'dependsOn');
+
+      // Checked here rather than left to dispatch. The orchestrator does reject
+      // an unknown project — with `unknown_project:<id>`, minutes later, on a
+      // task this handler already reported as queued. A throw reaches Helm now,
+      // naming the ids that exist, and costs one corrected call.
+      if (!registry.get(projectId)) {
+        const known = registry.list();
+        throw new Error(
+          `No project with id ${projectId}. ` +
+            (known.length > 0
+              ? `Registered ids: ${known.map((p) => p.id).join(', ')}. Use resolve_project if you are unsure which one the captain means.`
+              : `No projects are registered — the captain adds one with \`blue projects add <path>\`.`),
+        );
+      }
 
       const task = orch.createTask({ kind, projectId, title, brief, dependsOn });
       return ok({
@@ -386,9 +403,9 @@ export function helmTools(orch: Orchestrator, registry: ProjectRegistry): ToolDe
   const cancelTask: ToolDef = {
     name: 'cancel_task',
     description: [
-      'Stop a task and tear down its worktree.',
+      'Stop a task, end its Crew, and delete its worktree directory.',
       'Call this when the captain abandons the work, or when you created a task against the wrong project or the wrong goal.',
-      'Cancellation is final and the branch is discarded, so create a replacement task in the same turn if the work is still wanted.',
+      'Cancellation is final for the task and cannot be undone. Uncommitted work in the worktree is lost; commits the Crew made survive on the branch, which is kept whenever it holds anything not already in the base branch. If the work is still wanted, create a replacement task in the same turn.',
     ].join(' '),
     inputSchema: object({ taskId: str('Task id to cancel.') }, ['taskId']),
     handler: async (input) => {

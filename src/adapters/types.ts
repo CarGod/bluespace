@@ -55,24 +55,34 @@ export interface AdapterCapabilities {
   toolEvents: boolean;
   /** Can the run be constrained to a JSON Schema? (Sentinel needs this.) */
   structuredOutput: boolean;
-  /** Can messages be pushed into a live session? (Helm steering a Crew.) */
+  /** Can messages be pushed into a live session? (Rework, and `steer_task`.) */
   steer: boolean;
-  /** Can it host a multi-turn conversation with caller-supplied tools? (Helm.) */
+  /**
+   * Can it host a multi-turn conversation with caller-supplied tools?
+   *
+   * False on the only adapter there is, and nothing calls `converse()` any more:
+   * Helm used to run on this surface from `blue`'s REPL, and now runs in the
+   * captain's own Claude Code window over MCP. It stays declared because it is
+   * the honest answer to "what can this adapter do", and `requireCapability`
+   * turns the answer into a refusal instead of a surprise.
+   */
   conversation: boolean;
 }
 
 // ---------------------------------------------------------------------------
-// Conversation — the surface Helm runs on
+// Tools, and the conversation surface no adapter implements
 // ---------------------------------------------------------------------------
 
 /**
  * A tool the caller hosts, described vendor-neutrally.
  *
  * `inputSchema` is JSON Schema because that is the one tool-description format
- * every harness can consume. Adapters translate it into whatever their SDK
- * wants; callers never learn what that is. This is the boundary that keeps
- * Helm's tools — and therefore the orchestrator's entire control surface —
- * from being welded to one vendor.
+ * every harness can consume. The transport translates it into whatever its
+ * protocol wants; callers never learn what that is. This is the boundary that
+ * keeps Helm's tools — and therefore the orchestrator's entire control surface —
+ * from being welded to one vendor. Today the only consumer is the MCP server in
+ * `src/mcp/`, which hands these out verbatim; `ConversationRequest` below is the
+ * other consumer this type was designed for, and nothing implements it.
  */
 export interface ToolDef {
   name: string;
@@ -186,7 +196,10 @@ export interface HarnessAdapter {
   readonly capabilities: AdapterCapabilities;
   /** Run a one-shot worker (a Crew, or a Sentinel). */
   spawn(req: SpawnRequest): Promise<Session>;
-  /** Run a multi-turn conversation with hosted tools (Helm). Requires `conversation`. */
+  /**
+   * Run a multi-turn conversation with hosted tools. Requires `conversation`,
+   * which no adapter here declares — see {@link AdapterCapabilities.conversation}.
+   */
   converse(req: ConversationRequest): Promise<Conversation>;
 }
 

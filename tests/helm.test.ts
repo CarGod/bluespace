@@ -370,6 +370,21 @@ describe('helmTools — failure paths', () => {
     ).rejects.toThrow(/no live crew/);
   });
 
+  it('refuses to queue a task against a project that does not exist', async () => {
+    // Left to dispatch, this comes back as `unknown_project:ghost` minutes later
+    // on a task create_task already reported as "Queued. The orchestrator
+    // dispatches it once ...". Rejecting now is one corrected call instead.
+    const { tools } = wire();
+    await expect(
+      tools.get('create_task')!.handler({
+        kind: 'mission',
+        projectId: 'ghost',
+        title: 't',
+        brief: 'b',
+      }),
+    ).rejects.toThrow(/No project with id ghost.*proj-1/s);
+  });
+
   it('rejects a missing or malformed argument by name', async () => {
     const { tools } = wire();
     await expect(tools.get('resolve_project')!.handler({})).rejects.toThrow(/hint is required/);

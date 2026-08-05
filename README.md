@@ -3,9 +3,9 @@
 **A captain and an AI crew. One conversation in, a fleet of agents out.**
 
 You say what you want in your own Claude Code window. One agent — Helm — turns it into
-tasks. Each task gets its own worker in its own disposable git worktree, an independent
-verifier checks the result, and the only thing that reaches you is a decision that
-actually needs you.
+tasks. Each task gets its own worker, in a git worktree of its own on a throwaway branch;
+anything that changes code is graded by an independent verifier that sees only the brief
+and the diff; and the only thing that reaches you is a decision that actually needs you.
 
 Named for 蓝色空间号 — *Blue Space*, the ship in 三体 that carried human civilization
 forward after the fleet it belonged to was gone. It survived because it was willing to
@@ -22,14 +22,15 @@ Six words, and each one is a real boundary in the code.
 | --- | --- | --- |
 | **Captain** | You. The human. | Makes decisions. Nothing else. |
 | **Helm** | The one agent you talk to, inside your own Claude Code window. | Intake and judgement: understands the request, routes it to a project, writes briefs, creates tasks. Never writes your code. |
-| **Crew** | A worker. One per task. | Does the work, in a disposable git worktree of its own. Never sees another Crew. |
-| **Sentinel** | An independent verifier. | Reads the brief and the diff, and nothing else. Returns a pass/fail verdict. |
+| **Crew** | A worker. One per task. | Does the work, in a git worktree of its own on a throwaway branch. Never sees another Crew. |
+| **Sentinel** | An independent verifier. | Reads the brief and the diff, and nothing else. Returns a pass/fail verdict. Runs on missions; a recon has no diff to grade. |
 | **Starmap** | The view. | A live dashboard of the fleet, projected from the Blackbox. |
 | **Blackbox** | The log. | An append-only SQLite event log. Every state you can see is a fold over it. |
 
 The split that matters: **Helm decides *what*. The orchestrator decides *when*.**
-Helm never dispatches, retries, or tears anything down — it only creates tasks and
-answers questions. Everything that has to be predictable under failure is code.
+Helm never dispatches, retries, or reorders anything — it creates tasks, answers
+questions, and can stop a task the captain has given up on. Everything that has to be
+predictable under failure is code.
 
 ---
 
@@ -85,8 +86,10 @@ mkdir -p ~/.bluespace/worktrees && cd ~/.bluespace/worktrees && claude
 # answer "Yes, I trust this folder", then /exit
 ```
 
-Everything that only reads the Blackbox — `blue ps`, `blue log`, `blue inbox`,
-`blue config`, and `blue map` without `--orchestrate` — needs no CLI and no tmux.
+Reading the Blackbox needs neither — `blue ps`, `blue log`, `blue inbox`, `blue config`
+and `blue map` without `--orchestrate` all run on a machine with no `claude` and no tmux.
+Only the commands that actually run agents (`blue mcp`, `blue map --orchestrate`) check
+for the CLI, and they check before they accept any work.
 
 ## Quickstart
 
@@ -110,8 +113,8 @@ claude
 blue ps                  # what the fleet is doing — and what to type to watch a worker
 blue map                 # the Starmap dashboard in a browser
 
-# 5. Answer only what needs you.
-blue inbox
+# 5. See what needs you.
+blue inbox               # read the queue from anywhere; answer in the window from step 3
 ```
 
 There is no `blue` prompt and no REPL. A bare `blue` prints the setup command and gets
@@ -130,12 +133,23 @@ Stated plainly, because these are the claims people assume:
 - **No Crew ever pushes.** Not to a remote, not on a landed task, not on any delivery
   mode. The brief forbids it explicitly.
 - **No Crew opens a pull request, and nothing merges anything.** A project's `delivery`
-  setting is metadata Helm reads when writing a brief — it is not an action BlueSpace
-  takes.
-- **`landed` means the Sentinel passed it.** Nothing more. It is a local branch sitting
-  in a worktree. Taking delivery is your hands on your own repository.
-- **Helm is read-only over your projects.** It reads code, logs and diffs to judge and
-  report. Every change is made by a Crew, in a worktree, on a throwaway branch.
+  setting is metadata Helm reads when writing a brief. `pr` does not open one; there is
+  no code anywhere in this repo that pushes, opens, or merges.
+- **`landed` means verification is over, not that anything shipped.** It is a local
+  branch sitting in a worktree. On a mission it means the Sentinel read the diff and
+  passed it; a recon has no diff to grade, so it lands on its report with nothing
+  checking it. Either way, taking delivery is your hands on your own repository.
+- **Helm never writes your code, but nothing sandboxes it.** Helm is a persona in your
+  own Claude Code window, holding whatever tools that window has. `CLAUDE.md` tells it
+  to stay read-only over your projects and to route every change through a Crew — that
+  is an instruction to a model, not a boundary the code enforces. The isolation that
+  *is* enforced is the Crew's: its own worktree, on a throwaway branch, proven distinct
+  from your checkout by four separate checks before it is handed over (`src/worktree/`).
+- **Nothing reclaims a worktree.** A finished task keeps its worktree, because the
+  branch in it is the deliverable and deleting it would throw the work away at the
+  moment it succeeded. Only cancelling a task removes one. `~/.bluespace/worktrees/`
+  grows until you clear it yourself: `git worktree remove <path>` in the project, or
+  delete the directory and `git worktree prune`.
 
 ---
 
@@ -145,7 +159,7 @@ Stated plainly, because these are the claims people assume:
 blue mcp                      serve Helm's tools over stdio — your Claude Code window runs this
 blue                          how to reach Helm; there is no prompt here
 
-blue inbox                    answer the decisions waiting on you  ← start here
+blue inbox                    read the decisions waiting on you  ← start here
       --list                  render only, do not prompt
 blue ps                       what the fleet is doing, and how to watch a worker
 blue log <taskId>             replay one task's events from the Blackbox
@@ -156,7 +170,7 @@ blue map                      start the Starmap server and print its URL (defaul
       --orchestrate           also run the dispatch loop
 blue projects                 list registered projects
 blue projects add <path>      register a repo
-      --name X --desc Y --delivery pr|local
+      --name X --desc Y --delivery pr|local   (delivery is metadata; default pr)
 blue projects rm <id>         forget a project
 blue config                   print the effective config and where it lives
 blue config set <k> <v>       change one setting (validated)
@@ -173,6 +187,13 @@ Everything above is the fleet's instrument panel, not a way to talk to it.
 The dispatch loop runs inside `blue mcp` for as long as your Claude Code window holds the
 connection. If you want the fleet to keep moving with that window closed, `blue map
 --orchestrate` turns the same crank.
+
+**Answering a decision happens where the fleet is running, not in an arbitrary terminal.**
+The answer has to be typed into the live session the Crew is parked in, and only the
+process that dispatched it holds that handle — `blue mcp`, or `blue map --orchestrate`.
+So the ordinary way to answer is to tell Helm, in the window from step 3. `blue inbox`
+reads the queue from anywhere; if you try to answer from a terminal that is not running
+the fleet, it says so and leaves the decision open rather than pretending.
 
 ---
 
@@ -342,7 +363,8 @@ src/pricing/      token counts -> USD, so the budget ceiling means something
 src/mcp/          the stdio MCP server `blue mcp` runs — BlueSpace's front door
 src/worktree/     git worktree lifecycle. Nothing else in the system shells out to git.
 src/orchestrator/ the engine room: dispatch, ordering, retry, budget, teardown + state machine
-src/agents/       Helm's prompt and tools, the Crew brief builder, the Sentinel
+src/agents/       Helm's nine tools, the Crew brief builder, the Sentinel. Helm's own
+                  persona is not here — it lives in CLAUDE.md and skills/bluespace/
 src/config/       BlueConfig and the project registry
 src/cli/          the `blue` command
 src/server/       the Starmap dashboard
@@ -362,11 +384,12 @@ and `noUncheckedIndexedAccess` are on. Two runtime dependencies — `better-sqli
 `zod` — and the intent is to keep it that way.
 
 `tests/compliance-smoke.test.ts` is the tripwire for everything on this page that is
-observed rather than promised: it asserts the flags a worker is launched with still
-exist, that `auto` and `dontAsk` still mean what they mean, and that no Agent SDK has
-come back into `package.json`. Re-run it after every Claude Code upgrade — with
-`BLUESPACE_LIVE_SMOKE=1` for the paid end-to-end half — and update the version table in
-`docs/compliance.md`.
+observed rather than promised. Free and always on: every flag a worker is launched with
+still exists, `auto` and `dontAsk` are both still offered, and no Agent SDK has come back
+into `package.json`. Opt-in with `BLUESPACE_LIVE_SMOKE=1`, and it spends real tokens
+driving a session end to end — the only half that can show those two modes still *mean*
+what they mean, rather than merely still being listed. Re-run both after every Claude
+Code upgrade, and update the version table in `docs/compliance.md`.
 
 ## License
 

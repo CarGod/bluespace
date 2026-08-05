@@ -69,7 +69,7 @@ export interface TaskStateChanged {
 export interface TaskCompleted {
   type: 'task.completed';
   taskId: TaskId;
-  /** Branch name, report path, or PR url. */
+  /** Branch name for a mission, report path for a recon. Never a PR url — nothing here opens one. */
   artifact?: string;
   summary: string;
 }

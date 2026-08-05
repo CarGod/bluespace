@@ -184,6 +184,15 @@ function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+/** Tail a path under a signal, to EOF or abort, whichever comes first. */
+async function drainWithSignal(p: string, signal: AbortSignal): Promise<AdapterEvent[]> {
+  const events: AdapterEvent[] = [];
+  for await (const e of readTranscript({ path: p, price: fakePrice, pollIntervalMs: 10, signal })) {
+    events.push(e);
+  }
+  return events;
+}
+
 // ---------------------------------------------------------------------------
 
 describe('content mapping', () => {
@@ -498,6 +507,34 @@ describe('usage mapping', () => {
     );
     const events = await drain();
     expect(events.filter((e) => e.type === 'usage')).toHaveLength(0);
+  });
+
+  it('does not mistake a split-only cache block for an empty one', async () => {
+    // `cache_creation_input_tokens` and the `cache_creation` split are two
+    // views of the same total, and a transcript written across a schema change
+    // can carry one without the other. `src/pricing` bills the split, so a
+    // reader that decided emptiness from the total alone would drop an event
+    // that costs real money — and report zero cache-creation tokens for it.
+    await write(
+      assistant({
+        content: [{ type: 'text', text: 'cached' }],
+        usage: {
+          input_tokens: 0,
+          output_tokens: 0,
+          cache_read_input_tokens: 0,
+          cache_creation: { ephemeral_1h_input_tokens: 4000, ephemeral_5m_input_tokens: 1000 },
+        },
+      }),
+    );
+    const events = await drain({ price: realPrice });
+    const billed = events.filter((e) => e.type === 'usage');
+    expect(billed, 'a billable block was dropped as empty').toHaveLength(1);
+    expect(billed[0]).toMatchObject({ cacheCreationTokens: 5000 });
+    // claude-opus-5 input is $5/MTok: 4000 at 2x plus 1000 at 1.25x.
+    expect(billed[0] && billed[0].type === 'usage' ? billed[0].costUsd : 0).toBeCloseTo(
+      (4000 * 10 + 1000 * 6.25) / 1e6,
+      12,
+    );
   });
 
   it('survives a price callback that throws, keeping the token counts', async () => {
@@ -974,6 +1011,56 @@ describe('file appears late', () => {
 });
 
 describe('stopping', () => {
+  /**
+   * ABORT MEANS "DRAIN AND STOP", AND THE DIFFERENCE IS A WHOLE TURN'S BILL.
+   *
+   * The abort arrives from a watcher that has just seen the Stop hook, so the
+   * records the turn was still writing are on disk by the time it fires. A
+   * reader that checked its signal and bailed would hand back nothing at all —
+   * no cost, no text — for a transcript sitting complete in front of it, and
+   * `consumedBytes` would stay put, so no later turn would pick it up either.
+   * The signal here is aborted before the first read, which is the extreme of
+   * that race and the cheapest way to pin the contract.
+   */
+  it('drains what is already on disk even when the signal is ALREADY aborted', async () => {
+    await write(
+      assistant({ id: 'm1', content: [{ type: 'text', text: 'one' }], usage: usage({ output_tokens: 7 }) }),
+      assistant({ id: 'm2', content: [{ type: 'text', text: 'two' }], usage: usage({ output_tokens: 9 }) }),
+    );
+    const ac = new AbortController();
+    ac.abort();
+
+    const stats = createStats();
+    const events: AdapterEvent[] = [];
+    for await (const e of readTranscript({
+      path: transcript,
+      price: fakePrice,
+      pollIntervalMs: 10,
+      signal: ac.signal,
+      stats,
+    })) {
+      events.push(e);
+    }
+
+    expect(events).toContainEqual({ type: 'text', text: 'one' });
+    expect(events).toContainEqual({ type: 'text', text: 'two' });
+    const billed = events.filter((e) => e.type === 'usage');
+    expect(billed, 'an aborted reader dropped a turn it could see').toHaveLength(2);
+    expect(stats.consumedBytes).toBe((await fs.stat(transcript)).size);
+  });
+
+  it('does not wait for a file that does not exist when already aborted', async () => {
+    const ac = new AbortController();
+    ac.abort();
+    const started = Date.now();
+    // Trying the open before checking the signal must not turn into WAITING for
+    // one: a 30s default timeout here would stall every teardown.
+    await expect(
+      drainWithSignal(path.join(tmpBase, 'never.jsonl'), ac.signal),
+    ).resolves.toEqual([]);
+    expect(Date.now() - started).toBeLessThan(1000);
+  });
+
   it('stops when the abort signal fires mid-tail', async () => {
     await write(assistant({ content: [{ type: 'text', text: 'one' }] }));
     const ac = new AbortController();

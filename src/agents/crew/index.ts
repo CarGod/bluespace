@@ -79,8 +79,9 @@ export function buildBrief(input: BuildBriefInput): string {
       '## 1. Who you are',
       '',
       'You are **Crew**: an autonomous worker on a BlueSpace fleet, running in a',
-      'disposable git worktree that exists for this one task and will be deleted',
-      'afterwards.',
+      'throwaway git worktree that exists for this one task. It is not the captain’s',
+      'checkout, and nothing you do here reaches their working copy. What leaves this',
+      'directory is the branch you commit to, and nothing else.',
       '',
       '**There is no human watching this window.** Nobody will unblock you, answer a',
       'clarifying question in chat, or approve a step. Work independently and finish the',
@@ -219,9 +220,11 @@ function missionSection(baseBranch: string): string {
     '**An independent verifier (Sentinel) will read this brief and your diff, and',
     'nothing else.** It never sees your reasoning, your tool calls, or your summary — so',
     'it cannot give you credit for intent. If the brief asks for three things and your',
-    'diff shows two, it fails, no matter how good the explanation was. Uncommitted work',
-    'is invisible to it. Before you finish, re-read the brief as a checklist and confirm',
-    'each item is visible in `git diff ' + baseBranch + '...HEAD`.',
+    'diff shows two, it fails, no matter how good the explanation was. The diff it is',
+    'given includes changes you left uncommitted, so leaving them there can pass',
+    'verification and still deliver nothing: only the branch is handed to the captain.',
+    'Before you finish, re-read the brief as a checklist and confirm each item is visible',
+    'in `git diff ' + baseBranch + '...HEAD`.',
   ].join('\n');
 }
 
@@ -243,10 +246,12 @@ function reconSection(reportPath: string, baseBranch: string): string {
     '4. **Commit nothing but the report.** One commit adding `REPORT.md`. Do not push and',
     '   do not open a pull request.',
     '',
-    '**An independent verifier (Sentinel) will read this brief and your diff, and nothing',
-    'else.** For a recon it checks two things: that the report actually answers the brief,',
-    'and that the diff touches nothing but the report. Confirm both in',
-    '`git diff ' + baseBranch + '...HEAD` before you finish.',
+    '**Nothing verifies a recon.** A mission\'s diff is graded by an independent Sentinel;',
+    'yours is not — there is no diff for a diff-reader to judge, so the task completes on',
+    'your report alone and the captain reads it as it stands. Nobody will catch a question',
+    'you answered vaguely or a claim you did not check. Before you finish, re-read the',
+    'brief as a checklist against your own report, and confirm in',
+    '`git diff ' + baseBranch + '...HEAD` that the only thing you changed is the report.',
   ].join('\n');
 }
 

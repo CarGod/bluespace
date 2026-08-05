@@ -205,7 +205,7 @@ function usage(): string {
   L.push(bold('COMMANDS'));
   const rows: Array<[string, string]> = [
     ['mcp', "serve Helm's tools over stdio  ← your Claude Code window runs this"],
-    ['inbox', 'answer the decisions waiting on you'],
+    ['inbox', 'read the decisions waiting on you (answer them through Helm)'],
     ['ps', 'what the fleet is doing, and how to watch a worker'],
     ['log <taskId>', "replay one task's events from the Blackbox"],
     ['map', 'start the Starmap server and print its URL'],
@@ -239,6 +239,7 @@ function usage(): string {
   L.push(`  -V, --version               ${dim('print the version')}`);
   L.push(`      --no-color              ${dim('never emit ANSI colour')}`);
   L.push(`  -f, --follow                ${dim('(log) keep streaming new events')}`);
+  L.push(`      --limit <n>             ${dim('(log) show only the last n events')}`);
   L.push(`      --list                  ${dim('(inbox) render only, do not prompt')}`);
   L.push(`      --port <n>              ${dim('(map) port to listen on')}`);
   L.push(`      --orchestrate           ${dim('(map) also run the dispatch loop')}`);
@@ -1001,7 +1002,7 @@ function cmdFrontDoor(): number {
   out(bold('From this terminal'));
   const rows: Array<[string, string]> = [
     ['blue ps', 'what the fleet is doing, and how to watch a worker'],
-    ['blue inbox', 'answer the decisions waiting on you'],
+    ['blue inbox', 'read the decisions waiting on you'],
     ['blue map', 'the Starmap, in a browser'],
     ['blue --help', 'everything else'],
   ];

@@ -278,6 +278,23 @@ describe('model resolution', () => {
     }
     expect(resolveModelRate(undefined).match).toBe('unknown');
   });
+
+  it('does not answer a table lookup with something off Object.prototype', () => {
+    // A model string is parsed JSON off disk. A bare `RATES[model]` answers
+    // these with an inherited function or object — not undefined, so it would
+    // be reported as an EXACT match, and then every rate read off it is
+    // undefined, every product NaN, and the caller floors NaN to $0. That is
+    // the one outcome this module exists to make impossible.
+    for (const model of ['toString', 'constructor', 'valueOf', 'hasOwnProperty', '__proto__']) {
+      const resolved = resolveModelRate(model);
+      expect(resolved.match, model).toBe('unknown');
+      expect(resolved.rate, model).toEqual(UNKNOWN_MODEL_RATE);
+
+      const priced = priceUsage(model, { input_tokens: 1_000_000, output_tokens: 0 });
+      expect(Number.isFinite(priced.usd), model).toBe(true);
+      expect(priced.usd, model).toBeGreaterThan(0);
+    }
+  });
 });
 
 describe('unknown models are never free', () => {

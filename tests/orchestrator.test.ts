@@ -679,6 +679,12 @@ describe('rework', () => {
 
     const replacement = h.adapter.crewFor(task.id);
     expect(replacement).not.toBe(first);
+    // THE OUTGOING CREW IS CLOSED, NOT JUST DROPPED. A throw from send() is not
+    // proof the worker died — a transient backend failure raises it against a
+    // Crew that is alive and mid-turn. Leaking the handle would leave that
+    // worker spending tokens nothing reads or bills, in the same worktree the
+    // replacement is now editing.
+    expect(first.closed, 'the replaced crew was left running').toBe(true);
     // The replacement is briefed on the same worktree, with the gap spelled out.
     const respawn = h.adapter.spawns[1];
     expect(respawn!.request.cwd).toBe(worktreePath(task.id));
@@ -762,6 +768,50 @@ describe('rework', () => {
 
     expect(stateOf(h, task.id)).toBe('failed');
     expect(eventTypes(h, task.id)).toContain('task.failed');
+  });
+
+  /**
+   * `blue inbox` is a different process from the one running the fleet, so its
+   * Orchestrator projects the same log but holds no live sessions. It used to
+   * record the answer anyway and then fail the task with `crew_lost` — the inbox
+   * printed "✓ answered" and killed a healthy task in the same breath, while the
+   * real Crew went on running in the other process. A second Orchestrator over
+   * the same Blackbox is exactly that situation.
+   */
+  it('refuses to answer a decision from a process that holds no Crew, and changes nothing', async () => {
+    const h = harness();
+    const task = newTask(h);
+
+    await h.orch.tick();
+    const crew = h.adapter.crewFor(task.id);
+    crew.push({ type: 'text', text: 'NEEDS-DECISION: Drop the column?\n- Drop it\n- Keep it' });
+    await until(() => stateOf(h, task.id) === 'awaiting_decision', 'the task parks on the decision');
+
+    const decision = h.orch.openDecisions()[0]!;
+    const before = h.bb.read().length;
+
+    const elsewhere = new Orchestrator({
+      blackbox: h.bb,
+      adapter: h.adapter,
+      config: { permissionMode: 'auto', maxBudgetUsdPerTask: 25, maxConcurrentCrew: 4, maxRework: 2, dataDir: '/tmp/bluespace-test' },
+      registry: fakeRegistry([h.project]),
+      worktreeFor: () => h.worktrees as unknown as WorktreeManager,
+    });
+
+    await expect(elsewhere.resolveDecision(decision.id, 'left')).rejects.toThrow(
+      /no Crew running in this process/,
+    );
+
+    // Nothing was written, so the decision is still answerable where it can be
+    // delivered, and the task is still exactly where the Crew left it.
+    expect(h.bb.read().length).toBe(before);
+    expect(stateOf(h, task.id)).toBe('awaiting_decision');
+    expect(h.orch.openDecisions().map((d) => d.id)).toContain(decision.id);
+
+    // The process that does hold the Crew still answers it.
+    await h.orch.resolveDecision(decision.id, 'Drop it');
+    expect(stateOf(h, task.id)).toBe('working');
+    expect(crew.sent.at(-1)).toContain('Drop it');
   });
 });
 
@@ -905,6 +955,33 @@ describe('captain controls', () => {
     expect(crew.interrupted).toBe(true);
     expect(stateOf(h, task.id)).toBe('failed');
     expect(h.sentinelRuns).toHaveLength(0);
+    const failure = h.bb
+      .read()
+      .find((e: BlueEvent) => e.type === 'task.failed' && e.taskId === task.id);
+    expect(failure && failure.type === 'task.failed' ? failure.reason : '').toContain(
+      'budget_exceeded',
+    );
+  });
+
+  it('kills the session outright when the budget interrupt fails', async () => {
+    // The ceiling latches after one attempt, so a swallowed interrupt is a
+    // ceiling that logs a line and stops nothing: the Crew keeps spending until
+    // the turn timeout, hours later, with the captain told it was capped. This
+    // turn NEVER emits an exit — reaching `failed` at all proves the escalation
+    // ended the run rather than something downstream tidying up afterwards.
+    const h = harness({ maxBudgetUsdPerTask: 1 });
+    const task = newTask(h);
+
+    await h.orch.tick();
+    const crew = h.adapter.crewFor(task.id);
+    crew.interrupt = async () => {
+      throw new Error('tmux went away');
+    };
+
+    crew.push({ type: 'usage', costUsd: 9.5, inputTokens: 1000, outputTokens: 200 });
+    await until(() => stateOf(h, task.id) === 'failed', 'the over-budget crew is stopped');
+
+    expect(crew.closed, 'a failed interrupt left the crew running').toBe(true);
     const failure = h.bb
       .read()
       .find((e: BlueEvent) => e.type === 'task.failed' && e.taskId === task.id);

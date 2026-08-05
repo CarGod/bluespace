@@ -28,7 +28,9 @@ export type VerdictId = string;
 
 /**
  * What a task is expected to produce.
- *   mission — changes code, produces a branch (and optionally a PR).
+ *   mission — changes code, produces a local branch in a worktree. Nothing in
+ *             BlueSpace pushes it, opens a pull request for it, or merges it;
+ *             `Project.delivery` is a hint for the brief, not an action.
  *   recon   — investigates, produces a written report. Never pushes.
  */
 export type TaskKind = 'mission' | 'recon';
@@ -62,9 +64,6 @@ export const TERMINAL_TASK_STATES: readonly TaskState[] = [
   'failed',
   'cancelled',
 ] as const;
-
-/** States where the fleet is blocked on the captain, not on compute. */
-export const BLOCKED_TASK_STATES: readonly TaskState[] = ['awaiting_decision'] as const;
 
 export function isTerminal(state: TaskState): boolean {
   return TERMINAL_TASK_STATES.includes(state);
@@ -238,6 +237,15 @@ export const VERDICT_SCHEMA = {
 // Projects
 // ---------------------------------------------------------------------------
 
+/**
+ * How the captain intends to take delivery of a project's branches.
+ *
+ * METADATA, NOT BEHAVIOUR. Nothing in BlueSpace pushes, opens a pull request, or
+ * merges, and `pr` does not change that — it is context Helm can read when it
+ * writes a brief (say, to ask for commits shaped for review). Every task ends the
+ * same way in either mode: a local branch in a worktree that the captain moves by
+ * hand. `pr` is the default only because it is the commoner intent.
+ */
 export type DeliveryMode = 'pr' | 'local';
 
 export interface Project {

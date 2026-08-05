@@ -9,6 +9,13 @@
  *
  * Owns rendering and stdin interaction only. Resolution goes through
  * `Orchestrator.resolveDecision`, which appends the event and unblocks the task.
+ *
+ * ONE THING THIS SCREEN CANNOT DO. Delivering an answer needs the live session
+ * the Crew is parked in, and that handle exists only inside the process running
+ * the fleet — `blue mcp`, or `blue map --orchestrate`. `blue inbox` is neither,
+ * so `resolveDecision` refuses and says where to answer instead; the decision
+ * stays open. Reading the queue from any terminal still works, which is most of
+ * why this screen exists. See `Orchestrator.resolveDecision`.
  */
 
 import * as readline from 'node:readline';
@@ -303,12 +310,12 @@ function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
-/** One-line nudge used by the interactive Helm session after every turn. */
+/** One-line nudge appended by `blue` and `blue ps` when something is waiting. */
 export function decisionNudge(open: Decision[]): string | undefined {
   if (open.length === 0) return undefined;
   const oldest = open.reduce((a, b) => (a.openedAt <= b.openedAt ? a : b));
   const waited = formatDuration(Date.now() - oldest.openedAt);
   return `${yellow('◆')} ${bold(plural(open.length, 'decision'))} waiting${
     open.length === 1 ? '' : ` (oldest ${waited})`
-  } — run ${bold('blue inbox')}${dim(' or ask me to show them')}`;
+  } — ${bold('blue inbox')}${dim(' to read them; answer them through Helm')}`;
 }

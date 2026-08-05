@@ -32,10 +32,15 @@
  *     Passing `[]` as "omit the flag" would silently run every Crew with the
  *     captain's personal hooks — see SpawnRequest.settingScopes.
  *
- *  3. THE POSITIONAL PROMPT FILLS THE COMPOSER; IT DOES NOT SUBMIT. Submission
- *     is `sendKey(target, 'Enter')`, and it is not optional: without it the
- *     worker sits on unsent text forever. That split is also what makes
- *     `Session.send()` work — see decision (5) below.
+ *  3. THE POSITIONAL PROMPT SUBMITS ITSELF, and the Enter that follows it is a
+ *     belt-and-braces no-op. This was measured the other way round first: text
+ *     sitting unsent in the composer seven seconds in. That session was blocked
+ *     on the workspace-trust prompt (see the last paragraph of this header),
+ *     which is what an untrusted directory looks like from outside. Re-measured
+ *     in a trusted directory with no keys sent at all, the turn ran and the Stop
+ *     hook fired. `sendKey(target, 'Enter')` is still sent, because it costs
+ *     nothing on an empty composer and the failure it would otherwise cover is a
+ *     worker that waits forever. See docs/compliance.md, "Verified against".
  *
  *  4. EVERY SIGNAL IS STRUCTURED. Readiness is a `SessionStart` hook touching a
  *     marker file; end-of-turn is a `Stop` hook touching another; a dialog the
@@ -48,9 +53,10 @@
  *     The third one is not defensive programming. Verified on 2.1.222 with
  *     `--permission-mode auto`, in a git repo, editing a tracked file: Claude
  *     Code STILL asked "Do you want to make this edit?" and sat on the dialog.
- *     docs/compliance.md says auto edits with no confirmation dialog; on this
- *     machine it does not, and `auto mode` is a classifier, so "usually" is the
- *     most anyone can promise. Unattended, that is a worker frozen until the
+ *     Three of three runs on another machine did not — which is why `auto` is
+ *     the default — but it is a classifier, not a switch, so "usually" is the
+ *     most anyone can promise (docs/compliance.md, "Verified against", says the
+ *     same and no more). Unattended, a prompt is a worker frozen until the
  *     turn timeout — hours of a task's wall clock spent on a question nobody
  *     will ever be asked. The Notification payload names the case exactly
  *     (`"notification_type":"permission_prompt"`), so the run ends in seconds
@@ -896,6 +902,13 @@ class ClaudeCliSession implements Session {
       const file = path.join(dir, name);
       const stats = createStats();
       stats.consumedBytes = this.#subagentOffsets.get(file) ?? 0;
+      // DRAINED INTO AN ARRAY, NOT YIELDED THROUGH. Yielding from inside the
+      // read loop suspends this generator mid-read, so a consumer that stops
+      // early would abandon the reader before its final flush — while the
+      // offset below still advanced past the records it never billed, putting
+      // them out of reach of every later turn too. Collecting first makes the
+      // read atomic: the reader always runs to completion, or nothing moves.
+      const billed: AdapterEvent[] = [];
       try {
         for await (const event of readTranscript({
           path: file,
@@ -907,13 +920,13 @@ class ClaudeCliSession implements Session {
           waitForFileMs: 0,
           stats,
         })) {
-          if (event.type === 'usage') yield event;
+          if (event.type === 'usage') billed.push(event);
         }
       } catch {
         /* see the docstring: one unreadable delegate must not fail the turn */
-      } finally {
-        this.#subagentOffsets.set(file, stats.consumedBytes);
       }
+      this.#subagentOffsets.set(file, stats.consumedBytes);
+      yield* billed;
     }
   }
 
@@ -1295,9 +1308,12 @@ export class ClaudeCliAdapter implements HarnessAdapter {
       throw err;
     }
 
-    // READINESS, then submit. Both are required and neither is optional: the
-    // composer is not up until SessionStart has fired, and the prompt sitting in
-    // it is not sent until Enter.
+    // READINESS, then a belt-and-braces submit. Waiting for SessionStart is the
+    // load-bearing half: it is what turns an unanswered workspace-trust prompt
+    // into SessionNotReadyError instead of a worker that sits forever. The Enter
+    // is the other half of header (3) — the positional prompt submits itself, so
+    // this lands on an empty composer and does nothing, and it stays because the
+    // failure it covers costs a whole task.
     try {
       await waitForFile(markers.ready, {
         timeoutMs: this.#opts.readyTimeoutMs ?? DEFAULT_READY_TIMEOUT_MS,

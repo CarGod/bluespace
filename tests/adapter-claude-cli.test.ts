@@ -52,9 +52,17 @@ const SLOW = 60_000;
  * A `claude` that costs nothing.
  *
  * It emulates exactly the four behaviours the adapter depends on, and no others:
- * the positional prompt lands in argv and is NOT acted on, a submit is a line on
- * stdin, the hooks in `--settings` are commands run through a shell, and the
- * session survives its own Stop hook so a follow-up turn is possible.
+ * the positional prompt lands in argv, a submit is a line on stdin, the hooks in
+ * `--settings` are commands run through a shell, and the session survives its own
+ * Stop hook so a follow-up turn is possible.
+ *
+ * ONE DELIBERATE DIVERGENCE FROM THE REAL CLI: the fake starts turn one on the
+ * Enter rather than on the positional prompt, which 2.1.222 submits by itself
+ * (docs/compliance.md, "Verified against"). The fake keeps the old shape because
+ * it makes the launch observable — the assertions below can prove the Enter
+ * arrived AFTER SessionStart, which is the ordering the adapter must hold. The
+ * turn count is identical either way; only the instant turn one begins differs.
+ * Do NOT read this file as evidence about when the real CLI submits.
  *
  * Env knobs let one script cover every scenario:
  *   BLUE_ARGV_OUT        where to write the argv it was launched with
@@ -503,8 +511,9 @@ describe('spawn', () => {
       expect(settings.hooks['Stop']?.[0]?.hooks[0]?.command).toContain('stop');
 
       // THE SUBMIT: one bare Enter, delivered as a keypress, AFTER the
-      // SessionStart hook fired — never before, or it lands on a composer that
-      // is not up yet. The 900ms readiness delay is what makes that observable.
+      // SessionStart hook fired — never before. On the real CLI it is a no-op on
+      // an already-submitted prompt; the ordering is what is asserted, and the
+      // 900ms readiness delay is what makes it observable.
       await waitFor(async () => (await h.log()).some((r) => r['event'] === 'submit'), 'submit');
       const log = await h.log();
       const started = log.find((r) => r['event'] === 'start');

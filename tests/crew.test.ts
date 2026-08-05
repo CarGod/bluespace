@@ -58,10 +58,15 @@ describe('NEEDS_DECISION_MARKER', () => {
 });
 
 describe('buildBrief', () => {
-  it('states that the worker is autonomous and unobserved', () => {
+  it('states that the worker is autonomous, unobserved, and isolated', () => {
     const text = brief();
     expect(text).toMatch(/no human watching/i);
-    expect(text).toMatch(/disposable git worktree/i);
+    expect(text).toMatch(/throwaway git worktree/i);
+    // What the worktree is for, stated without claiming it gets cleaned up:
+    // only cancellation removes one (Orchestrator#teardown), so a brief that
+    // promised deletion would be teaching every Crew something untrue.
+    expect(text).toMatch(/not the captain.s\s+checkout/i);
+    expect(text).not.toMatch(/will be deleted/i);
   });
 
   it('carries the title and the full brief text', () => {
@@ -125,10 +130,17 @@ describe('buildBrief — mission', () => {
     expect(text).toMatch(/no stubs/i);
   });
 
-  it('warns that the Sentinel sees only the diff', () => {
+  it('warns that the Sentinel sees only the diff, and that only commits are delivered', () => {
     const text = brief();
     expect(text).toMatch(/never sees your reasoning/i);
-    expect(text).toMatch(/Uncommitted work\s+is invisible/i);
+    // WorktreeManager.diff() concatenates the committed diff with a
+    // working-tree diff taken through a temporary index, so the Sentinel DOES
+    // see uncommitted and untracked work. The brief used to say the opposite.
+    // The true hazard is that passing verification on uncommitted work still
+    // delivers nothing, because the captain is handed the branch.
+    expect(text).toMatch(/includes changes you left uncommitted/i);
+    expect(text).toMatch(/only the branch is handed to the captain/i);
+    expect(text).not.toMatch(/uncommitted work\s+is invisible/i);
   });
 
   it('does not tell a mission to write REPORT.md', () => {
@@ -150,5 +162,15 @@ describe('buildBrief — recon', () => {
     expect(text).toMatch(/Never modify project code/);
     expect(text).toMatch(/Commit nothing but the report/);
     expect(text).toMatch(/do not open a pull request/i);
+  });
+
+  it('tells a recon that nothing will verify it', () => {
+    // Orchestrator#afterExit completes a recon straight from `verifying` with
+    // reason `recon_reported` and never calls the Sentinel: "a diff-reading
+    // verifier has nothing to read here". The brief used to promise one anyway,
+    // and a worker that believes it will be checked writes for the checker.
+    const text = recon();
+    expect(text).toMatch(/Nothing verifies a recon/i);
+    expect(text).not.toMatch(/an independent verifier \(sentinel\) will read/i);
   });
 });
