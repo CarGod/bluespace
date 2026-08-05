@@ -77,9 +77,12 @@ export const EFFORT_LEVELS: readonly Effort[] = [
 
 export interface BlueConfig {
   /**
-   * Permission posture handed to every Crew. Defaults to `bypassPermissions`:
-   * BlueSpace exists to run crews unattended, and a permission prompt nobody is
-   * sitting in front of is just a hang. The captain can dial it back here.
+   * Permission posture handed to every Crew. Defaults to `auto`: BlueSpace runs
+   * crews unattended, and a permission prompt nobody is sitting in front of is
+   * just a hang — but `bypassPermissions`, which is the other way to avoid one,
+   * costs a modal only a human can dismiss and writes a machine-wide loosening
+   * into the captain's global config. See `PermissionMode` in types/domain.ts.
+   * The captain can dial it back here.
    */
   permissionMode: PermissionMode;
   /** Model id. Undefined means "whatever the harness defaults to". */

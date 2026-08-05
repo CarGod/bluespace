@@ -91,6 +91,16 @@ export interface CrewSpawned {
   /** The harness's own session id, so a Crew can be resumed or forked later. */
   sessionId?: string;
   cwd: string;
+  /**
+   * Literally what the captain types to watch this Crew or take it over —
+   * `Session.attachCommand`, verbatim.
+   *
+   * Recorded here because it is the only way another process can learn it:
+   * `blue ps` and the Starmap hold no live `Session`, and the command is minted
+   * by the session backend at spawn. Absent for a headless adapter, so every
+   * reader treats it as optional rather than printing a line nobody can act on.
+   */
+  attachCommand?: string;
 }
 
 export interface CrewText {

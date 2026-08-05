@@ -2,24 +2,32 @@
 /**
  * `blue` — the BlueSpace command line.
  *
- * This module owns the terminal surface of BlueSpace: argv parsing (by hand, no
- * framework), the interactive Helm session, and the read-only views over the
- * Blackbox (`ps`, `log`, `inbox`, `map`). It composes the other modules and
- * holds no domain logic of its own — every state change goes through the
- * Orchestrator, and every fact it prints is a projection over the event log.
+ * This module owns the terminal surface: argv parsing (by hand, no framework),
+ * the read-only views over the Blackbox (`ps`, `log`, `inbox`, `map`), the
+ * registry and config editors, and `blue mcp` — the stdio server that the
+ * captain's own Claude Code window launches.
  *
- * No vendor SDK appears here. The interactive Helm session is an
- * `adapter.converse()` — the captain's turns go in as strings and come back as
- * `AdapterEvent`s, and which harness is underneath is the adapter's business.
+ * What is deliberately NOT here any more is a conversation. `blue` used to open
+ * a readline REPL and drive Helm through `adapter.converse()`. It does not, and
+ * the reason is `docs/compliance.md`: the line Anthropic draws is "is a person
+ * interacting with it", and a REPL that relays typed lines into a programmatic
+ * session is on the wrong side of it. The captain now types into a real
+ * interactive Claude Code window and BlueSpace hangs off it as an MCP server.
+ * The REPL was deleted rather than deprecated — a second front door is a second
+ * way to end up back on the wrong side, and it would have to be maintained.
+ *
+ * What remains is worth more than it was, not less: these views are the
+ * captain's only unmediated look at the fleet. Everything printed here is a
+ * projection over the event log, and every state change goes through the
+ * Orchestrator. No vendor SDK appears in this file.
  */
 
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import * as readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
 
-import { assertClaudeCliAvailable, createClaudeAdapter } from '../adapters/claude.js';
-import { requireCapability, type HarnessAdapter } from '../adapters/types.js';
+import { assertClaudeCliAvailable, createClaudeCliAdapter } from '../adapters/claude-cli.js';
+import type { HarnessAdapter } from '../adapters/types.js';
 import { Blackbox, projectCrewLog } from '../blackbox/index.js';
 import {
   PERMISSION_MODES,
@@ -34,7 +42,6 @@ import { WorktreeManager } from '../worktree/index.js';
 import { isTerminal } from '../types/domain.js';
 import type {
   DeliveryMode,
-  DispatchProfile,
   Effort,
   PermissionMode,
   Project,
@@ -51,7 +58,6 @@ import {
   cyan,
   describeEvent,
   dim,
-  formatDuration,
   formatUsd,
   green,
   padEnd,
@@ -84,11 +90,12 @@ function errorMessage(e: unknown): string {
 /**
  * Gate every path that will actually run an agent.
  *
- * BlueSpace runs its crews through the captain's own Claude CLI, so the one hard
- * requirement is that the CLI is installed and signed in. The SDK spawns it
- * lazily, which means a missing or signed-out CLI would otherwise surface as a
- * dead crew partway through a task — after a worktree exists and the captain has
- * been told work started. Checking here turns that into one sentence at startup.
+ * BlueSpace runs its crews as real interactive sessions of the captain's own
+ * `claude`, so the one hard requirement is that the CLI is installed and signed
+ * in. A worker is launched into a terminal session, which means a missing or
+ * signed-out CLI would otherwise surface as a window that dies without ever
+ * signalling readiness — after a worktree exists and the captain has been told
+ * work started. Checking here turns that into one sentence at startup.
  *
  * Returns false (having already printed the reason) rather than throwing, so the
  * caller exits with a clean status instead of a stack trace.
@@ -192,13 +199,14 @@ function usage(): string {
   L.push(`${bold('blue')} ${dim('— a captain and an AI crew. One conversation in, a fleet of agents out.')}`);
   L.push('');
   L.push(bold('USAGE'));
-  L.push(`  blue                        ${dim('talk to Helm (interactive session)')}`);
   L.push(`  blue <command> [options]`);
+  L.push(`  blue                        ${dim('how to reach Helm — there is no prompt here')}`);
   L.push('');
   L.push(bold('COMMANDS'));
   const rows: Array<[string, string]> = [
-    ['inbox', 'answer the decisions waiting on you  ← start here'],
-    ['ps', 'what the fleet is doing right now'],
+    ['mcp', "serve Helm's tools over stdio  ← your Claude Code window runs this"],
+    ['inbox', 'answer the decisions waiting on you'],
+    ['ps', 'what the fleet is doing, and how to watch a worker'],
     ['log <taskId>', "replay one task's events from the Blackbox"],
     ['map', 'start the Starmap server and print its URL'],
     ['projects', 'list registered projects'],
@@ -210,14 +218,21 @@ function usage(): string {
   const w = Math.max(...rows.map(([k]) => k.length));
   for (const [k, v] of rows) L.push(`  ${padEnd(k, w)}  ${dim(v)}`);
   L.push('');
+  L.push(bold('TALKING TO HELM'));
+  L.push(`  ${cyan(MCP_ADD_COMMAND)}`);
+  L.push(`  ${dim('register once, then say what you want built in your own Claude Code window.')}`);
+  L.push(`  ${dim('`blue mcp` is not for typing into: stdout is the protocol stream.')}`);
+  L.push('');
   L.push(bold('CONFIG KEYS'));
+  // Spelled from the same constants `blue config set` validates against. Help
+  // text that lists modes by hand is help text that eventually names one the
+  // loader rejects — which is exactly what happened to the last copy of these
+  // two lines when PermissionMode was rewritten to mirror the harness.
+  L.push(`  ${dim('permissionMode')} ${PERMISSION_MODES.join('|')}`);
+  L.push(`  ${dim('effort')} ${EFFORTS.join('|')}   ${dim('model')} <string>`);
   L.push(
-    `  ${dim('permissionMode')} default|dontAsk|plan|bypassPermissions|async   ${dim('model')} <string>`,
+    `  ${dim('maxConcurrentCrew')} <int>   ${dim('maxRework')} <int>   ${dim('maxBudgetUsdPerTask')} <number>`,
   );
-  L.push(
-    `  ${dim('effort')} low|medium|high|xhigh|max   ${dim('maxConcurrentCrew')} <int>   ${dim('maxRework')} <int>`,
-  );
-  L.push(`  ${dim('maxBudgetUsdPerTask')} <number>`);
   L.push('');
   L.push(bold('OPTIONS'));
   L.push(`  -h, --help                  ${dim('this text')}`);
@@ -231,10 +246,42 @@ function usage(): string {
   return L.join('\n');
 }
 
+/**
+ * The one line that wires BlueSpace into the captain's Claude Code window.
+ *
+ * Written out in full rather than described, because the whole product is
+ * unreachable until it has been run once and a command you can paste is the
+ * difference between a setup step and a support question. `-s user` registers
+ * it for every directory: Helm is fleet-wide, and a server scoped to whichever
+ * folder the captain happened to be in would vanish the moment they moved.
+ */
+const MCP_ADD_COMMAND = 'claude mcp add -s user bluespace -- blue mcp';
+
+/** The installed package root — `dist/cli/index.js` sits two levels down. */
+function installRoot(): string {
+  return path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
+}
+
+/** This exact file, for a captain who needs to spell the MCP command out in full. */
+function entryPath(): string {
+  return fileURLToPath(import.meta.url);
+}
+
+/**
+ * Where to read why the REPL is gone.
+ *
+ * A path only if there is a file at the end of it: `docs/` is not in the
+ * published package, and pointing an npm user at an absolute path to nothing is
+ * worse than naming the file and letting them find it in the repo.
+ */
+function complianceDoc(): string {
+  const local = path.join(installRoot(), 'docs', 'compliance.md');
+  return safe(() => fs.existsSync(local)) === true ? local : 'docs/compliance.md in the BlueSpace repo';
+}
+
 function version(): string {
   try {
-    const here = path.dirname(fileURLToPath(import.meta.url));
-    const raw = fs.readFileSync(path.join(here, '..', '..', 'package.json'), 'utf8');
+    const raw = fs.readFileSync(path.join(installRoot(), 'package.json'), 'utf8');
     const pkg = JSON.parse(raw) as { version?: unknown };
     return typeof pkg.version === 'string' ? pkg.version : '0.0.0';
   } catch {
@@ -261,7 +308,7 @@ function boot(): Boot {
 
   const blackbox = Blackbox.open(path.join(config.dataDir, 'blackbox.db'));
   const registry = ProjectRegistry.open(config.dataDir);
-  const adapter = createClaudeAdapter();
+  const adapter = createClaudeCliAdapter();
 
   // Worktrees live under the data directory, NOT the manager's tmpdir default: a
   // landed task keeps its worktree because the branch it built is the deliverable,
@@ -308,11 +355,33 @@ function boot(): Boot {
 // blue ps
 // ---------------------------------------------------------------------------
 
+/**
+ * Attach commands for the crews that have one, keyed by crew id.
+ *
+ * A Crew is a real interactive session on the captain's machine, and watching
+ * one — or taking it over mid-task — is the point of running them that way. The
+ * command is minted by the session backend at spawn and recorded on
+ * `crew.spawned`; `blue ps` is a separate short-lived process with no live
+ * `Session` to ask, so the Blackbox is the only place it can come from. Empty
+ * for a headless adapter, which is why every caller treats it as optional
+ * rather than printing a line nobody can act on.
+ */
+function attachCommands(b: Boot): Map<string, string> {
+  const byCrew = new Map<string, string>();
+  const events = safe(() => b.blackbox.read({ types: ['crew.spawned'] })) ?? [];
+  for (const e of events) {
+    if (e.type !== 'crew.spawned') continue;
+    if (e.attachCommand !== undefined) byCrew.set(e.crewId, e.attachCommand);
+  }
+  return byCrew;
+}
+
 function cmdPs(b: Boot): number {
   const tasks = b.orch.tasks();
   if (tasks.length === 0) {
     out('');
-    out(dim('No tasks yet. Run `blue` and tell Helm what you want built.'));
+    out(dim('No tasks yet. Ask Helm for something in your Claude Code window.'));
+    out(dim(`Not set up yet? ${MCP_ADD_COMMAND}`));
     out('');
     return 0;
   }
@@ -367,6 +436,23 @@ function cmdPs(b: Boot): number {
 
   out('');
   out(`${summary}${dim('  ·  ')}${bold(formatUsd(total))} ${dim('spent')}`);
+
+  // A task's `crewId` is its LATEST dispatch, which is what makes this lookup
+  // correct across rework: an earlier crew's window is gone with the crew.
+  const attach = attachCommands(b);
+  const watchable: Array<[string, string]> = [];
+  for (const t of sorted) {
+    if (isTerminal(t.state)) continue;
+    const crewId = t.crewId;
+    if (crewId === undefined) continue;
+    const command = attach.get(crewId);
+    if (command !== undefined) watchable.push([shortId(t.id), command]);
+  }
+  if (watchable.length > 0) {
+    out('');
+    out(dim('watch a crew — a live session you can read and type into:'));
+    for (const [id, command] of watchable) out(`  ${dim(id)}  ${cyan(command)}`);
+  }
 
   const open = b.orch.openDecisions();
   const nudge = decisionNudge(open);
@@ -856,275 +942,87 @@ async function cmdMap(b: Boot, flags: Flags): Promise<number> {
 }
 
 // ---------------------------------------------------------------------------
-// Interactive Helm session
+// blue mcp
 // ---------------------------------------------------------------------------
 
-/** `mcp__tools__create_task` reads better as `create_task`. */
-function prettyToolName(name: string): string {
-  const m = /^mcp__[^_]+__(.+)$/.exec(name);
-  return m?.[1] ?? name;
+/**
+ * Hand Helm's tools to the captain's own Claude Code window.
+ *
+ * This is the front door: the captain talks to Helm in a window they already
+ * had, and BlueSpace is a stdio MCP server it launched. Nothing in this function
+ * may print — stdout is the protocol stream from the moment `runMcp` starts, and
+ * a single stray line desynchronizes the client into what looks like a hang.
+ * `requireClaudeCli` writes to stderr, which is why it is safe here.
+ */
+async function cmdMcp(b: Boot): Promise<number> {
+  // Crews are the captain's own `claude`, so a missing or signed-out CLI means
+  // every task this server accepts would die after dispatch. Say so now, on
+  // stderr, where the client puts it in its MCP log.
+  if (!requireClaudeCli()) return 1;
+  const { runMcp } = await import('../mcp/index.js');
+  return await runMcp({ orch: b.orch, registry: b.registry });
 }
 
-const HELM_BANNER = [
-  '',
-  `${bold('BlueSpace')} ${dim('· you talk to Helm; Helm briefs the crew')}`,
-  dim('  /ps  /inbox  /help  /exit    ctrl-c to stand down'),
-  '',
-].join('\n');
+// ---------------------------------------------------------------------------
+// blue — no subcommand
+// ---------------------------------------------------------------------------
 
-async function runHelm(): Promise<number> {
-  // Nothing here is worth booting without a usable CLI, and the failure must be a
-  // sentence rather than a stack trace. Local read-only commands (ps, config,
-  // projects, log) deliberately do NOT go through this — they never spawn an agent.
-  if (!requireClaudeCli()) return 1;
+/**
+ * What a bare `blue` does now that there is no REPL behind it.
+ *
+ * This used to open a prompt, so the captain who types `blue` out of habit is
+ * exactly the person this text exists for. It says the thing changed, gives the
+ * one command that makes Helm reachable, and then gets out of the way — a
+ * "removed" notice with no path forward would leave them stranded in the same
+ * terminal they were stranded in before.
+ *
+ * Read-only, and cheap: it opens the Blackbox only to surface waiting decisions,
+ * because a captain standing at a terminal wondering what to do is precisely
+ * when a blocked fleet is worth a line. A failure to open it is not worth
+ * mentioning — the guidance above it is still the answer.
+ */
+function cmdFrontDoor(): number {
+  out('');
+  out(`${bold('BlueSpace')} ${dim('· you talk to Helm in your own Claude Code window')}`);
+  out('');
+  out('There is no prompt here any more. Helm is an MCP server that your Claude Code');
+  out('window launches, so the session you type into is a real interactive one — which');
+  out(`is the whole point; see ${dim(complianceDoc())}.`);
+  out('');
+  out(bold('Set it up once'));
+  out(`  ${cyan(MCP_ADD_COMMAND)}`);
+  // The absolute path is worth the ugly line: `blue` is only on PATH after a
+  // global install, and this is the exact file that is running right now.
+  out(dim(`  blue not on your PATH? Replace \`blue mcp\` with: node ${entryPath()} mcp`));
+  out('');
+  out(bold('Then'));
+  out(`  ${cyan('claude')}${dim('  — in any repo, and say what you want built. Helm briefs the crew.')}`);
+  out('');
+  out(bold('From this terminal'));
+  const rows: Array<[string, string]> = [
+    ['blue ps', 'what the fleet is doing, and how to watch a worker'],
+    ['blue inbox', 'answer the decisions waiting on you'],
+    ['blue map', 'the Starmap, in a browser'],
+    ['blue --help', 'everything else'],
+  ];
+  const w = Math.max(...rows.map(([k]) => k.length));
+  for (const [k, v] of rows) out(`  ${padEnd(k, w)}  ${dim(v)}`);
 
-  const b = boot();
-
-  const helm = await import('../agents/helm/index.js');
-
-  // A harness that cannot host a conversation cannot run Helm. Say so here,
-  // before the orchestrator starts and before the captain types anything.
-  requireCapability(b.adapter, 'conversation');
-
-  // The orchestrator is code and runs for as long as the captain is at the helm.
-  b.orch.start();
-
-  const abort = new AbortController();
-
-  // Helm does intake and judgement, never Crew work: it needs no budget or turn
-  // ceiling of its own, and the model is the captain's global choice.
-  const profile: DispatchProfile = { permissionMode: 'bypassPermissions' };
-  if (b.config.model !== undefined) profile.model = b.config.model;
-
-  const convo = await b.adapter.converse({
-    systemPrompt: helm.HELM_SYSTEM_PROMPT,
-    tools: helm.helmTools(b.orch, b.registry),
-    cwd: process.cwd(),
-    profile,
-    // Helm is the control plane, and `cwd` here is wherever the captain happened
-    // to type `blue` — which is not necessarily a registered project and may be
-    // no repo at all. Inheriting a CLAUDE.md from a directory chosen by accident
-    // would let the working directory silently change how the fleet is routed.
-    settingScopes: [],
-    signal: abort.signal,
-  });
-
-  const rl = readline.createInterface({
-    input: process.stdin,
-    output: process.stdout,
-    terminal: process.stdin.isTTY === true,
-    historySize: 250,
-  });
-  const PROMPT = process.stdin.isTTY === true ? `${cyan('›')} ` : '';
-  rl.setPrompt(PROMPT);
-
-  let busy = false;
-  let wroteTurnOutput = false;
-  let atLineStart = true;
-  let exitCode = 0;
-  let finished = false;
-  /**
-   * stdin reached EOF while there was still work to do.
-   *
-   * A pipe delivers its buffered lines and then closes immediately, so `close`
-   * lands while the first turn is still running. Shutting down there would
-   * discard the answer the captain piped in and asked for. Instead we remember
-   * that no more input is coming and exit once the queue has drained.
-   */
-  let inputClosed = false;
-  let resolveDone: (code: number) => void = () => undefined;
-  const done = new Promise<number>((resolve) => {
-    resolveDone = resolve;
-  });
-
-  const shutdown = (code: number): void => {
-    if (finished) return;
-    finished = true;
-    exitCode = code;
-    out('');
-    out(dim('Standing down. Every decision and every dollar is in the Blackbox.'));
+  const nudge = safe(() => {
+    const b = boot();
     try {
-      abort.abort();
-    } catch {
-      /* already aborted */
+      return decisionNudge(b.orch.openDecisions());
+    } finally {
+      b.close();
     }
-    void convo.close().catch(() => undefined);
-    rl.close();
-    b.close();
-    resolveDone(exitCode);
-  };
-
-  const readyForInput = (): void => {
-    busy = false;
-    wroteTurnOutput = false;
-    atLineStart = true;
-    if (finished) return;
-    const nudge = decisionNudge(b.orch.openDecisions());
-    if (nudge !== undefined) out(nudge);
-    // Piped input: the queue is empty and stdin is gone, so this was the last turn.
-    if (inputClosed) {
-      shutdown(0);
-      return;
-    }
-    rl.resume();
-    rl.prompt();
-  };
-
-  // ---- Helm's output stream -----------------------------------------------
-
-  /** Open the turn's output block once, then track whether the cursor is at column 0. */
-  const beginOutput = (): void => {
-    if (!wroteTurnOutput) {
-      wroteTurnOutput = true;
-      atLineStart = true;
-      out('');
-    }
-  };
-
-  const emit = (text: string): void => {
-    beginOutput();
-    process.stdout.write(text);
-    atLineStart = text.endsWith('\n');
-  };
-
-  const emitLine = (text: string): void => {
-    beginOutput();
-    process.stdout.write(`${atLineStart ? '' : '\n'}${text}\n`);
-    atLineStart = true;
-  };
-
-  /**
-   * Lines the captain got in ahead of the turn they belong after.
-   *
-   * A conversation runs one turn at a time — sending into a live turn is
-   * refused, not interleaved — and `rl.pause()` only holds back a TTY. A pipe
-   * delivers whatever it has buffered, so those lines wait here and go out as
-   * their own turns rather than colliding with the one in flight.
-   */
-  const queued: string[] = [];
-
-  /**
-   * One turn: hand the captain's line to the conversation and render the events
-   * it streams back. The iterable ends with the turn — the session behind it
-   * stays up for the next line.
-   */
-  const runTurn = async (line: string): Promise<void> => {
-    const startedAt = Date.now();
-    let costUsd = 0;
-
-    try {
-      for await (const ev of convo.send(line)) {
-        if (finished) break;
-
-        switch (ev.type) {
-          case 'text':
-            if (ev.text.trim() !== '') emit(ev.text);
-            break;
-          case 'tool_use':
-            emitLine(dim(`  · ${prettyToolName(ev.name)}`));
-            break;
-          case 'usage':
-            costUsd = ev.costUsd;
-            break;
-          case 'exit': {
-            if (wroteTurnOutput && !atLineStart) process.stdout.write('\n');
-            if (!ev.ok) out(red(`  Helm stopped: ${ev.reason ?? 'unknown error'}`));
-            out(dim(`  ${formatUsd(costUsd)} · ${formatDuration(Date.now() - startedAt)}`));
-            break;
-          }
-          default:
-            break;
-        }
-      }
-    } catch (e: unknown) {
-      if (finished) return;
-      errOut('');
-      errOut(red(`Helm session ended: ${errorMessage(e)}`));
-      shutdown(1);
-      return;
-    }
-
-    if (finished) return;
-
-    const next = queued.shift();
-    if (next !== undefined) {
-      wroteTurnOutput = false;
-      atLineStart = true;
-      void runTurn(next);
-      return;
-    }
-
-    readyForInput();
-  };
-
-  // ---- The captain's input ------------------------------------------------
-  const handleLocal = (line: string): boolean => {
-    switch (line) {
-      case '/exit':
-      case '/quit':
-        shutdown(0);
-        return true;
-      case '/help':
-        out(usage());
-        return true;
-      case '/ps':
-        cmdPs(b);
-        return true;
-      case '/inbox':
-        void runInbox({ orch: b.orch, registry: b.registry }, { listOnly: true });
-        return true;
-      default:
-        return false;
-    }
-  };
-
-  rl.on('line', (raw) => {
-    const line = raw.trim();
-    if (line === '') {
-      if (!busy) rl.prompt();
-      return;
-    }
-    if (line.startsWith('/') && handleLocal(line)) {
-      if (!busy && !finished) rl.prompt();
-      return;
-    }
-    if (busy) {
-      queued.push(line);
-      return;
-    }
-    busy = true;
-    wroteTurnOutput = false;
-    rl.pause();
-    void runTurn(line);
   });
-
-  rl.on('close', () => {
-    if (finished) return;
-    // Work still in flight (a pipe, or Ctrl-D mid-turn): let it finish, then exit.
-    if (busy || queued.length > 0) {
-      inputClosed = true;
-      return;
-    }
-    shutdown(0);
-  });
-
-  // readline swallows SIGINT when the terminal is attached, so listen on both.
-  rl.on('SIGINT', () => shutdown(0));
-  process.on('SIGINT', () => shutdown(0));
-  process.on('SIGTERM', () => shutdown(0));
-
-  out(HELM_BANNER);
-  const nudge = decisionNudge(b.orch.openDecisions());
   if (nudge !== undefined) {
-    out(nudge);
     out('');
+    out(nudge);
   }
-  rl.prompt();
 
-  const code = await done;
-  // The harness subprocess can outlive the stream; do not hang the terminal.
-  setTimeout(() => process.exit(code), 1500).unref();
-  return code;
+  out('');
+  return 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -1156,7 +1054,7 @@ async function main(argv: string[]): Promise<number> {
     return 0;
   }
 
-  if (command === undefined) return await runHelm();
+  if (command === undefined) return cmdFrontDoor();
 
   let b: Boot;
   try {
@@ -1191,6 +1089,9 @@ async function main(argv: string[]): Promise<number> {
       case 'map':
       case 'starmap':
         return await cmdMap(b, flags);
+
+      case 'mcp':
+        return await cmdMcp(b);
 
       default:
         errOut(red(`Unknown command: ${command}`));

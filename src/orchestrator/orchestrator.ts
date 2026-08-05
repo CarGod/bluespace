@@ -551,6 +551,11 @@ export class Orchestrator {
         taskId: task.id,
         sessionId: session.id,
         cwd: worktree.path,
+        // The one fact about a Crew that only exists in this process. A live
+        // `Session` cannot be projected, so `blue ps` and the Starmap — separate
+        // processes with nothing but the log — can only learn where to attach if
+        // we write it down at spawn. Undefined for a headless adapter.
+        attachCommand: session.attachCommand,
       },
     ]);
 
@@ -577,6 +582,13 @@ export class Orchestrator {
    * Drain a Crew's event stream in the background, then decide what happens
    * next. Loops while the decision is "keep this Crew going" (a rework steer,
    * a cold restart), so one pump covers a task's whole working life.
+   *
+   * EACH PASS OF THE LOOP IS ONE TURN, and calls `session.events()` again for
+   * the next one. That is the contract a steerable adapter owes: `send()` starts
+   * a fresh turn in a session that outlived the last one, and a stream the
+   * caller cannot re-open is a turn nobody watches — no usage, no exit, a task
+   * left in `working` forever. Adapters refuse a second CONCURRENT consumer,
+   * which is why only this loop ever calls it.
    */
   #pump(live: LiveCrew): void {
     if (live.pumping || live.closed) return;
@@ -600,7 +612,7 @@ export class Orchestrator {
     this.#track(work);
   }
 
-  /** Mirror the adapter's stream into the Blackbox. Returns how the run ended. */
+  /** Mirror one turn's events into the Blackbox. Returns how that turn ended. */
   async #consume(live: LiveCrew): Promise<ExitEvent> {
     const bb = this.#deps.blackbox;
     let exit: ExitEvent | undefined;
@@ -973,9 +985,23 @@ export class Orchestrator {
   // -----------------------------------------------------------------------
 
   /**
-   * The adapter enforces a per-run ceiling; this enforces the per-TASK one,
-   * which is the number the captain actually set. Reworks and verifications
-   * all bill to the same task, so only the orchestrator can see the total.
+   * THE ONLY COST CEILING THAT EXISTS. It used to be the second of two.
+   *
+   * `DispatchProfile.maxBudgetUsd` is still threaded to the adapter, and an
+   * adapter that can enforce a per-run ceiling still should — but the one
+   * BlueSpace runs on cannot: an interactive Claude Code session has no
+   * `--max-turns`, and `--max-budget-usd` only works with `--print`, which is
+   * the non-interactive mode `docs/compliance.md` forbids. So the belt is gone
+   * and this is the braces.
+   *
+   * Which makes the shape of this check the thing to understand rather than
+   * tidy: it fires on a `usage` event, and usage arrives when a message
+   * completes, so the ceiling is crossed BEFORE it is noticed. A task can
+   * overshoot by roughly one message — and, for a Crew that delegates, by
+   * whatever its subagents spent during the turn, since those land at the end of
+   * the turn (see `src/adapters/claude-cli.ts`, header 6). It is a ceiling with
+   * overshoot, not a hard stop, and calling it anything else would be a lie the
+   * captain pays for.
    */
   #enforceBudget(live: LiveCrew): void {
     const cap = this.#deps.config.maxBudgetUsdPerTask;

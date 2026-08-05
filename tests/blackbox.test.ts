@@ -215,7 +215,7 @@ describe('projectTasks', () => {
       crewId: 'c1',
       worktree: '/tmp/wt/t1',
       model: 'claude-opus-4',
-      permissionMode: 'bypassPermissions',
+      permissionMode: 'auto',
     });
     tick();
     bb.append({ type: 'crew.spawned', crewId: 'c1', taskId: 't1', cwd: '/tmp/wt/t1' });
@@ -499,9 +499,19 @@ describe('projectCrewLog', () => {
       taskId: 't1',
       crewId: 'c1',
       worktree: '/wt/1',
-      permissionMode: 'bypassPermissions',
+      permissionMode: 'auto',
     });
-    bb.append({ type: 'crew.spawned', crewId: 'c1', taskId: 't1', cwd: '/wt/1' });
+    // As the orchestrator writes it: a crew is a real session somewhere the
+    // captain can go, and the attach command is stored because no later process
+    // can derive it.
+    bb.append({
+      type: 'crew.spawned',
+      crewId: 'c1',
+      taskId: 't1',
+      cwd: '/wt/1',
+      sessionId: '11111111-2222-3333-4444-555555555555',
+      attachCommand: 'tmux attach -t bluespace:=blue-11111111',
+    });
     bb.append({ type: 'crew.text', crewId: 'c1', text: 'reading files' });
     bb.append({ type: 'crew.text', crewId: 'c2', text: 'different crew' });
     bb.append({
@@ -522,6 +532,10 @@ describe('projectCrewLog', () => {
       'crew.exited',
     ]);
     expect(log.map((e) => e.seq)).toEqual([...log.map((e) => e.seq)].sort((a, b) => a - b));
+    const spawned = log.find((e) => e.type === 'crew.spawned');
+    expect(spawned?.type === 'crew.spawned' ? spawned.attachCommand : undefined).toBe(
+      'tmux attach -t bluespace:=blue-11111111',
+    );
     expect(projectCrewLog(bb.read(), 'nobody')).toEqual([]);
   });
 });

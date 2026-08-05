@@ -115,6 +115,19 @@ export interface ReadTranscriptOptions {
   signal?: AbortSignal;
   /** Tail for appended records (default). `false` reads to EOF and stops. */
   follow?: boolean;
+  /**
+   * Byte offset to start at. Default 0 — the whole file.
+   *
+   * Exists so ONE transcript can be read as SEVERAL runs without re-billing the
+   * earlier ones: a Claude Code session outlives a turn, appends every turn to
+   * the same file, and a reader that started over at byte 0 for the second turn
+   * would emit the first turn's usage a second time. Feed back
+   * {@link TranscriptReadStats.consumedBytes} to resume exactly where the last
+   * read stopped. An offset past the end of a file that was truncated or
+   * rewritten is detected as a shrink and reset to 0, which re-reads rather
+   * than silently skipping.
+   */
+  startAtByte?: number;
   /** How long to wait for a file that does not exist yet. Default 30s. */
   waitForFileMs?: number;
   /** Backstop poll interval; `fs.watch` supplies the low-latency path. Default 100ms. */
@@ -144,6 +157,12 @@ export interface TranscriptReadStats {
   /** Assistant content-block `type` values seen and not mapped, with counts. */
   ignoredBlockKinds: Record<string, number>;
   eventsEmitted: number;
+  /**
+   * Absolute byte offset just past the last COMPLETE line consumed — never
+   * inside a record still being written. Pass it as {@link
+   * ReadTranscriptOptions.startAtByte} to resume this read where it stopped.
+   */
+  consumedBytes: number;
 }
 
 export function createStats(): TranscriptReadStats {
@@ -156,6 +175,7 @@ export function createStats(): TranscriptReadStats {
     ignoredKinds: {},
     ignoredBlockKinds: {},
     eventsEmitted: 0,
+    consumedBytes: 0,
   };
 }
 
@@ -361,7 +381,8 @@ export async function* readTranscript(
     if (follow) watcher = startWatcher(opts.path, waker);
 
     const buffer = Buffer.allocUnsafe(READ_CHUNK_BYTES);
-    let position = 0;
+    let position = Math.max(0, Math.trunc(opts.startAtByte ?? 0));
+    stats.consumedBytes = position;
     let carry: Buffer = Buffer.alloc(0);
     /** Set after a discarded oversized line: swallow bytes up to the next newline. */
     let resyncing = false;
@@ -374,6 +395,7 @@ export async function* readTranscript(
       // rewritten). Start over rather than decode from a stale offset.
       if (size < position) {
         position = 0;
+        stats.consumedBytes = 0;
         carry = Buffer.alloc(0);
         resyncing = false;
       }
@@ -412,6 +434,10 @@ export async function* readTranscript(
           carry = Buffer.alloc(0);
           resyncing = true;
         }
+        // Everything before `carry` is a decoded, complete line; `carry` is a
+        // record still being written. Resuming from here therefore never splits
+        // a record and never re-reads one.
+        stats.consumedBytes = position - carry.length;
       }
 
       if (!follow) break;

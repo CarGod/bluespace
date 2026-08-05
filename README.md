@@ -2,9 +2,10 @@
 
 **A captain and an AI crew. One conversation in, a fleet of agents out.**
 
-You talk to one agent. It talks to the fleet. Work gets split into tasks, each task
-gets its own worker in its own disposable git worktree, an independent verifier checks
-the result, and the only thing that reaches you is a decision that actually needs you.
+You say what you want in your own Claude Code window. One agent — Helm — turns it into
+tasks. Each task gets its own worker in its own disposable git worktree, an independent
+verifier checks the result, and the only thing that reaches you is a decision that
+actually needs you.
 
 Named for 蓝色空间号 — *Blue Space*, the ship in 三体 that carried human civilization
 forward after the fleet it belonged to was gone. It survived because it was willing to
@@ -20,7 +21,7 @@ Six words, and each one is a real boundary in the code.
 | Role | What it is | What it may do |
 | --- | --- | --- |
 | **Captain** | You. The human. | Makes decisions. Nothing else. |
-| **Helm** | The one agent you talk to. | Intake and judgement: understands the request, routes it to a project, writes briefs, creates tasks. Never writes your code. |
+| **Helm** | The one agent you talk to, inside your own Claude Code window. | Intake and judgement: understands the request, routes it to a project, writes briefs, creates tasks. Never writes your code. |
 | **Crew** | A worker. One per task. | Does the work, in a disposable git worktree of its own. Never sees another Crew. |
 | **Sentinel** | An independent verifier. | Reads the brief and the diff, and nothing else. Returns a pass/fail verdict. |
 | **Starmap** | The view. | A live dashboard of the fleet, projected from the Blackbox. |
@@ -32,9 +33,14 @@ answers questions. Everything that has to be predictable under failure is code.
 
 ---
 
-## Install
+## Requirements
 
-Requires **Node 20+** and **git**.
+| | Why |
+| --- | --- |
+| **Node 20+** | Runs BlueSpace itself. |
+| **git** | Every Crew works in a `git worktree`. Nothing else in the system shells out to git. |
+| **tmux** | A Crew *is* a terminal session. tmux is where those sessions live and how you attach to one. |
+| **Claude Code**, installed and signed in | A Crew is your own `claude` binary. BlueSpace never holds a credential — see below. |
 
 ```bash
 git clone <this repo> bluespace
@@ -44,33 +50,43 @@ npm run build
 npm link          # optional: puts `blue` on your PATH
 ```
 
-## Credentials — your own Claude CLI
+## How BlueSpace runs Claude
 
-BlueSpace runs its crews through the [Claude CLI](https://claude.com/claude-code) you
-already have, signed in as you already are. There is nothing extra to configure:
+**A Crew is a real, interactive Claude Code session** — a TUI, in a tmux window, on your
+machine, launched from the `claude` binary you installed and signed into. You can attach
+to any worker while it is running and type into it. `blue ps` prints the exact command.
+
+That is an architectural boundary, not a configuration choice. Anthropic documents
+subscription (OAuth) authentication as being for *ordinary use of Claude Code and other
+native Anthropic applications*, and directs anything built on the Agent SDK to API keys
+instead. BlueSpace therefore has **no Agent SDK dependency**, never runs `claude -p`, and
+never implements a login, holds a token, or proxies a request: its relationship to your
+credential is the same as tmux's.
+
+**Read [`docs/compliance.md`](docs/compliance.md) before changing how workers are
+launched.** It quotes the rules in full, says where the line falls, and is honest about
+the three things this reasoning does *not* settle — volume, distribution, and the
+possibility that the reading is wrong. It also documents the escape hatch: set
+`ANTHROPIC_API_KEY` and every question on that page goes away, at metered API pricing.
+
+Two practical notes:
 
 ```bash
-claude --version     # installed?
-claude               # run once and sign in, if you have not
+export CLAUDE_CLI_PATH=/full/path/to/claude   # only if `claude` is off your PATH
 ```
 
-If `claude` lives somewhere off your `PATH`, point BlueSpace at it:
+Claude Code asks *"Is this a project you trust?"* the first time it opens a directory, and
+no hook runs until it is answered — so a fresh worktree would sit there forever with
+nobody to press Enter. Trust is inherited from a parent, so answer it once for the
+directory worktrees are created under:
 
 ```bash
-export CLAUDE_CLI_PATH=/full/path/to/claude
+mkdir -p ~/.bluespace/worktrees && cd ~/.bluespace/worktrees && claude
+# answer "Yes, I trust this folder", then /exit
 ```
-
-BlueSpace checks the CLI answers **before** it dispatches anything. The SDK spawns it
-lazily, so without that check a missing or signed-out CLI shows up as a crew dying
-partway through a task — after a worktree exists and you have been told work started.
-One sentence at startup is the whole difference between a tool that feels solid and one
-that feels haunted.
-
-An `ANTHROPIC_API_KEY` in the environment is used if present, which is how a headless or
-CI run works with no login at all. You do not need one otherwise.
 
 Everything that only reads the Blackbox — `blue ps`, `blue log`, `blue inbox`,
-`blue config`, and `blue map` without `--orchestrate` — needs no credentials and no CLI.
+`blue config`, and `blue map` without `--orchestrate` — needs no CLI and no tmux.
 
 ## Quickstart
 
@@ -78,38 +94,64 @@ Everything that only reads the Blackbox — `blue ps`, `blue log`, `blue inbox`,
 # 1. Tell BlueSpace where your code lives. It references repos in place and never moves them.
 blue projects add ~/code/api --desc "payments API, Go, deploys from main"
 
-# 2. Talk to Helm. This is the whole interface.
-blue
-› the /refunds endpoint 500s on partial refunds, and while you're in there
+# 2. Register BlueSpace with your own Claude Code, once. This is the front door.
+claude mcp add -s user bluespace -- blue mcp
+
+# 3. Open Claude Code anywhere and say what you want built.
+claude
+> the /refunds endpoint 500s on partial refunds, and while you're in there
   the retry logic has no tests
 
-# Helm asks what it needs to, writes the briefs, and creates the tasks.
-# The orchestrator dispatches them — in parallel where it can.
+# Helm — the mcp__bluespace__* tools in that window — asks what it needs to,
+# writes the briefs, and creates the tasks. The orchestrator dispatches them,
+# in parallel where it can, for as long as that window is open.
 
-# 3. Watch, from anywhere.
-blue ps                  # what the fleet is doing right now
+# 4. Watch, from any other terminal.
+blue ps                  # what the fleet is doing — and what to type to watch a worker
 blue map                 # the Starmap dashboard in a browser
 
-# 4. Answer only what needs you.
+# 5. Answer only what needs you.
 blue inbox
 ```
+
+There is no `blue` prompt and no REPL. A bare `blue` prints the setup command and gets
+out of the way; typing at Helm happens in a real Claude Code window, which is precisely
+the point (`docs/compliance.md` again).
 
 Each task lands as a branch in its own worktree under `~/.bluespace/worktrees/`.
 Nothing is ever committed to your primary checkout; a Crew cannot even see it.
 
 ---
 
+## What BlueSpace will not do
+
+Stated plainly, because these are the claims people assume:
+
+- **No Crew ever pushes.** Not to a remote, not on a landed task, not on any delivery
+  mode. The brief forbids it explicitly.
+- **No Crew opens a pull request, and nothing merges anything.** A project's `delivery`
+  setting is metadata Helm reads when writing a brief — it is not an action BlueSpace
+  takes.
+- **`landed` means the Sentinel passed it.** Nothing more. It is a local branch sitting
+  in a worktree. Taking delivery is your hands on your own repository.
+- **Helm is read-only over your projects.** It reads code, logs and diffs to judge and
+  report. Every change is made by a Crew, in a worktree, on a throwaway branch.
+
+---
+
 ## Commands
 
 ```
-blue                          talk to Helm (interactive session)
+blue mcp                      serve Helm's tools over stdio — your Claude Code window runs this
+blue                          how to reach Helm; there is no prompt here
 
 blue inbox                    answer the decisions waiting on you  ← start here
       --list                  render only, do not prompt
-blue ps                       what the fleet is doing right now
+blue ps                       what the fleet is doing, and how to watch a worker
 blue log <taskId>             replay one task's events from the Blackbox
       -f, --follow            keep streaming new events
-blue map                      start the Starmap server and print its URL
+      --limit <n>             show only the last n events
+blue map                      start the Starmap server and print its URL (default :7777)
       --port <n>              port to listen on
       --orchestrate           also run the dispatch loop
 blue projects                 list registered projects
@@ -124,7 +166,13 @@ blue config set <k> <v>       change one setting (validated)
       --no-color              never emit ANSI colour
 ```
 
-Inside a Helm session, `/ps`, `/inbox`, `/help` and `/exit` work without leaving it.
+Helm itself is not a `blue` subcommand. It is the `mcp__bluespace__*` tools inside your
+own Claude Code window — see `CLAUDE.md` — and `blue mcp` is what that window launches.
+Everything above is the fleet's instrument panel, not a way to talk to it.
+
+The dispatch loop runs inside `blue mcp` for as long as your Claude Code window holds the
+connection. If you want the fleet to keep moving with that window closed, `blue map
+--orchestrate` turns the same crank.
 
 ---
 
@@ -136,33 +184,52 @@ directory (config, Blackbox, worktrees) — useful for keeping work projects sep
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `permissionMode` | `bypassPermissions` | Permission posture handed to every Crew. See below. |
+| `permissionMode` | `auto` | Permission posture handed to every Crew. See below. |
 | `model` | harness default | Model id for Crew and Sentinel runs. |
 | `effort` | `high` | Reasoning effort: `low`, `medium`, `high`, `xhigh`, `max`. |
-| `maxBudgetUsdPerTask` | `5` | Hard USD ceiling for one task, across its Crew *and* Sentinel runs. The task is killed at the line. |
+| `maxBudgetUsdPerTask` | `5` | USD ceiling for one task, across its Crew *and* Sentinel runs. |
 | `maxConcurrentCrew` | `4` | How many Crew may be in flight at once. |
 | `maxRework` | `2` | How many times a failing verdict may send a task back before it escalates to you. |
-| `dataDir` | `~/.bluespace` | Derived from `BLUESPACE_HOME`. Read-only; not settable from the file. |
+| `dataDir` | `~/.bluespace` | Derived from `BLUESPACE_HOME`. Read-only; not settable. |
+
+The budget ceiling is enforced by the orchestrator, which prices the token counts in each
+worker's transcript (`src/pricing/`) and kills the task when the total crosses the line.
+That is a ceiling with up to one turn of overshoot, not a hard stop mid-request: the
+harness's own `--max-budget-usd` only works in the non-interactive mode BlueSpace does
+not use.
+
+`maxConcurrentCrew` is not a performance knob. "Advertised usage limits assume ordinary,
+individual usage" is a real constraint and raising this is a decision about it; the
+default is low on purpose. See `docs/compliance.md`.
 
 ### Permission modes
 
-All five are accepted. Projects may override the global setting individually.
+These are exactly the modes `claude --permission-mode` accepts — BlueSpace deliberately
+does not invent its own vocabulary, because a mapping is a place for one mode to quietly
+become another. Projects may override the global setting individually. The authority is
+`PermissionMode` in `src/types/domain.ts`.
 
 | Mode | Behaviour |
 | --- | --- |
-| **`bypassPermissions`** | **The default.** No prompts. The Crew acts freely inside its worktree. This is the point of the tool — a permission prompt with nobody sitting in front of it is just a hang, and the worktree is the safety boundary instead. |
-| `default` | The harness's normal posture: prompts on the actions it considers sensitive. |
-| `dontAsk` | Proceeds without prompting, but still refuses what policy forbids. |
-| `plan` | The Crew plans and reports but does not modify anything. Useful for a dry run on an unfamiliar repo. |
-| `async` | For unattended runs: a classifier decides in place of a human rather than blocking on one. |
+| **`auto`** | **The default.** Edits and commands proceed unattended: no dialog, and nothing written to your global config. The one posture that does real work with nobody watching. |
+| `acceptEdits` | File edits auto-approved; other tools still prompt. Attended runs only. |
+| `plan` | Plans and reports, changes nothing. Useful for a dry run on an unfamiliar repo. |
+| `manual` | Prompts on anything sensitive. Only meaningful with a human attached. |
+| `dontAsk` | **Reads like "proceed without prompting"; does the opposite.** It *denies* Edit and Write outright — a Crew launched with it reads the repo, tries the change, is refused, and explains itself to a human who is not there. Present because the harness has it. |
+| `bypassPermissions` | Fully unrestricted. Costs a one-time modal only a human can dismiss, and dismissing it writes a permanent, machine-wide loosening into your global config. |
 
-`bypassPermissions` is the default *because of* the isolation model, not in spite of
-it. A Crew works in a throwaway worktree on a throwaway branch; the worst case is a
-branch you delete. If you would rather it not be, dial it back:
+`auto` is the default *because of* the isolation model, not in spite of it: a Crew works
+in a throwaway worktree on a throwaway branch, so the worst case is a branch you delete.
+If you would rather it not act unattended at all:
 
 ```bash
 blue config set permissionMode plan
 ```
+
+A Crew that hits a permission dialog anyway does not sit on it. A `Notification` hook
+reports the prompt, the run ends in seconds, and the error tells you which session to
+attach to. BlueSpace will not answer the dialog for you — a machine pressing "1. Yes" is
+`--dangerously-skip-permissions` by keystroke, which it rejected for milder reasons.
 
 ---
 
@@ -174,25 +241,36 @@ the log on demand. Kill the process mid-flight and reopen it: the state is ident
 because the state was never in memory to begin with.
 
 ```
-  Captain ──► Helm ──► creates tasks ──► ORCHESTRATOR (code)
-                                            │
-                            ┌───────────────┼───────────────┐
-                            ▼               ▼               ▼
-                          Crew            Crew            Crew        each in its own
-                        worktree        worktree        worktree      git worktree
-                            │               │               │
-                            └──── diff ─────┴───────────────┘
-                                    ▼
-                                 Sentinel   (sees the brief + the diff.
-                                    │        never the Crew's reasoning.)
-                                    ▼
-                            pass ──► ready ──► landed
-                            fail ──► rework, or a decision for the Captain
+  Captain
+     │ types into their own interactive Claude Code window
+     ▼
+  Claude Code ──► blue mcp ──► Helm ──► creates tasks ──► ORCHESTRATOR (code)
+                  src/mcp/     src/agents/helm/          src/orchestrator/
+                  stdio                                       │
+                  JSON-RPC              ┌─────────────────────┼─────────────────────┐
+                                        ▼                     ▼                     ▼
+                                      Crew                  Crew                  Crew
+                                  tmux session          tmux session          tmux session
+                                  git worktree          git worktree          git worktree
+                                        │                     │                     │
+                                        │  a real TUI you can attach to and type into
+                                        │
+                    what it did and what it cost is read back from the
+                    session transcript on disk, never from the screen:
+                    src/session/ ─► src/transcript/ ─► src/pricing/
+                                        │
+                                        └──── diff ────► Sentinel   (sees the brief + the
+                                                             │       diff. never the Crew's
+                                                             │       reasoning.)
+                                                             ▼
+                                        pass ──► ready ──► landed  (a local branch. that is all
+                                                                    "landed" has ever meant.)
+                                        fail ──► rework, or a decision for the Captain
 
   every arrow above is an event in the Blackbox; every view is a fold over it
 ```
 
-Two decisions carry the whole design.
+Three decisions carry the whole design.
 
 ### 1. The orchestrator is code, not an agent
 
@@ -221,14 +299,33 @@ the reasoning that produced a mistake is the reasoning that will excuse it.
 The Sentinel is a separate run with a separate context. It receives two things — the
 original brief, and the git diff — and it never receives the Crew's transcript,
 narration, or explanation of why something was skipped. It cannot be talked into a
-pass, because there is no conversation to be talked into. Its verdict is constrained
-to a JSON schema (`VERDICT_SCHEMA`) at the tool-call layer, so a result is validated
-structure rather than prose someone has to parse and hope about.
+pass, because there is no conversation to be talked into. Its verdict must match
+`VERDICT_SCHEMA`: the Sentinel is handed the schema and a path outside the worktree,
+writes its JSON there, and the file is validated on exit, with one bounded correction
+typed into the live session if it is malformed. That is an application-layer check
+rather than a protocol-level guarantee, and the Sentinel fails closed on a missing or
+unreadable verdict — which is what makes the weakening survivable, not equivalent.
 
-A failing verdict returns unmet requirements to the Crew as rework. After `maxRework`
-attempts, the orchestrator stops burning money and opens a decision for the Captain.
-That escalation path is the honest answer to "what happens when the agent can't do
-it" — which is a question most of these systems decline to answer.
+A failing verdict returns unmet requirements to the Crew as rework. Because the session
+outlives the turn, rework is a follow-up message typed into the *same* worker rather
+than a fresh run replaying context. After `maxRework` attempts, the orchestrator stops
+burning money and opens a decision for the Captain. That escalation path is the honest
+answer to "what happens when the agent can't do it" — which is a question most of these
+systems decline to answer.
+
+### 3. Nothing reads the screen
+
+A terminal is a picture of a conversation, not the conversation. `src/session/` may
+start a session, address it, and type into it; it may **not** read what it renders.
+Every semantic signal comes from a structured source instead: the JSONL transcript
+Claude Code writes to disk (`src/transcript/`), and marker files written by per-run
+hooks that travel in inline `--settings` JSON and never touch `~/.claude/settings.json`.
+
+Cost works the same way. The transcript carries token counts and a model string and
+nothing else, so `src/pricing/` converts them with a table of published rates — one that
+is dated in the source, prices unknown models at the most expensive known family rather
+than at zero, and drains a delegating worker's subagent files so a Crew cannot spend
+money the ceiling cannot see.
 
 ---
 
@@ -237,13 +334,19 @@ it" — which is a question most of these systems decline to answer.
 ```
 src/types/        domain + event schemas — the frozen contracts everything codes against
 src/blackbox/     the append-only SQLite log, and every projection over it
-src/adapters/     the ONLY place a vendor SDK is imported; everything else is neutral
+src/adapters/     the harness boundary: AdapterEvent / Session / SpawnRequest, and the
+                  Claude Code CLI adapter that stitches session + transcript + pricing
+src/session/      start a terminal session, address it, type into it. Never reads it.
+src/transcript/   the event stream, recovered from the JSONL the CLI writes to disk
+src/pricing/      token counts -> USD, so the budget ceiling means something
+src/mcp/          the stdio MCP server `blue mcp` runs — BlueSpace's front door
 src/worktree/     git worktree lifecycle. Nothing else in the system shells out to git.
 src/orchestrator/ the engine room: dispatch, ordering, retry, budget, teardown + state machine
 src/agents/       Helm's prompt and tools, the Crew brief builder, the Sentinel
 src/config/       BlueConfig and the project registry
 src/cli/          the `blue` command
 src/server/       the Starmap dashboard
+docs/compliance.md  why a worker is an interactive session and not an SDK call
 ```
 
 ## Development
@@ -255,7 +358,15 @@ npm run build        # emit to dist/
 ```
 
 TypeScript, ESM, NodeNext resolution — every relative import ends in `.js`. `strict`
-and `noUncheckedIndexedAccess` are on.
+and `noUncheckedIndexedAccess` are on. Two runtime dependencies — `better-sqlite3` and
+`zod` — and the intent is to keep it that way.
+
+`tests/compliance-smoke.test.ts` is the tripwire for everything on this page that is
+observed rather than promised: it asserts the flags a worker is launched with still
+exist, that `auto` and `dontAsk` still mean what they mean, and that no Agent SDK has
+come back into `package.json`. Re-run it after every Claude Code upgrade — with
+`BLUESPACE_LIVE_SMOKE=1` for the paid end-to-end half — and update the version table in
+`docs/compliance.md`.
 
 ## License
 

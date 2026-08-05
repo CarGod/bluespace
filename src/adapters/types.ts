@@ -161,6 +161,16 @@ export interface SpawnRequest {
 
 export interface Session {
   readonly id: string;
+  /**
+   * Literally what the captain types to watch this worker or take it over,
+   * when the adapter runs workers somewhere a human can reach. Undefined for
+   * an adapter whose runs are headless — which is a real difference in what
+   * the tool can do, so it is surfaced rather than papered over.
+   *
+   * Carried into the Blackbox on `crew.spawned` so `blue ps` and the Starmap
+   * can print it. A value nobody can act on is not worth an event.
+   */
+  readonly attachCommand?: string;
   /** The normalized event stream. Ends when the run exits. */
   events(): AsyncIterable<AdapterEvent>;
   /** Push a follow-up message into a live session. Requires `steer`. */

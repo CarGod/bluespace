@@ -109,7 +109,9 @@ function makeTask(overrides: Partial<Task> = {}): Task {
 const PROFILE: DispatchProfile = {
   model: 'claude-opus-4',
   effort: 'high',
-  permissionMode: 'bypassPermissions',
+  // The default posture since crews became real interactive sessions: it edits
+  // unattended with no dialog and no machine-wide config write.
+  permissionMode: 'auto',
   maxBudgetUsd: 5,
   maxTurns: 200,
 };
@@ -170,6 +172,51 @@ describe('runSentinel — pass verdict', () => {
     expect(req?.profile.permissionMode).toBe(PROFILE.permissionMode);
     // Verification is one read-and-judge pass; the Crew's 200-turn leash is cut down.
     expect(req?.profile.maxTurns).toBe(SENTINEL_MAX_TURNS);
+  });
+
+  it('keeps a posture that can actually produce a verdict', async () => {
+    // The verdict is a FILE the Sentinel writes now, not a schema-constrained
+    // tool call. `plan` changes nothing on disk by definition and `dontAsk`
+    // refuses Write outright, so inheriting either would fail every
+    // verification closed — and a task whose diff was never judged would burn
+    // its whole rework budget before reaching the captain.
+    for (const mode of ['plan', 'dontAsk'] as const) {
+      const fake = fakeAdapter([exitWith({ pass: true, reasoning: 'ok', unmet: [] })]);
+      await runSentinel({
+        adapter: fake.adapter,
+        task: makeTask(),
+        diff: DIFF,
+        cwd: '/tmp/wt/task-1',
+        profile: { ...PROFILE, permissionMode: mode },
+      });
+      expect(fake.spawns[0]?.profile.permissionMode).toBe('auto');
+    }
+
+    // Every other posture is the Crew's, untouched: the Sentinel is held
+    // read-only by its system prompt, not by a mode.
+    const fake = fakeAdapter([exitWith({ pass: true, reasoning: 'ok', unmet: [] })]);
+    await runSentinel({
+      adapter: fake.adapter,
+      task: makeTask(),
+      diff: DIFF,
+      cwd: '/tmp/wt/task-1',
+      profile: { ...PROFILE, permissionMode: 'acceptEdits' },
+    });
+    expect(fake.spawns[0]?.profile.permissionMode).toBe('acceptEdits');
+  });
+
+  it('tells the Sentinel it may write its verdict file and nothing else', async () => {
+    const fake = fakeAdapter([exitWith({ pass: true, reasoning: 'ok', unmet: [] })]);
+    await run(fake.adapter);
+
+    // The read-only rule and the file-based verdict path contradict each other
+    // unless the exception is stated: a Sentinel that obeys "create nothing"
+    // literally writes no verdict, and fails closed on work it actually judged.
+    const sys = fake.spawns[0]?.systemPromptAppend ?? '';
+    expect(sys).toMatch(/read-only over the worktree/i);
+    expect(sys).toMatch(/must not edit, create, delete, stage, commit/i);
+    expect(sys).toMatch(/ONE file you must write is the\s+structured-output file/i);
+    expect(sys).toMatch(/outside the\s+worktree/i);
   });
 
   it('gives the Sentinel the brief and the diff, and nothing about the Crew', async () => {

@@ -18,7 +18,6 @@
     "blue": "node --enable-source-maps dist/cli/index.js"
   },
   "dependencies": {
-    "@anthropic-ai/claude-agent-sdk": "^0.3.221",
     "better-sqlite3": "^13.0.2",
     "zod": "^4.0.0"
   },

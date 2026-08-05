@@ -72,6 +72,8 @@ type CrewScript = (cwd: string) => Promise<{ text: string }>;
 
 class ScriptedSession implements Session {
   readonly id = `sess-${Math.random().toString(36).slice(2)}`;
+  /** Shaped like the tmux backend's, since that is what mints the real one. */
+  readonly attachCommand = `tmux attach -t bluespace:=blue-${Math.random().toString(36).slice(2, 10)}`;
   closed = false;
   readonly steers: string[] = [];
 
@@ -210,6 +212,14 @@ describe('end-to-end: real blackbox + real worktrees + real registry', () => {
     // The primary checkout was never touched.
     expect(await readFile(path.join(repo, 'index.ts'), 'utf8')).toBe(
       'export const hello = () => "hi";\n',
+    );
+
+    // A Crew is a session the captain can walk into, and `blue ps` is a separate
+    // process holding nothing but this log — so if the attach command is not
+    // here, it does not exist anywhere.
+    const spawnedEvent = w.bb.read().find((e) => e.type === 'crew.spawned');
+    expect(spawnedEvent?.type === 'crew.spawned' ? spawnedEvent.attachCommand : undefined).toMatch(
+      /^tmux attach -t /,
     );
 
     // The Sentinel saw the Crew's REAL diff, computed by git, not a fixture.

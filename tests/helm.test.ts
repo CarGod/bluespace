@@ -14,7 +14,6 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { jsonSchemaToZodShape } from '../src/adapters/claude.js';
 import type { ToolDef } from '../src/adapters/types.js';
 import { helmTools } from '../src/agents/helm/index.js';
 import type { ProjectRegistry } from '../src/config/index.js';
@@ -166,12 +165,14 @@ describe('helmTools — shape', () => {
     }
   });
 
-  it('describes its input as a JSON Schema object the adapter can convert', () => {
+  it('describes its input as a JSON Schema object the transport can serve verbatim', () => {
     for (const t of list) {
       expect(t.inputSchema['type']).toBe('object');
       expect(t.inputSchema['properties']).toBeTypeOf('object');
-      // The converter is the thing that has to swallow this; it must not throw.
-      expect(() => jsonSchemaToZodShape(t.inputSchema)).not.toThrow();
+      // The MCP server puts this object on the wire untranslated, so the only
+      // thing it has to survive is JSON.stringify — a cycle or a function here
+      // would take the whole `tools/list` frame down rather than one tool.
+      expect(() => JSON.stringify(t.inputSchema)).not.toThrow();
       for (const [field, raw] of Object.entries(
         t.inputSchema['properties'] as Record<string, Record<string, unknown>>,
       )) {

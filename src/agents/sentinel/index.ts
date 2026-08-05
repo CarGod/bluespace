@@ -21,7 +21,14 @@ import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 
 import { requireCapability, type HarnessAdapter, type Session } from '../../adapters/types.js';
-import { VERDICT_SCHEMA, type DispatchProfile, type Task, type Verdict } from '../../types/domain.js';
+import {
+  DEFAULT_PERMISSION_MODE,
+  VERDICT_SCHEMA,
+  type DispatchProfile,
+  type PermissionMode,
+  type Task,
+  type Verdict,
+} from '../../types/domain.js';
 
 // ---------------------------------------------------------------------------
 // Bounds
@@ -43,10 +50,17 @@ export const SENTINEL_MAX_TURNS = 24;
 // ---------------------------------------------------------------------------
 
 /**
- * Runtime shape of VERDICT_SCHEMA. The schema is enforced by the harness at the
- * tool-call layer, but we re-validate here: "the model claimed to honour a JSON
- * schema" and "this object is a verdict" are different statements, and only the
- * second one is safe to act on.
+ * Runtime shape of VERDICT_SCHEMA, and now the LOAD-BEARING check rather than a
+ * second opinion.
+ *
+ * It used to be the second: the harness constrained the tool call to the schema,
+ * and this re-validated because "the model claimed to honour a JSON schema" and
+ * "this object is a verdict" are different statements. The interactive CLI has
+ * no such constraint to offer — `--json-schema` is a `--print` flag, and
+ * `--print` is the non-interactive mode `docs/compliance.md` forbids — so the
+ * verdict is now a file the Sentinel is told to write, and the adapter's own
+ * check of it is deliberately partial (see `validateAgainstSchema`). This is the
+ * layer that decides whether an object is a verdict, and it is the only one.
  */
 const verdictShape = z.object({
   pass: z.boolean(),
@@ -86,12 +100,17 @@ export const SENTINEL_SYSTEM_PROMPT = [
   'and only if `pass` is true. `reasoning` is one short paragraph — the verdict, and what',
   'decided it.',
   '',
-  'You are read-only. You may inspect files in the working tree to understand context,',
+  'You are read-only over the worktree. You may inspect files there to understand context,',
   'but you must not edit, create, delete, stage, commit, or run any command that changes',
-  'state — the worktree still holds the worker\'s output. Do not attempt to find the',
+  'state — the worktree still holds the worker\'s output, and a verifier that edits the',
+  'thing it is judging has destroyed the evidence. The ONE file you must write is the',
+  'structured-output file you are given a path to. It deliberately lives outside the',
+  'worktree, so writing it changes nothing you are judging. Do not attempt to find the',
   'worker\'s transcript or session log; verifying against it would defeat your purpose.',
   '',
-  'Return the structured verdict. Nothing else.',
+  'The structured verdict is your only deliverable. Follow the structured-output',
+  'instructions exactly: a verdict you only describe in your reply has not been returned,',
+  'because the file is the only thing that is read.',
 ].join('\n');
 
 // ---------------------------------------------------------------------------
@@ -321,18 +340,38 @@ export function buildSentinelPrompt(input: SentinelPromptInput): string {
 // ---------------------------------------------------------------------------
 
 /**
+ * Postures under which the Sentinel cannot return a verdict AT ALL.
+ *
+ * Not a judgement about how much freedom a verifier deserves — a mechanical
+ * fact about the one it now runs on. The verdict is a file the Sentinel writes
+ * (see the header of `src/adapters/claude-cli.ts`), and `plan` changes nothing
+ * on disk by definition while `dontAsk` refuses Write outright. Under either,
+ * every verification would fail closed with "no structured verdict", every task
+ * would exhaust its rework budget, and the captain's inbox would fill with
+ * decisions about work nobody ever actually judged.
+ */
+const CANNOT_WRITE_A_VERDICT: readonly PermissionMode[] = ['plan', 'dontAsk'] as const;
+
+/**
  * Derive the Sentinel's dispatch profile from the Crew's.
  *
  * Same model and effort — a verifier weaker than the worker it checks is
- * theatre. Same permission posture, because the alternative postures either
- * block on a prompt nobody is there to answer or cut the run short before the
- * structured verdict is produced; the Sentinel is held read-only by its system
- * prompt instead. Turns are capped tighter: this is one read-and-judge pass, and
- * a verifier that wanders is a verifier that is rationalising.
+ * theatre. Same permission posture, with the one exception above: the remaining
+ * alternatives either block on a prompt nobody is there to answer or cut the run
+ * short before the verdict is written, and the Sentinel is held read-only by its
+ * system prompt rather than by a mode.
+ *
+ * `maxTurns` is set and, on the interactive CLI, NOT ENFORCED — there is no
+ * `--max-turns` flag. It stays because it states the intent for any adapter that
+ * can honour it (this is one read-and-judge pass; a verifier that wanders is a
+ * verifier that is rationalising), and because a profile that quietly dropped it
+ * would make the day someone adds enforcement a surprise.
  */
 function sentinelProfile(profile: DispatchProfile): DispatchProfile {
   const derived: DispatchProfile = {
-    permissionMode: profile.permissionMode,
+    permissionMode: CANNOT_WRITE_A_VERDICT.includes(profile.permissionMode)
+      ? DEFAULT_PERMISSION_MODE
+      : profile.permissionMode,
     maxTurns: Math.min(profile.maxTurns ?? SENTINEL_MAX_TURNS, SENTINEL_MAX_TURNS),
   };
   if (profile.model !== undefined) derived.model = profile.model;

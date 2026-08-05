@@ -712,6 +712,91 @@ describe('malformed input', () => {
   });
 });
 
+describe('resuming at an offset', () => {
+  /**
+   * The case this exists for: a Claude Code session outlives a turn and appends
+   * every turn to ONE file, so the reader for turn 2 must not re-read turn 1.
+   * Doing so would emit its usage a second time, and a double-counted bill is
+   * the one reader bug the captain pays for directly.
+   */
+  it('reads only what the previous read left, and bills each turn once', async () => {
+    await write(
+      assistant({ id: 'turn1', content: [{ type: 'text', text: 'turn one' }], usage: usage({ output_tokens: 100 }) }),
+    );
+
+    const first = createStats();
+    const firstEvents = await drain({ stats: first });
+    expect(firstEvents).toContainEqual({ type: 'text', text: 'turn one' });
+    expect(firstEvents.filter((e) => e.type === 'usage')).toHaveLength(1);
+    expect(first.consumedBytes).toBe((await fs.stat(transcript)).size);
+
+    await append(
+      line(
+        assistant({
+          id: 'turn2',
+          content: [{ type: 'text', text: 'turn two' }],
+          usage: usage({ output_tokens: 200 }),
+        }),
+      ),
+    );
+
+    const second = createStats();
+    const secondEvents: AdapterEvent[] = [];
+    for await (const e of readTranscript({
+      path: transcript,
+      price: fakePrice,
+      follow: false,
+      startAtByte: first.consumedBytes,
+      stats: second,
+    })) {
+      secondEvents.push(e);
+    }
+
+    expect(secondEvents).toContainEqual({ type: 'text', text: 'turn two' });
+    expect(secondEvents).not.toContainEqual({ type: 'text', text: 'turn one' });
+    const billed = secondEvents.filter((e) => e.type === 'usage');
+    expect(billed, 'turn one was billed a second time').toHaveLength(1);
+    expect(billed[0]).toMatchObject({ outputTokens: 200 });
+    expect(second.consumedBytes).toBe((await fs.stat(transcript)).size);
+  });
+
+  it('stops at a line boundary, never inside a record still being written', async () => {
+    const complete = line(assistant({ id: 'msg_1', content: [{ type: 'text', text: 'complete' }] }));
+    const half = line(assistant({ id: 'msg_2', content: [{ type: 'text', text: 'half' }] })).slice(0, 40);
+    await fs.writeFile(transcript, complete + half);
+
+    const stats = createStats();
+    await drain({ stats });
+    // Resuming from here re-reads the half-written record from its first byte.
+    expect(stats.consumedBytes).toBe(Buffer.byteLength(complete));
+  });
+
+  it('re-reads from the start when the file it was reading shrank', async () => {
+    // A resumed session gets its transcript rewritten. An offset past the end of
+    // the new file would silently skip everything in it.
+    await write(assistant({ id: 'old', content: [{ type: 'text', text: 'rewritten away' }] }));
+    const stats = createStats();
+    await drain({ stats });
+    const wasAt = stats.consumedBytes;
+    expect(wasAt).toBeGreaterThan(0);
+
+    await fs.writeFile(transcript, line(assistant({ id: 'new', content: [{ type: 'text', text: 'fresh' }] })));
+
+    const after = createStats();
+    const events: AdapterEvent[] = [];
+    for await (const e of readTranscript({
+      path: transcript,
+      price: fakePrice,
+      follow: false,
+      startAtByte: wasAt + 10_000,
+      stats: after,
+    })) {
+      events.push(e);
+    }
+    expect(events).toContainEqual({ type: 'text', text: 'fresh' });
+  });
+});
+
 describe('partial trailing line', () => {
   it('never yields a record that is still being written', async () => {
     const complete = line(assistant({ id: 'msg_1', content: [{ type: 'text', text: 'complete' }] }));

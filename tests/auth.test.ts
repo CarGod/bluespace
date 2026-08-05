@@ -1,11 +1,12 @@
 /**
  * How a run authenticates, and the startup check that makes failure legible.
  *
- * BlueSpace drives the captain's own Claude CLI with the login they already have,
+ * BlueSpace launches the captain's own `claude` with the login they already have,
  * so the happy path needs no configuration at all. What actually breaks is the
- * CLI being absent, mis-pathed, or unresponsive — and because the SDK spawns it
- * lazily, that would otherwise surface as a crew dying partway through a task,
- * after a worktree exists and the captain has been told work started.
+ * CLI being absent, mis-pathed, or unresponsive — and because a worker is a
+ * terminal session rather than a call this process makes, that would otherwise
+ * surface as a window that dies partway through a task, after a worktree exists
+ * and the captain has been told work started.
  *
  * These tests pin the two things that keep that from happening: the auth mode is
  * reported honestly, and the startup check fails with a sentence a human can act
@@ -23,7 +24,7 @@ import {
   ClaudeCliUnavailableError,
   assertClaudeCliAvailable,
   resolveAuth,
-} from '../src/adapters/claude.js';
+} from '../src/adapters/claude-cli.js';
 
 /** An explicit environment, so an ambient key on a developer machine cannot leak in. */
 const env = (over: Record<string, string> = {}): NodeJS.ProcessEnv => ({ ...over });
@@ -126,10 +127,11 @@ describe('assertClaudeCliAvailable', () => {
   it('resolves PATH to an absolute binary, so the CLI we verify is the CLI that runs', () => {
     // Whether a CLI is installed is a property of the machine, not of the code,
     // so both outcomes are legal. What must hold in each: a found CLI reports an
-    // ABSOLUTE path — a bare `claude` would let the SDK quietly substitute the
-    // copy bundled inside its own package, which is a different (SDK-pinned)
-    // version from the one the captain installed — and an absent CLI still
-    // produces the typed, actionable error rather than a raw spawn failure.
+    // ABSOLUTE path — a bare `claude` is resolved against the environment of a
+    // long-lived tmux server, which is not this process's PATH, so the binary
+    // verified here would not necessarily be the binary that runs — and an
+    // absent CLI still produces the typed, actionable error rather than a raw
+    // spawn failure.
     try {
       const info = assertClaudeCliAvailable(env());
       expect(path.isAbsolute(info.path)).toBe(true);

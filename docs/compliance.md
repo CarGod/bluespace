@@ -130,12 +130,51 @@ Everything here was checked empirically, not inferred.
 | Platform | macOS (darwin 25.5.0), tmux 3.7b |
 
 What was verified working: `--session-id` fixes the transcript path before
-launch; `--permission-mode auto` performs real file edits with **no confirmation
-dialog and no persisted global state**; `--settings` accepts inline JSON so the
-completion hook is per-run and never touches `~/.claude/settings.json`; a
-positional prompt populates the composer without submitting, so submission is an
-explicit keypress; the transcript is structured JSONL carrying `text`,
-`thinking`, `tool_use`, tool results, and full `usage`.
+launch; `--settings` accepts inline JSON so the completion hook is per-run and
+never touches `~/.claude/settings.json`; the transcript is structured JSONL
+carrying `text`, `thinking`, `tool_use`, tool results, and full `usage`; a
+session survives its own Stop hook, so a follow-up turn is a keystroke rather
+than a new run.
+
+Three things here were believed, then re-measured, and the first draft of this
+document was wrong about all three. They are written out because the cost of
+each is a worker that hangs, and a hang looks the same as a worker thinking.
+
+**A fresh directory blocks everything until it is trusted.** No hook fires — not
+even `SessionStart` — while Claude Code is asking whether this is a project you
+trust. Every Crew worktree is a brand-new directory, so this is the *default*
+first-run experience, not an edge case. Trust is inherited from a trusted
+ancestor, so trusting the worktree root once covers every worktree beneath it;
+`SessionNotReadyError` says so and prints the command. Measured: a first launch
+in a new git repo never reached `SessionStart`; subsequent launches in the same
+directory did.
+
+**A positional prompt submits itself.** The first draft claimed it only fills the
+composer and that submission needs an explicit Enter. Re-measured in a trusted
+directory with **no keys sent at all**: the turn ran, the edit landed, and the
+Stop hook fired — twice out of two. The original observation (text sitting unsent
+in the composer seven seconds in) came from a session blocked on the trust prompt
+above, which is what an untrusted directory looks like from the outside. The
+adapter still sends Enter, because it is a no-op on an empty composer and the
+alternative failure is a worker that waits forever.
+
+**`--permission-mode auto` usually does not prompt — usually.** Three of three
+runs edited a tracked file in a git repo with no dialog and no global state
+written, which is why it is the default. But `auto` is a classifier, not a
+switch, and a second machine saw it prompt on the same shape of task. So the
+adapter does not assume: an inline `Notification` hook captures
+`notification_type: permission_prompt`, and a worker parked on a dialog nobody
+can answer ends with a reason and an attach command instead of burning its
+timeout. It never presses "Yes" — doing that by keystroke is
+`--dangerously-skip-permissions` with extra steps.
+
+One more, and it is the one that costs money if it changes: **a subagent's
+records are not in the session transcript.** They are written to
+`<project-dir>/<session-uuid>/subagents/agent-<id>.jsonl`. BlueSpace reads those
+files at the end of every turn, because a Crew that delegates otherwise spends
+real money that no ceiling can see. If a future release inlines them instead,
+that spend would be counted twice rather than not at all — check this one first
+after an upgrade.
 
 **Re-run `tests/compliance-smoke.test.ts` after every Claude Code upgrade.**
 None of the above is a documented, versioned API contract. It is observed

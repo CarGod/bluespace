@@ -143,9 +143,22 @@ export interface DispatchProfile {
   model?: string;
   effort?: Effort;
   permissionMode: PermissionMode;
-  /** Hard USD ceiling for a single Crew run. The SDK stops the query at it. */
+  /**
+   * USD ceiling for a single run, and ADVISORY unless the adapter says otherwise.
+   *
+   * The SDK stopped the query at it. An interactive Claude Code session cannot:
+   * `--max-budget-usd` is documented "only works with --print", and `--print` is
+   * the non-interactive mode `docs/compliance.md` rules out. It is still stated
+   * here because it is the captain's number and an adapter that can enforce it
+   * must — but the ceiling that actually stops a run is the orchestrator's
+   * per-task one, which watches `usage` events. See `#enforceBudget`.
+   */
   maxBudgetUsd?: number;
-  /** Hard cap on agentic turns for a single Crew run. */
+  /**
+   * Cap on agentic turns for a single run. Same story as `maxBudgetUsd`: the SDK
+   * enforced it, the interactive CLI has no `--max-turns` at all, and the honest
+   * backstop is the adapter's turn timeout.
+   */
   maxTurns?: number;
 }
 
@@ -189,8 +202,15 @@ export interface Verdict {
 }
 
 /**
- * JSON Schema handed to the Sentinel via the SDK's `outputFormat`, so the
- * verdict is validated at the tool-call layer instead of parsed out of prose.
+ * The shape of a verdict, as JSON Schema, handed to the adapter as
+ * `SpawnRequest.outputSchema`.
+ *
+ * It used to be a protocol constraint: the SDK validated the tool call against
+ * it, and malformed output was impossible rather than merely caught. On an
+ * interactive session it is an INSTRUCTION — the Sentinel is given this schema
+ * and a path, and writes a file. So it is quoted to the model verbatim, which is
+ * why every `description` here is written to be read by one: they are the only
+ * explanation it gets of what each field means.
  */
 export const VERDICT_SCHEMA = {
   type: 'object',

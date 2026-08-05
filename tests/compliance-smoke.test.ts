@@ -168,15 +168,29 @@ describe.skipIf(!LIVE)('live loop (spends tokens — BLUESPACE_LIVE_SMOKE=1)', (
     return { dir, stopped: existsSync(marker) };
   }
 
-  it('SessionStart fires, a positional prompt needs an explicit Enter, and auto mode really edits', async () => {
+  it('SessionStart fires, the turn runs, and auto mode really edits', async () => {
+    // NOTE ON TRUST: this launches in a fresh temp directory, and a fresh
+    // directory is exactly what Claude Code asks about before it will do
+    // anything — no hook fires, including SessionStart, until it is trusted.
+    // Trust is inherited from an ancestor, so this passes on a machine where
+    // the temp root has been trusted once and hangs to its timeout on one
+    // where it has not. That is the same trap every Crew worktree hits; the
+    // adapter turns it into SessionNotReadyError with the command to fix it.
+    // If this test times out on a clean machine, that is the reason.
     const { dir, stopped } = await launchAndSubmit(
       'auto',
       'calc.py has a bug: add() uses minus. Change it to plus. Then stop; ask nothing.',
     );
 
-    expect(stopped, 'Stop hook never fired — the turn either never started or never ended').toBe(true);
+    expect(stopped, 'Stop hook never fired — the turn never started, or the directory is untrusted').toBe(
+      true,
+    );
     const after = await readFile(join(dir, 'calc.py'), 'utf8');
-    expect(after, 'auto mode did not perform the edit').toContain('a + b');
+    // `auto` is a classifier rather than a switch: it did not prompt in three
+    // of three measured runs on this shape of task, and a second machine saw it
+    // prompt. A failure here is a signal to re-read docs/compliance.md, not
+    // automatically a regression.
+    expect(after, 'auto mode did not perform the edit — did it stop to ask?').toContain('a + b');
   }, 180_000);
 
   it('dontAsk refuses writes, which is why it is not the dispatch default', async () => {

@@ -401,7 +401,12 @@ export function describeEvent(e: BlueEvent): EventLine {
     case 'crew.spawned':
       return {
         label: blue('crew up'),
-        detail: `${shortId(e.crewId)} in ${e.cwd}${e.sessionId ? dim(` · session ${shortId(e.sessionId)}`) : ''}`,
+        // The attach command goes on its own line: it is the one thing on this
+        // event a human acts on, and a command you have to reconstruct out of a
+        // wrapped line is a command nobody runs. `eventLine` indents the rest.
+        detail:
+          `${shortId(e.crewId)} in ${e.cwd}${e.sessionId ? dim(` · session ${shortId(e.sessionId)}`) : ''}` +
+          (e.attachCommand !== undefined ? `\n${dim('watch it:')} ${e.attachCommand}` : ''),
       };
     case 'crew.text':
       return { label: blue('crew'), detail: e.text };

@@ -56,9 +56,22 @@ const ALL_CAPABILITIES: AdapterCapabilities = {
  * `events()` yields until it hands out an `exit`, exactly like a real turn, and
  * a later call resumes over whatever is still queued — which is what makes the
  * steer-the-same-session rework path testable.
+ *
+ * IT REFUSES A SECOND CONCURRENT CONSUMER, because both real adapters do and a
+ * fake that did not would hide the difference. That is not hypothetical: the
+ * orchestrator calls `events()` once per TURN, so a rework steer opens a second
+ * stream — legal — while two overlapping pumps would race one transcript and
+ * bill it twice — not legal, and caught here rather than in production.
  */
 class FakeSession implements Session {
   readonly sent: string[] = [];
+
+  /**
+   * What `blue ps` prints. Shaped like the tmux backend's, since that is what
+   * mints it. Undefined models a headless harness, which is a real difference
+   * rather than a missing value.
+   */
+  readonly attachCommand: string | undefined;
 
   closed = false;
 
@@ -68,7 +81,14 @@ class FakeSession implements Session {
 
   #wake: (() => void) | undefined;
 
-  constructor(readonly id: string) {}
+  #streaming = false;
+
+  constructor(
+    readonly id: string,
+    attachable = true,
+  ) {
+    this.attachCommand = attachable ? `tmux attach -t bluespace:=blue-${id}` : undefined;
+  }
 
   push(...events: AdapterEvent[]): void {
     this.#queue.push(...events);
@@ -91,21 +111,29 @@ class FakeSession implements Session {
   }
 
   events(): AsyncIterable<AdapterEvent> {
+    if (this.#streaming) {
+      throw new Error(`session "${this.id}" event stream is already being consumed`);
+    }
+    this.#streaming = true;
     return this.#drain();
   }
 
   async *#drain(): AsyncGenerator<AdapterEvent> {
-    for (;;) {
-      while (this.#queue.length > 0) {
-        const next = this.#queue.shift();
-        if (!next) break;
-        yield next;
-        if (next.type === 'exit') return;
+    try {
+      for (;;) {
+        while (this.#queue.length > 0) {
+          const next = this.#queue.shift();
+          if (!next) break;
+          yield next;
+          if (next.type === 'exit') return;
+        }
+        if (this.closed) return;
+        await new Promise<void>((resolve) => {
+          this.#wake = resolve;
+        });
       }
-      if (this.closed) return;
-      await new Promise<void>((resolve) => {
-        this.#wake = resolve;
-      });
+    } finally {
+      this.#streaming = false;
     }
   }
 
@@ -133,8 +161,11 @@ class FakeAdapter implements HarnessAdapter {
 
   readonly spawns: Array<{ request: SpawnRequest; session: FakeSession }> = [];
 
+  /** Set to model an adapter whose runs are nowhere a human can attach. */
+  headless = false;
+
   async spawn(request: SpawnRequest): Promise<Session> {
-    const session = new FakeSession(`sess-${this.spawns.length + 1}`);
+    const session = new FakeSession(`sess-${this.spawns.length + 1}`, !this.headless);
     this.spawns.push({ request, session });
     return session;
   }
@@ -289,7 +320,9 @@ function harness(
     blackbox: bb,
     adapter,
     config: {
-      permissionMode: 'bypassPermissions',
+      // `auto` is the default posture now: it edits and runs commands unattended
+      // with no dialog and no machine-wide config write. See types/domain.ts.
+      permissionMode: 'auto',
       maxBudgetUsdPerTask: 25,
       maxConcurrentCrew: 4,
       maxRework: 2,
@@ -458,7 +491,7 @@ describe('dispatch', () => {
   });
 
   it('lets a project override the global permission mode', async () => {
-    const h = harness({ permissionMode: 'bypassPermissions' }, { permissionMode: 'plan' });
+    const h = harness({ permissionMode: 'auto' }, { permissionMode: 'plan' });
     newTask(h);
     await h.orch.tick();
 
@@ -467,6 +500,41 @@ describe('dispatch', () => {
     expect(spawn!.request.profile.permissionMode).toBe('plan');
     expect(spawn!.request.cwd).toBe(h.worktrees.created[0]!.path);
     expect(spawn!.request.profile.maxBudgetUsd).toBe(25);
+  });
+
+  it('records where to attach to the Crew it just started', async () => {
+    const h = harness();
+    const task = newTask(h);
+
+    await h.orch.tick();
+
+    const spawned = h.bb
+      .read()
+      .find((e: BlueEvent) => e.type === 'crew.spawned' && e.taskId === task.id);
+    expect(spawned?.type).toBe('crew.spawned');
+    // A live Session cannot be projected, so if the attach command is not
+    // written down at spawn, `blue ps` — a different process — can never learn
+    // it, and the captain has no way to take over a worker that is stuck.
+    if (spawned?.type === 'crew.spawned') {
+      expect(spawned.attachCommand).toBe(h.adapter.crewFor(task.id).attachCommand);
+      expect(spawned.sessionId).toBe(h.adapter.crewFor(task.id).id);
+    }
+  });
+
+  it('leaves the attach command undefined for a headless harness', async () => {
+    const h = harness();
+    // An adapter whose workers are not somewhere a human can reach reports no
+    // attach command; recording an empty string would put an unrunnable line in
+    // front of the captain.
+    h.adapter.headless = true;
+    const task = newTask(h);
+
+    await h.orch.tick();
+
+    const spawned = h.bb
+      .read()
+      .find((e: BlueEvent) => e.type === 'crew.spawned' && e.taskId === task.id);
+    if (spawned?.type === 'crew.spawned') expect(spawned.attachCommand).toBeUndefined();
   });
 
   it('fails the task instead of the engine when a worktree cannot be cut', async () => {
