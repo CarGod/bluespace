@@ -146,22 +146,29 @@ function userMessage(text: string): SDKUserMessage {
 // ---------------------------------------------------------------------------
 
 /**
- * BlueSpace's `PermissionMode` and the SDK's are near-identical; only `async`
- * has no direct counterpart. It means "nobody is watching", which is exactly
- * what the SDK's `auto` mode is for (a classifier decides instead of a human).
+ * BlueSpace's `PermissionMode` now mirrors the Claude Code CLI's flag values,
+ * which the SDK also accepts — with one exception: the SDK calls the
+ * prompt-on-anything posture `default`, and the CLI calls it `manual`.
+ *
+ * This function is scheduled for deletion along with the rest of this file; see
+ * docs/compliance.md for why BlueSpace is leaving the SDK. It is kept correct
+ * in the meantime because a half-migrated tree that does not compile hides the
+ * errors that matter under the ones that do not.
  */
 function toSdkPermissionMode(mode: PermissionMode): ClaudePermissionMode {
   switch (mode) {
-    case 'default':
+    case 'manual':
       return 'default';
+    case 'auto':
+      return 'auto';
+    case 'acceptEdits':
+      return 'acceptEdits';
     case 'dontAsk':
       return 'dontAsk';
     case 'plan':
       return 'plan';
     case 'bypassPermissions':
       return 'bypassPermissions';
-    case 'async':
-      return 'auto';
   }
 }
 

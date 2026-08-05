@@ -34,12 +34,34 @@ import { DEFAULT_PERMISSION_MODE } from '../types/domain.js';
 // ---------------------------------------------------------------------------
 
 export const PERMISSION_MODES: readonly PermissionMode[] = [
-  'default',
-  'dontAsk',
+  'auto',
+  'acceptEdits',
   'plan',
+  'manual',
+  'dontAsk',
   'bypassPermissions',
-  'async',
 ] as const;
+
+/**
+ * Modes that used to be legal, and what they become.
+ *
+ * BlueSpace's permission vocabulary was invented against a vendor SDK. It now
+ * mirrors `claude --permission-mode`, and two of the old names have no harness
+ * equivalent — they were never going to survive contact with the real flag.
+ * A config on disk outlives a refactor, so these are migrated with a sentence
+ * saying what happened rather than rejected with "expected one of …", which
+ * tells a captain nothing about why the value they set last month is gone.
+ */
+const RETIRED_PERMISSION_MODES: Readonly<Record<string, { to: PermissionMode; why: string }>> = {
+  // The SDK's "prompt on anything sensitive" posture. `manual` is that.
+  default: { to: 'manual', why: 'renamed — the harness calls this "manual"' },
+  // Never existed outside BlueSpace: a classifier deciding in place of a human
+  // is not something `claude --permission-mode` offers.
+  async: {
+    to: 'auto',
+    why: 'removed — no harness equivalent; "auto" is the unattended posture now',
+  },
+};
 
 export const EFFORT_LEVELS: readonly Effort[] = [
   'low',
@@ -257,8 +279,19 @@ export function mergeConfig(base: BlueConfig, patch: Record<string, unknown>): B
   const out: BlueConfig = { ...base };
 
   if (patch.permissionMode !== undefined) {
-    const got = pickEnum<PermissionMode>(patch.permissionMode, PERMISSION_MODES, 'permissionMode');
-    if (got.ok) out.permissionMode = got.value;
+    const retired =
+      typeof patch.permissionMode === 'string'
+        ? RETIRED_PERMISSION_MODES[patch.permissionMode]
+        : undefined;
+    if (retired !== undefined) {
+      warn(
+        `permissionMode ${JSON.stringify(patch.permissionMode)} is ${retired.why}; using ${JSON.stringify(retired.to)}`,
+      );
+      out.permissionMode = retired.to;
+    } else {
+      const got = pickEnum<PermissionMode>(patch.permissionMode, PERMISSION_MODES, 'permissionMode');
+      if (got.ok) out.permissionMode = got.value;
+    }
   }
 
   if ('effort' in patch) {

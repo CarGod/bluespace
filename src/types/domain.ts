@@ -100,20 +100,44 @@ export type Effort = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 /**
  * Permission posture for a spawned Crew.
  *
- * BlueSpace defaults to `bypassPermissions` (fully autonomous — the point of
- * the tool), and the captain can dial it back per project or globally in
- * config. `bypassPermissions` additionally requires
- * `allowDangerouslySkipPermissions: true` on the SDK call; the adapter sets
- * that automatically and it is NOT a separate knob.
+ * These are exactly the modes `claude --permission-mode` accepts. That is not a
+ * coincidence and not a convenience: BlueSpace launches real Claude Code
+ * sessions, so inventing a vocabulary here would only create values that have
+ * to be mapped onto the real ones, and a mapping is a place for a mode to
+ * quietly become a different mode. If the harness gains a mode, add it here; if
+ * it loses one, this list is what fails the build.
+ *
+ * The two that look right and are not:
+ *
+ *   `dontAsk` reads like "proceed without prompting". It does the opposite —
+ *   it DENIES Edit and Write outright. A Crew launched with it reads the repo,
+ *   attempts the change, is refused, and writes an explanation addressed to a
+ *   human who is not there. Verified on 2.1.222; see tests/compliance-smoke.
+ *
+ *   `bypassPermissions` works, but puts a modal warning in front of the first
+ *   run that only a human can dismiss — and dismissing it writes a permanent,
+ *   machine-wide `bypassPermissionsModeAccepted` into the captain's global
+ *   config. An unattended fleet cannot answer it, and it should not be the
+ *   price of trying the tool.
+ *
+ * `auto` is the default because it is the one posture that edits files, runs
+ * commands, needs no dialog, and leaves no global state behind.
  */
 export type PermissionMode =
-  | 'default'
-  | 'dontAsk'
+  /** Edits and commands proceed unattended, no dialog, no global state. */
+  | 'auto'
+  /** File edits auto-approved; other tools still prompt. Attended runs only. */
+  | 'acceptEdits'
+  /** Plans and reports, changes nothing. Useful for a dry run on a new repo. */
   | 'plan'
-  | 'bypassPermissions'
-  | 'async';
+  /** Prompts on anything sensitive. Only meaningful with a human attached. */
+  | 'manual'
+  /** Refuses writes. Present because the harness has it — see the note above. */
+  | 'dontAsk'
+  /** Fully unrestricted. Costs a one-time modal and a global config write. */
+  | 'bypassPermissions';
 
-export const DEFAULT_PERMISSION_MODE: PermissionMode = 'bypassPermissions';
+export const DEFAULT_PERMISSION_MODE: PermissionMode = 'auto';
 
 export interface DispatchProfile {
   model?: string;

@@ -21,7 +21,13 @@ import { fileURLToPath } from 'node:url';
 import { assertClaudeCliAvailable, createClaudeAdapter } from '../adapters/claude.js';
 import { requireCapability, type HarnessAdapter } from '../adapters/types.js';
 import { Blackbox, projectCrewLog } from '../blackbox/index.js';
-import { ProjectRegistry, configPath, loadConfig, saveConfig } from '../config/index.js';
+import {
+  PERMISSION_MODES,
+  ProjectRegistry,
+  configPath,
+  loadConfig,
+  saveConfig,
+} from '../config/index.js';
 import type { BlueConfig } from '../config/index.js';
 import { Orchestrator } from '../orchestrator/index.js';
 import { WorktreeManager } from '../worktree/index.js';
@@ -661,13 +667,9 @@ function cmdProjects(b: Boot, rest: string[], flags: Flags): number {
 // blue config
 // ---------------------------------------------------------------------------
 
-const PERMISSION_MODES: readonly PermissionMode[] = [
-  'default',
-  'dontAsk',
-  'plan',
-  'bypassPermissions',
-  'async',
-];
+// Imported, not redeclared. Two copies of an enum drift, and the one that
+// drifts is always the one nobody is looking at — here that would mean
+// `blue config set` accepting a mode the loader then rejects.
 const EFFORTS: readonly Effort[] = ['low', 'medium', 'high', 'xhigh', 'max'];
 
 function printConfig(config: BlueConfig): void {

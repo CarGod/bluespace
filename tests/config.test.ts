@@ -67,7 +67,7 @@ describe('defaults', () => {
 
   it('defaults to autonomous crews with a bounded budget', () => {
     expect(defaultConfig()).toEqual({
-      permissionMode: 'bypassPermissions',
+      permissionMode: 'auto',
       effort: 'high',
       maxBudgetUsdPerTask: 5,
       maxConcurrentCrew: 4,
@@ -110,7 +110,7 @@ describe('corrupt config tolerance', () => {
     writeConfig(JSON.stringify({ maxRework: 7, futureKnob: { deep: true } }));
     const cfg = loadConfig();
     expect(cfg.maxRework).toBe(7);
-    expect(cfg.permissionMode).toBe('bypassPermissions');
+    expect(cfg.permissionMode).toBe('auto');
   });
 });
 
@@ -178,20 +178,43 @@ describe('invalid values are dropped, not fatal', () => {
       }),
     );
     const cfg = loadConfig();
-    expect(cfg.permissionMode).toBe('bypassPermissions');
+    expect(cfg.permissionMode).toBe('auto');
     expect(cfg.effort).toBe('high');
     expect(cfg.maxRework).toBe(6);
     expect(warnSpy).toHaveBeenCalledTimes(2);
   });
 
   it('accepts every legal permissionMode and effort level', () => {
-    for (const mode of ['default', 'dontAsk', 'plan', 'bypassPermissions', 'async'] as const) {
+    for (const mode of [
+      'auto',
+      'acceptEdits',
+      'plan',
+      'manual',
+      'dontAsk',
+      'bypassPermissions',
+    ] as const) {
       expect(saveConfig({ permissionMode: mode }).permissionMode).toBe(mode);
     }
     for (const effort of ['low', 'medium', 'high', 'xhigh', 'max'] as const) {
       expect(saveConfig({ effort }).effort).toBe(effort);
     }
     expect(warnSpy).not.toHaveBeenCalled();
+  });
+
+  it('migrates a retired permissionMode instead of silently dropping it', () => {
+    // A config file outlives a refactor. `default` and `async` were legal when
+    // BlueSpace ran on a vendor SDK and have no `claude --permission-mode`
+    // counterpart; a captain who set one months ago should be told what
+    // happened to it, not quietly handed the default.
+    writeConfig(JSON.stringify({ permissionMode: 'default' }));
+    expect(loadConfig().permissionMode).toBe('manual');
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    expect(String(warnSpy.mock.calls[0]?.[0])).toContain('renamed');
+
+    warnSpy.mockClear();
+    writeConfig(JSON.stringify({ permissionMode: 'async' }));
+    expect(loadConfig().permissionMode).toBe('auto');
+    expect(String(warnSpy.mock.calls[0]?.[0])).toContain('no harness equivalent');
   });
 
   it('drops out-of-range and non-numeric numbers', () => {
