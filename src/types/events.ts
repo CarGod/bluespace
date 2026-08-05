@@ -69,7 +69,12 @@ export interface TaskStateChanged {
 export interface TaskCompleted {
   type: 'task.completed';
   taskId: TaskId;
-  /** Branch name for a mission, report path for a recon. Never a PR url — nothing here opens one. */
+  /**
+   * Branch name for a mission; for a recon, the path of the report ARCHIVED out
+   * of the worktree (`<dataDir>/reports/<taskId>.md`), which is why it outlives
+   * reclamation. Absent when a recon wrote no report — `summary` says so.
+   * Never a PR url — nothing here opens one.
+   */
   artifact?: string;
   summary: string;
 }

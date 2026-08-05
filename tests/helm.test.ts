@@ -267,6 +267,33 @@ describe('helmTools — reads', () => {
     expect(many.tasks[0].brief).toBeUndefined();
   });
 
+  /**
+   * `worktree` is a directory `blue gc` is allowed to delete; a recon's report
+   * is archived out to `<dataDir>/reports/<taskId>.md` precisely so one copy
+   * survives that. Helm reads a single task through this tool and nothing else,
+   * so if the archived path does not come through here, the surviving copy is
+   * one Helm cannot name.
+   */
+  it('get_task points at the archived artifact, not just the reclaimable worktree', async () => {
+    const { tools } = wire({
+      tasks: [
+        makeTask({
+          id: 'task-recon',
+          kind: 'recon',
+          state: 'landed',
+          worktree: '/home/cap/.bluespace/worktrees/repo-task-recon',
+          artifact: '/home/cap/.bluespace/reports/task-recon.md',
+          summary: 'Recon complete. The report is archived at /home/cap/.bluespace/reports/task-recon.md.',
+        }),
+      ],
+    });
+
+    const one = await callJson(tools.get('get_task')!, { taskId: 'task-recon' });
+    expect(one.artifact).toBe('/home/cap/.bluespace/reports/task-recon.md');
+    expect(one.outcome).toContain('archived at');
+    expect(one.worktree).toBe('/home/cap/.bluespace/worktrees/repo-task-recon');
+  });
+
   it('open_decisions hands back the question, the options and the context', async () => {
     const { tools } = wire();
     const result = await callJson(tools.get('open_decisions')!);

@@ -129,6 +129,11 @@ export function projectTasks(events: BlueEvent[]): Map<TaskId, Task> {
       case 'task.completed': {
         const task = touch(e.taskId, e.at);
         if (!task) break;
+        // The deliverable, kept on the task. For a recon this is the report
+        // archived OUT of the worktree, which is the only pointer that stays
+        // valid after `blue gc` reclaims the directory.
+        task.artifact = e.artifact;
+        task.summary = e.summary;
         transition(task, 'landed');
         break;
       }

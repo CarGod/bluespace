@@ -9,9 +9,18 @@
  *
  * The fake sessions are queue-driven rather than timer-driven, so every test is
  * deterministic: push the events a Crew would emit, then await quiescence.
+ *
+ * The one collaborator that is NOT faked away is the filesystem. Worktree paths
+ * and `dataDir` are real temp directories, because archiving a recon's report
+ * out of a worktree is a real file copy — asserting it against a stub would
+ * assert nothing about the data-loss bug it exists to close.
  */
 
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { mkdtempSync, rmSync, promises as fsp } from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
+
+import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import type {
   AdapterCapabilities,
@@ -191,8 +200,16 @@ class FakeAdapter implements HarnessAdapter {
 // A stubbed worktree manager
 // ---------------------------------------------------------------------------
 
+/** One temp tree for the whole file: worktrees on the left, `dataDir` on the right. */
+const TMP_ROOT = mkdtempSync(path.join(os.tmpdir(), 'bluespace-orch-'));
+const DATA_DIR = path.join(TMP_ROOT, 'data');
+
+afterAll(() => {
+  rmSync(TMP_ROOT, { recursive: true, force: true });
+});
+
 function worktreePath(taskId: string): string {
-  return `/tmp/bluespace-wt/${taskId}`;
+  return path.join(TMP_ROOT, 'worktrees', taskId);
 }
 
 class FakeWorktrees {
@@ -211,12 +228,16 @@ class FakeWorktrees {
       repoPath: this.repoPath,
       taskId,
     };
+    // A real directory, because a Crew writes into one and reclamation deletes
+    // one; a path that never existed would let a broken archive step pass.
+    await fsp.mkdir(worktree.path, { recursive: true });
     this.created.push(worktree);
     return worktree;
   }
 
   async remove(worktree: Worktree, opts?: { force?: boolean }): Promise<void> {
     this.removed.push({ worktree, force: opts?.force ?? false });
+    await fsp.rm(worktree.path, { recursive: true, force: true });
   }
 
   async list(): Promise<Worktree[]> {
@@ -326,7 +347,7 @@ function harness(
       maxBudgetUsdPerTask: 25,
       maxConcurrentCrew: 4,
       maxRework: 2,
-      dataDir: '/tmp/bluespace-test',
+      dataDir: DATA_DIR,
       ...config,
     },
     registry: fakeRegistry([merged]),
@@ -361,6 +382,27 @@ function stateOf(h: Harness, id: string): TaskState {
   const task = h.orch.task(id);
   if (!task) throw new Error(`task ${id} vanished`);
   return task.state;
+}
+
+/** What `task.completed` recorded as the deliverable, if the task got that far. */
+function completionOf(
+  h: Harness,
+  id: string,
+): { artifact?: string; summary: string } | undefined {
+  const event = h.bb
+    .read()
+    .find((e: BlueEvent) => e.type === 'task.completed' && e.taskId === id);
+  return event !== undefined && event.type === 'task.completed'
+    ? { artifact: event.artifact, summary: event.summary }
+    : undefined;
+}
+
+function artifactOf(h: Harness, id: string): string | undefined {
+  return completionOf(h, id)?.artifact;
+}
+
+function summaryOf(h: Harness, id: string): string {
+  return completionOf(h, id)?.summary ?? '';
 }
 
 /** The recorded state path, which is the audit trail the whole design promises. */
@@ -594,23 +636,46 @@ describe('a mission that works', () => {
     expect(crew.closed).toBe(true);
   });
 
-  it('skips verification for recon and lands the report', async () => {
+  /**
+   * The recon report used to be recorded as a path INSIDE the worktree, which
+   * made it both unreclaimable (untracked, so the worktree is dirty forever) and
+   * destroyable (anything that forced the worktree away took the only copy).
+   * Archiving it out is what makes reclaiming a recon worktree safe at all.
+   */
+  it('archives a recon report out of the worktree before teardown', async () => {
     const h = harness();
     const task = newTask(h, { kind: 'recon', title: 'Why is startup slow?' });
 
     await h.orch.tick();
+    const report = '# Why startup is slow\n\nThe registry is read twice.\n';
+    await fsp.writeFile(path.join(worktreePath(task.id), 'REPORT.md'), report);
     h.adapter.crewFor(task.id).turn({ text: 'Wrote REPORT.md' });
     await h.orch.whenIdle();
 
     expect(stateOf(h, task.id)).toBe('landed');
     expect(h.sentinelRuns).toHaveLength(0);
 
-    const completed = h.bb
-      .read()
-      .find((e: BlueEvent) => e.type === 'task.completed' && e.taskId === task.id);
-    expect(completed && completed.type === 'task.completed' ? completed.artifact : '').toBe(
-      `${worktreePath(task.id)}/REPORT.md`,
-    );
+    const archived = path.join(DATA_DIR, 'reports', `${task.id}.md`);
+    expect(artifactOf(h, task.id)).toBe(archived);
+    expect(await fsp.readFile(archived, 'utf8')).toBe(report);
+
+    // And it survives reclamation: the whole point of copying it out.
+    await h.worktrees.remove(h.worktrees.created[0]!, { force: true });
+    expect(await fsp.readFile(archived, 'utf8')).toBe(report);
+  });
+
+  it('lands a recon that wrote no report, and says so instead of failing', async () => {
+    const h = harness();
+    const task = newTask(h, { kind: 'recon', title: 'Anything to find here?' });
+
+    await h.orch.tick();
+    h.adapter.crewFor(task.id).turn({ text: 'Nothing to report.' });
+    await h.orch.whenIdle();
+
+    expect(stateOf(h, task.id)).toBe('landed');
+    expect(artifactOf(h, task.id)).toBeUndefined();
+    expect(summaryOf(h, task.id)).toContain('without writing a report');
+    expect(h.errors).toEqual([]);
   });
 
   it('fails a task whose Crew exits badly', async () => {
@@ -793,7 +858,7 @@ describe('rework', () => {
     const elsewhere = new Orchestrator({
       blackbox: h.bb,
       adapter: h.adapter,
-      config: { permissionMode: 'auto', maxBudgetUsdPerTask: 25, maxConcurrentCrew: 4, maxRework: 2, dataDir: '/tmp/bluespace-test' },
+      config: { permissionMode: 'auto', maxBudgetUsdPerTask: 25, maxConcurrentCrew: 4, maxRework: 2, dataDir: DATA_DIR },
       registry: fakeRegistry([h.project]),
       worktreeFor: () => h.worktrees as unknown as WorktreeManager,
     });
@@ -924,6 +989,38 @@ describe('cancelTask', () => {
     await h.orch.cancelTask(task.id);
     expect(stateOf(h, task.id)).toBe('cancelled');
     expect(h.adapter.spawns).toHaveLength(0);
+  });
+
+  /**
+   * Cancellation is the only place that deletes a worktree without asking, so
+   * it is the only place that can destroy a recon's report. Archiving on the
+   * landed path alone left exactly this hole: a recon that wrote its report and
+   * was then cancelled lost it, with nothing recorded anywhere.
+   */
+  it('rescues a recon report before destroying its worktree', async () => {
+    const h = harness();
+    const task = newTask(h, { kind: 'recon', title: 'What is in here?' });
+
+    await h.orch.tick();
+    const report = '# Findings\n\nThe cache is never invalidated.\n';
+    await fsp.writeFile(path.join(worktreePath(task.id), 'REPORT.md'), report);
+
+    await h.orch.cancelTask(task.id);
+
+    expect(stateOf(h, task.id)).toBe('cancelled');
+    expect(h.worktrees.removed).toHaveLength(1);
+    expect(await fsp.readFile(path.join(DATA_DIR, 'reports', `${task.id}.md`), 'utf8')).toBe(report);
+  });
+
+  it('cancels a recon that wrote nothing without complaining about it', async () => {
+    const h = harness();
+    const task = newTask(h, { kind: 'recon', title: 'Nothing here' });
+
+    await h.orch.tick();
+    await h.orch.cancelTask(task.id);
+
+    expect(stateOf(h, task.id)).toBe('cancelled');
+    expect(h.errors).toEqual([]);
   });
 });
 

@@ -168,6 +168,11 @@ function taskView(t: Task, projectName?: string): Record<string, unknown> {
     reworkCount: t.reworkCount,
     crewId: t.crewId,
     worktree: t.worktree,
+    // The deliverable, and the only path here that survives `blue gc`:
+    // `worktree` is a directory the captain may reclaim, while a recon's
+    // `artifact` is the report archived out of it.
+    artifact: t.artifact,
+    outcome: t.summary,
     createdAt: iso(t.createdAt),
     updatedAt: iso(t.updatedAt),
   };
@@ -326,8 +331,9 @@ export function helmTools(orch: Orchestrator, registry: ProjectRegistry): ToolDe
   const getTask: ToolDef = {
     name: 'get_task',
     description: [
-      'Fetch one task in full: its current state, brief, accumulated cost, rework count, worktree and dependencies.',
+      'Fetch one task in full: its current state, brief, accumulated cost, rework count, worktree, dependencies, and once it has landed, its artifact and outcome.',
       'Call this when the captain asks about a specific piece of work, and before saying that any single task is finished — the state here is the only thing that entitles you to say so.',
+      "artifact is the deliverable: the branch name for a mission, and for a recon the path of the report, which was archived out of the worktree and is what you should read. Prefer it over worktree, which is a directory `blue gc` may have reclaimed. A landed recon with no artifact wrote no report — say that rather than guessing.",
     ].join(' '),
     inputSchema: object({ taskId: str('Task id returned by create_task or list_tasks.') }, [
       'taskId',

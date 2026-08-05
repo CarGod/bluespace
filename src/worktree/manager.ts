@@ -38,6 +38,15 @@ const BRANCH_PREFIX = 'blue/';
 /** The well-known empty tree object, used as a diff base when there is no merge base. */
 const EMPTY_TREE = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
 
+/**
+ * What `countUnlanded` reports when git could not answer.
+ *
+ * Any non-zero value refuses the removal and keeps the branch, which is the
+ * whole point; 1 is chosen so the captain reads "1 commit not in main" rather
+ * than a number the repository cannot justify.
+ */
+const UNKNOWN_IS_UNLANDED = 1;
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -117,13 +126,13 @@ export class UnlandedCommitsError extends Error {
 // git plumbing
 // ---------------------------------------------------------------------------
 
-interface GitResult {
+export interface GitResult {
   stdout: string;
   stderr: string;
   exitCode: number;
 }
 
-interface GitOpts {
+export interface GitOpts {
   /** Return the failure instead of throwing. Use when non-zero is a real answer. */
   allowFailure?: boolean;
   /** Extra environment for this invocation (e.g. GIT_INDEX_FILE). */
@@ -137,8 +146,12 @@ function isExecError(e: unknown): e is { code?: number; stdout?: string; stderr?
 /**
  * Run git with an argv array. Never a shell string — user-controlled values
  * (task ids, paths, branch names) are arguments, and can never be commands.
+ *
+ * Exported for `reclaim.ts`, which has to interrogate directories this manager
+ * does not own. It is module-internal plumbing, not public API: `index.ts` does
+ * not re-export it, and nothing outside `src/worktree/` may shell out to git.
  */
-async function git(args: string[], cwd: string, opts: GitOpts = {}): Promise<GitResult> {
+export async function git(args: string[], cwd: string, opts: GitOpts = {}): Promise<GitResult> {
   try {
     const { stdout, stderr } = await execFileAsync('git', args, {
       cwd,
@@ -340,11 +353,41 @@ export class WorktreeManager {
   }
 
   /**
-   * The branch new worktrees are cut from. origin/HEAD wins, then main, then
-   * master. A local branch is preferred over its remote-tracking counterpart so
-   * the Crew branches from what the captain actually has checked out.
+   * The branch new worktrees are cut from, as a SHORT name (`main`,
+   * `origin/main`) — what `git worktree add` takes and what a human reads.
+   *
+   * origin/HEAD wins, then main, then master. A local branch is preferred over
+   * its remote-tracking counterpart so the Crew branches from what the captain
+   * actually has checked out.
+   *
+   * Anything that decides whether work may be DELETED must use
+   * `defaultBranchRef()` instead. See the warning there.
    */
   async defaultBranch(): Promise<string> {
+    return (await this.resolveDefaultBranch()).name;
+  }
+
+  /**
+   * The same branch, fully qualified (`refs/heads/main`, `refs/remotes/origin/main`).
+   *
+   * A short name is AMBIGUOUS, and the ambiguity is silent and destructive. Git
+   * resolves a bare `main` in this order: refs/main, refs/tags/main,
+   * refs/heads/main, refs/remotes/main, refs/remotes/main/HEAD — so a repository
+   * that also has a TAG called `main` (git permits it) answers
+   * `rev-list --count main..blue/x` against the tag. It warns on stderr, which
+   * nothing here reads, and exits 0. A branch holding two unmerged commits then
+   * measures as fully merged, and the safe sweep deletes the worktree AND
+   * `git branch -D`s the only ref that reached those commits.
+   *
+   * That is the one bug this whole module exists to make impossible, so every
+   * reachability question asks for the qualified ref and every range is computed
+   * from resolved object ids.
+   */
+  async defaultBranchRef(): Promise<string> {
+    return (await this.resolveDefaultBranch()).ref;
+  }
+
+  private async resolveDefaultBranch(): Promise<{ name: string; ref: string }> {
     const repoRoot = await this.repoRoot();
 
     const candidates: string[] = [];
@@ -363,8 +406,10 @@ export class WorktreeManager {
     }
 
     for (const name of candidates) {
-      if (await this.revExists(repoRoot, `refs/heads/${name}`)) return name;
-      if (await this.revExists(repoRoot, `refs/remotes/origin/${name}`)) return `origin/${name}`;
+      const local = `refs/heads/${name}`;
+      if (await this.revExists(repoRoot, local)) return { name, ref: local };
+      const remote = `refs/remotes/origin/${name}`;
+      if (await this.revExists(repoRoot, remote)) return { name: `origin/${name}`, ref: remote };
     }
 
     throw new Error(
@@ -374,10 +419,17 @@ export class WorktreeManager {
   }
 
   private async revExists(cwd: string, ref: string): Promise<boolean> {
+    return (await this.resolveCommit(cwd, ref)) !== undefined;
+  }
+
+  /** The object id `ref` names, or undefined when it names no commit. */
+  private async resolveCommit(cwd: string, ref: string): Promise<string | undefined> {
     const res = await git(['rev-parse', '--verify', '--quiet', `${ref}^{commit}`], cwd, {
       allowFailure: true,
     });
-    return res.exitCode === 0 && res.stdout.trim().length > 0;
+    if (res.exitCode !== 0) return undefined;
+    const oid = res.stdout.trim();
+    return oid.length > 0 ? oid : undefined;
   }
 
   /**
@@ -449,7 +501,10 @@ export class WorktreeManager {
    * The temporary index means the Crew's real index is never mutated.
    */
   async diff(wt: Worktree): Promise<string> {
-    const base = await this.defaultBranch();
+    // Qualified, for the same reason the reclamation checks are: a tag that
+    // shadows the branch name would silently move the merge base, and the
+    // Sentinel would grade a diff against the wrong thing.
+    const base = await this.defaultBranchRef();
 
     const mbRes = await git(['merge-base', base, 'HEAD'], wt.path, { allowFailure: true });
     const mergeBase = mbRes.exitCode === 0 && mbRes.stdout.trim() ? mbRes.stdout.trim() : EMPTY_TREE;
@@ -474,7 +529,18 @@ export class WorktreeManager {
     }
   }
 
-  /** Any staged, unstaged, or untracked change in the worktree. */
+  /**
+   * Any staged, unstaged, or untracked change in the worktree.
+   *
+   * NOT ignored files. `git status --porcelain` omits everything `.gitignore`
+   * covers, and `git worktree remove` deletes them without complaint, so a
+   * merged worktree is removed with its `.env`, its `dist/` and its
+   * `node_modules/` — silently, reported as "merged". That is deliberate rather
+   * than overlooked: counting ignored files as work would make every worktree in
+   * a JavaScript or Python repository permanently unreclaimable, which is a
+   * worse failure than the one it prevents. It is the one thing the safe rule
+   * does not cover, and the README says so.
+   */
   async hasUncommittedChanges(wt: Worktree): Promise<boolean> {
     if (!(await pathExists(wt.path))) return false;
     const res = await git(['status', '--porcelain'], wt.path);
@@ -487,30 +553,60 @@ export class WorktreeManager {
    * deleting the branch. Fail closed: true if EITHER ref has unlanded commits.
    */
   async hasUnlandedCommits(wt: Worktree): Promise<boolean> {
-    const repoRoot = await this.repoRoot();
-    const base = await this.defaultBranch();
+    return (await this.unlandedCommitCount(wt)) > 0;
+  }
 
-    if (await this.countUnlanded(repoRoot, base, `refs/heads/${wt.branch}`)) return true;
+  /**
+   * HOW MANY commits would be stranded by deleting this branch.
+   *
+   * The same question `hasUnlandedCommits` answers, with the number kept — a
+   * sweep that refuses to reclaim a worktree has to be able to tell the captain
+   * "3 commits not in main", not merely "not yet". Fail closed: the larger of
+   * the branch's count and the detached HEAD's, since either can hold work.
+   */
+  async unlandedCommitCount(wt: Worktree): Promise<number> {
+    const repoRoot = await this.repoRoot();
+    const base = await this.defaultBranchRef();
+
+    let count = await this.countUnlanded(repoRoot, base, `refs/heads/${wt.branch}`);
 
     // A Crew may have committed on a detached HEAD, or checked out something else.
     if (await pathExists(wt.path)) {
       const head = await git(['rev-parse', 'HEAD'], wt.path, { allowFailure: true });
       const sha = head.stdout.trim();
-      if (head.exitCode === 0 && sha && (await this.countUnlanded(repoRoot, base, sha))) {
-        return true;
+      if (head.exitCode === 0 && sha) {
+        count = Math.max(count, await this.countUnlanded(repoRoot, base, sha));
       }
     }
-    return false;
+    return count;
   }
 
-  /** True when `ref` exists and holds commits not reachable from `base`. */
-  private async countUnlanded(repoRoot: string, base: string, ref: string): Promise<boolean> {
-    if (!(await this.revExists(repoRoot, ref))) return false;
-    const res = await git(['rev-list', '--count', `${base}..${ref}`, '--'], repoRoot, {
-      allowFailure: true,
-    });
-    if (res.exitCode !== 0) return false;
-    return Number.parseInt(res.stdout.trim(), 10) > 0;
+  /**
+   * Commits on `ref` that are not reachable from `baseRef`; 0 when `ref` is gone.
+   *
+   * `baseRef` must be fully qualified — see `defaultBranchRef()`. Both ends are
+   * resolved to object ids before the range is built, so nothing in the range
+   * expression can be re-interpreted as a tag, a remote, or a file name.
+   *
+   * Every failure answers "unlanded", never "landed": this number is the only
+   * thing standing between a Crew's commits and `git branch -D`, and a question
+   * we could not ask is not an answer of zero. The one exception is a `ref` that
+   * names no commit at all, which really is nothing to lose.
+   */
+  private async countUnlanded(repoRoot: string, baseRef: string, ref: string): Promise<number> {
+    const tip = await this.resolveCommit(repoRoot, ref);
+    if (tip === undefined) return 0;
+
+    const base = await this.resolveCommit(repoRoot, baseRef);
+    // No resolvable base means we cannot prove anything landed. Count the whole
+    // history of the ref rather than pretending it is merged.
+    const range = base === undefined ? tip : `${base}..${tip}`;
+
+    const res = await git(['rev-list', '--count', range, '--'], repoRoot, { allowFailure: true });
+    if (res.exitCode !== 0) return UNKNOWN_IS_UNLANDED;
+    const n = Number.parseInt(res.stdout.trim(), 10);
+    if (!Number.isFinite(n)) return UNKNOWN_IS_UNLANDED;
+    return n > 0 ? n : 0;
   }
 
   /**
@@ -522,7 +618,9 @@ export class WorktreeManager {
   async remove(wt: Worktree, opts?: { force?: boolean }): Promise<void> {
     const force = opts?.force === true;
     const repoRoot = await this.repoRoot();
-    const base = await this.defaultBranch();
+    // Two forms of the same branch: the qualified ref decides, the short name
+    // is what the refusal tells the captain.
+    const { name: base, ref: baseRef } = await this.resolveDefaultBranch();
 
     if (!force) {
       if (await this.hasUncommittedChanges(wt)) throw new DirtyWorktreeError(wt);
@@ -539,7 +637,10 @@ export class WorktreeManager {
 
     // Only reap the branch when nothing would be lost with it.
     const ref = `refs/heads/${wt.branch}`;
-    if ((await this.revExists(repoRoot, ref)) && !(await this.countUnlanded(repoRoot, base, ref))) {
+    if (
+      (await this.revExists(repoRoot, ref)) &&
+      (await this.countUnlanded(repoRoot, baseRef, ref)) === 0
+    ) {
       await git(['branch', '-D', wt.branch], repoRoot, { allowFailure: true });
     }
   }

@@ -325,6 +325,31 @@ export function formatUsd(usd: number): string {
 }
 
 // ---------------------------------------------------------------------------
+// Disk
+// ---------------------------------------------------------------------------
+
+const BYTE_UNITS = ['B', 'KB', 'MB', 'GB', 'TB'] as const;
+
+/**
+ * `0 B`, `812 B`, `4.2 MB`. Powers of 1024, one decimal above a kilobyte.
+ *
+ * Used by `blue gc` to make the size of `~/.bluespace/worktrees` legible at a
+ * glance — the number exists to answer "is this growing", so readable beats
+ * exact.
+ */
+export function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
+  let n = bytes;
+  let unit = 0;
+  while (n >= 1024 && unit < BYTE_UNITS.length - 1) {
+    n /= 1024;
+    unit += 1;
+  }
+  const label = BYTE_UNITS[unit] ?? 'B';
+  return unit === 0 ? `${Math.round(n)} ${label}` : `${n.toFixed(1)} ${label}`;
+}
+
+// ---------------------------------------------------------------------------
 // Task state vocabulary
 // ---------------------------------------------------------------------------
 

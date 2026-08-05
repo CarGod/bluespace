@@ -23,6 +23,8 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import { promises as fs } from 'node:fs';
+import * as path from 'node:path';
 
 import {
   requireCapability,
@@ -762,9 +764,13 @@ export class Orchestrator {
     // Recon produces a report, not a diff. A diff-reading verifier has nothing
     // to read here, and running one anyway would reject every recon task.
     if (task.kind === 'recon') {
+      // The report is copied OUT of the worktree first, and the archived path is
+      // what gets recorded — see #archiveReport. Undefined artifact is a real
+      // answer here: a recon that wrote nothing still landed.
+      const archived = await this.#archiveReport(taskId, live.worktree.path);
       this.#complete(taskId, {
-        summary: 'Recon complete; the report is in the worktree.',
-        artifact: reportPath(live.worktree.path),
+        summary: archived.summary,
+        artifact: archived.artifact,
         reason: 'recon_reported',
       });
       await this.#teardown(taskId, { removeWorktree: false });
@@ -1147,6 +1153,64 @@ export class Orchestrator {
   }
 
   // -----------------------------------------------------------------------
+  // Recon reports
+  // -----------------------------------------------------------------------
+
+  /**
+   * Copy a recon's report OUT of the worktree, before anything can reclaim it.
+   *
+   * A recon's whole deliverable is `REPORT.md` inside a disposable directory,
+   * and that had two consequences, both bad. The report is usually untracked, so
+   * `git status --porcelain` never empties and the worktree can never satisfy
+   * the safe-reclaim rule — recon worktrees were precisely the ones that piled
+   * up. And anything that force-reclaimed one destroyed the only artifact the
+   * task produced. Archiving to `<dataDir>/reports/<taskId>.md` fixes both: the
+   * captain's copy lives outside the worktree, and the worktree is then holding
+   * nothing irreplaceable.
+   *
+   * Never throws. A recon that wrote nothing is a real (if disappointing)
+   * outcome, not a failed task — so what actually happened goes into the
+   * completion summary, which is in the Blackbox forever, rather than into an
+   * exception that would flip a finished task to `failed`.
+   */
+  async #archiveReport(
+    taskId: TaskId,
+    worktreePath: string,
+  ): Promise<{ summary: string; artifact?: string }> {
+    const source = reportPath(worktreePath);
+    const target = path.join(this.#deps.config.dataDir, 'reports', reportFileName(taskId));
+
+    try {
+      const body = await fs.readFile(source);
+      await fs.mkdir(path.dirname(target), { recursive: true });
+      await fs.writeFile(target, body);
+      return {
+        summary: `Recon complete. The report is archived at ${target}.`,
+        artifact: target,
+      };
+    } catch (err) {
+      if (isNotFound(err)) {
+        return {
+          summary:
+            `Recon finished without writing a report — nothing was found at ${source}. ` +
+            `Whatever the Crew learned is only in its transcript.`,
+        };
+      }
+      // Archiving failed for some other reason (permissions, a full disk). The
+      // in-worktree copy is then the only one there is, so point at it and say
+      // so; a captain who is told the report is archived when it is not will
+      // find that out at exactly the wrong moment.
+      this.#log(`archive report ${taskId}`, err);
+      return {
+        summary:
+          `Recon complete, but the report could not be archived (${errorText(err)}). ` +
+          `It is still in the worktree at ${source}, which nothing will reclaim while it is dirty.`,
+        artifact: source,
+      };
+    }
+  }
+
+  // -----------------------------------------------------------------------
   // Teardown
   // -----------------------------------------------------------------------
 
@@ -1155,8 +1219,21 @@ export class Orchestrator {
    * into a directory we are about to delete), then optionally the worktree.
    *
    * A landed task keeps its worktree — the branch it built is the deliverable,
-   * and deleting it would throw the work away at the exact moment it succeeded.
-   * Only cancellation forces removal.
+   * and deleting it at the moment it succeeded would throw the work away before
+   * the captain has taken delivery. Only cancellation forces removal here.
+   *
+   * That is not the same as "forever". Once the branch is merged, the worktree
+   * holds nothing that is not also in the repository, and `blue gc` reclaims it
+   * on exactly that test (`src/worktree/reclaim.ts`). Teardown does not run that
+   * sweep itself: at teardown the work has just landed and has definitionally
+   * not been merged yet, so a sweep here would always decline.
+   *
+   * The removal here is `force: true` and answers to nobody — it is the one
+   * place in the system that deletes a worktree without asking whether anything
+   * in it is the only copy. So it rescues a recon's report first: a recon
+   * cancelled after it wrote `REPORT.md` used to lose it outright, which is the
+   * same data loss `#archiveReport` was added to prevent, on the one path that
+   * actually deletes something.
    */
   async #teardown(taskId: TaskId, opts: { removeWorktree: boolean }): Promise<void> {
     const live = this.#live.get(taskId);
@@ -1176,6 +1253,13 @@ export class Orchestrator {
     }
 
     if (!opts.removeWorktree) return;
+
+    // Idempotent: a recon that already landed archived the same bytes to the
+    // same path, and re-copying them costs nothing next to losing them.
+    if (this.task(taskId)?.kind === 'recon') {
+      await this.#archiveReport(taskId, live.worktree.path);
+    }
+
     try {
       await live.worktrees.remove(live.worktree, { force: true });
     } catch (err) {
@@ -1219,6 +1303,21 @@ function stateChange(
 /** Where a recon Crew's brief tells it to write. Kept in step with buildBrief(). */
 function reportPath(worktreePath: string): string {
   return worktreePath.endsWith('/') ? `${worktreePath}REPORT.md` : `${worktreePath}/REPORT.md`;
+}
+
+/**
+ * A task id becomes a file name in the captain's data directory. Ids are minted
+ * by `createTask` as UUIDs and have already passed the worktree manager's much
+ * stricter rules to get this far — this is the second belt, not the first.
+ */
+function reportFileName(taskId: TaskId): string {
+  const safe = taskId.replace(/[^A-Za-z0-9._-]/g, '_').replace(/\.{2,}/g, '.');
+  return `${safe === '' ? 'unknown' : safe}.md`;
+}
+
+/** ENOENT, whatever wrapper it arrives in. A missing report is not an error. */
+function isNotFound(err: unknown): boolean {
+  return typeof err === 'object' && err !== null && (err as { code?: unknown }).code === 'ENOENT';
 }
 
 function byCreation(a: Task, b: Task): number {

@@ -274,6 +274,33 @@ describe('hasUnlandedCommits', () => {
     await git(['merge', '--no-ff', '-q', '-m', 'land', wt.branch], repoPath);
     expect(await mgr.hasUnlandedCommits(wt)).toBe(false);
   });
+
+  /**
+   * A tag may share a branch's name, and git resolves the bare name to the TAG
+   * first. Asked as `main..blue/x`, a branch two commits ahead of refs/heads/main
+   * measures as fully merged — git warns on stderr and exits 0 — and `remove()`
+   * then deletes the worktree and `git branch -D`s the only ref that reached
+   * those commits. The question has to be asked of refs/heads/main.
+   */
+  it('is not fooled by a TAG that shares the default branch name', async () => {
+    const wt = await mgr.create(taskId());
+    await fs.writeFile(path.join(wt.path, 'precious.txt'), 'the only copy\n');
+    await git(['add', '-A'], wt.path);
+    await git(['commit', '-qm', 'crew work'], wt.path);
+
+    // The tag points at the branch tip, so `main..blue/x` against it is empty.
+    const tip = (await git(['rev-parse', 'HEAD'], wt.path)).trim();
+    await git(['tag', 'main', tip], repoPath);
+
+    expect(await mgr.hasUnlandedCommits(wt)).toBe(true);
+    expect(await mgr.unlandedCommitCount(wt)).toBe(1);
+    await expect(mgr.remove(wt)).rejects.toThrow(UnlandedCommitsError);
+
+    // Untouched: directory, branch, and the commit itself.
+    expect(await fs.stat(wt.path)).toBeTruthy();
+    expect((await git(['branch', '--list', wt.branch], repoPath)).trim()).not.toBe('');
+    expect(await git(['show', `${wt.branch}:precious.txt`], repoPath)).toBe('the only copy\n');
+  });
 });
 
 describe('diff', () => {

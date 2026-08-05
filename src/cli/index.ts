@@ -50,6 +50,7 @@ import type {
 } from '../types/domain.js';
 import type { BlueEvent } from '../types/events.js';
 
+import { runGc } from './gc.js';
 import { decisionNudge, runInbox } from './inbox.js';
 import {
   bold,
@@ -209,6 +210,7 @@ function usage(): string {
     ['ps', 'what the fleet is doing, and how to watch a worker'],
     ['log <taskId>', "replay one task's events from the Blackbox"],
     ['map', 'start the Starmap server and print its URL'],
+    ['gc', 'reclaim the worktrees whose work is merged  [--dry-run] [--force]'],
     ['projects', 'list registered projects'],
     ['projects add <path>', 'register a repo  [--name X] [--desc Y] [--delivery pr|local]'],
     ['projects rm <id>', 'forget a project'],
@@ -243,6 +245,9 @@ function usage(): string {
   L.push(`      --list                  ${dim('(inbox) render only, do not prompt')}`);
   L.push(`      --port <n>              ${dim('(map) port to listen on')}`);
   L.push(`      --orchestrate           ${dim('(map) also run the dispatch loop')}`);
+  L.push(`  -n, --dry-run               ${dim('(gc) report what would be reclaimed, change nothing')}`);
+  L.push(`      --force                 ${dim('(gc) also take unmerged and dirty worktrees — asks first')}`);
+  L.push(`  -y, --yes                   ${dim('(gc) skip the --force confirmation')}`);
   L.push('');
   return L.join('\n');
 }
@@ -300,6 +305,10 @@ interface Boot {
   registry: ProjectRegistry;
   adapter: HarnessAdapter;
   orch: Orchestrator;
+  /** `<dataDir>/worktrees` — every project's worktrees are cut under it. */
+  worktreeRoot: string;
+  /** The same per-project managers the orchestrator dispatches with. */
+  worktreeFor(projectPath: string): WorktreeManager;
   close(): void;
 }
 
@@ -314,7 +323,7 @@ function boot(): Boot {
   // Worktrees live under the data directory, NOT the manager's tmpdir default: a
   // landed task keeps its worktree because the branch it built is the deliverable,
   // and the OS reaps its temp directory. Losing finished work to /tmp cleanup is
-  // not a tradeoff, it is a bug.
+  // not a tradeoff, it is a bug. `blue gc` reclaims from here on the merged test.
   const worktreeRoot = path.join(config.dataDir, 'worktrees');
   const worktrees = new Map<string, WorktreeManager>();
   const worktreeFor = (projectPath: string): WorktreeManager => {
@@ -335,6 +344,8 @@ function boot(): Boot {
     registry,
     adapter,
     orch,
+    worktreeRoot,
+    worktreeFor,
     close(): void {
       if (closed) return;
       closed = true;
@@ -943,6 +954,33 @@ async function cmdMap(b: Boot, flags: Flags): Promise<number> {
 }
 
 // ---------------------------------------------------------------------------
+// blue gc
+// ---------------------------------------------------------------------------
+
+/**
+ * Reclaim the worktrees whose tasks are over.
+ *
+ * Needs no Claude CLI and starts no fleet: it reads the task projection, asks
+ * git what is merged, and removes only what the answer allows. See `./gc.ts`
+ * for the reporting rules and `src/worktree/reclaim.ts` for the decision.
+ */
+async function cmdGc(b: Boot, flags: Flags): Promise<number> {
+  return await runGc(
+    {
+      tasks: () => b.orch.tasks(),
+      projects: () => b.registry.list(),
+      worktreeFor: (projectPath: string) => b.worktreeFor(projectPath),
+      worktreeRoot: b.worktreeRoot,
+    },
+    {
+      dryRun: flagBool(flags, 'dry-run', 'n'),
+      force: flagBool(flags, 'force'),
+      yes: flagBool(flags, 'yes', 'y'),
+    },
+  );
+}
+
+// ---------------------------------------------------------------------------
 // blue mcp
 // ---------------------------------------------------------------------------
 
@@ -1090,6 +1128,9 @@ async function main(argv: string[]): Promise<number> {
       case 'map':
       case 'starmap':
         return await cmdMap(b, flags);
+
+      case 'gc':
+        return await cmdGc(b, flags);
 
       case 'mcp':
         return await cmdMcp(b);

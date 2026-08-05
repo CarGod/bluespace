@@ -84,6 +84,19 @@ export interface Task {
   /** Set once dispatched. */
   crewId?: CrewId;
   worktree?: string;
+  /**
+   * What the task delivered, from `task.completed`: a branch name for a
+   * mission, the ARCHIVED report path for a recon.
+   *
+   * Carried on the task, not left in the event log, because `worktree` is a
+   * directory `blue gc` may reclaim and this is the copy that outlives it —
+   * anything answering "where is the deliverable" has to be able to read it
+   * without replaying the log. Absent until the task lands, and absent on a
+   * recon that wrote no report.
+   */
+  artifact?: string;
+  /** The one-line outcome recorded with `artifact`; says so when there is none. */
+  summary?: string;
   /** Accumulated USD across every Crew and Sentinel run for this task. */
   costUsd: number;
   /** Verification attempts so far; bounded by orchestrator config. */

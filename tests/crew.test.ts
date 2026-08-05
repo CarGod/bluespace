@@ -63,10 +63,13 @@ describe('buildBrief', () => {
     expect(text).toMatch(/no human watching/i);
     expect(text).toMatch(/throwaway git worktree/i);
     // What the worktree is for, stated without claiming it gets cleaned up:
-    // only cancellation removes one (Orchestrator#teardown), so a brief that
-    // promised deletion would be teaching every Crew something untrue.
+    // nothing removes one on the way out except cancellation, and `blue gc`
+    // takes it only once the branch is merged — so a brief that promised
+    // deletion would be teaching every Crew something untrue.
     expect(text).toMatch(/not the captain.s\s+checkout/i);
     expect(text).not.toMatch(/will be deleted/i);
+    expect(text).toMatch(/outlives your run/i);
+    expect(text).toMatch(/merged into the base branch/i);
   });
 
   it('carries the title and the full brief text', () => {
@@ -155,6 +158,10 @@ describe('buildBrief — recon', () => {
     const text = recon();
     expect(text).toContain('/var/blue/wt/task-1/REPORT.md');
     expect(text).toMatch(/standalone/i);
+    // The orchestrator copies that file to <dataDir>/reports/<taskId>.md before
+    // teardown, so a report that points back into the worktree points at a path
+    // its reader may not have. The brief has to say so.
+    expect(text).toMatch(/archived out of this worktree/i);
   });
 
   it('forbids modifying project code or committing anything but the report', () => {

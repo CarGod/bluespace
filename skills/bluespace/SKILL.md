@@ -154,8 +154,18 @@ git -C <worktree> diff --stat <defaultBranch>...HEAD
 git -C <worktree> diff <defaultBranch>...HEAD
 ```
 
-A recon's deliverable is a `REPORT.md` committed on the branch. Read it and give the
-captain the finding, not the file.
+A recon's deliverable is a report the Crew wrote as `REPORT.md` in its worktree. When the
+task lands, the orchestrator copies it to `<dataDir>/reports/<taskId>.md` — usually
+`~/.bluespace/reports/<taskId>.md` — and records THAT path as the `artifact` on the task,
+so it survives the worktree being reclaimed. `get_task` returns it; read it there and give
+the captain the finding, not the file. A landed recon with no `artifact` wrote no report;
+say that plainly rather than guessing at what it might have found.
+
+Two endings do not go through that copy. A recon whose Crew **failed** never archived
+anything, so its only copy is the `REPORT.md` still in the worktree — read it from
+`worktree` and tell the captain that copy is the only one. A **cancelled** recon is
+archived on the way out, so the file is at `<dataDir>/reports/<taskId>.md` even though no
+`artifact` was ever recorded for it.
 
 Judge it against the brief and say what you see in one or two sentences — what changed,
 and anything the captain would want to know before merging. Do not re-run the Sentinel's
@@ -187,6 +197,32 @@ uncommitted work with it. Commits survive — the branch is kept whenever it hol
 the base branch does not, so a cancelled task that got as far as committing leaves
 `blue/<taskId>` behind in the project. Say that plainly rather than implying the work is
 gone. If it is still wanted in another form, create the replacement in the same turn.
+
+---
+
+## Worktrees, and getting the disk back
+
+Every other ending keeps its worktree: a landed, failed or abandoned task holds its
+directory and its branch under `~/.bluespace/worktrees/` until the captain says otherwise.
+You have no tool that removes one, so never say a worktree has been cleaned up.
+
+The captain's tool is `blue gc`. It reclaims the worktrees **whose commits are already in
+the base branch** — a directory holding uncommitted changes or unmerged commits is kept,
+and the command names it with the reason. It is a sweep for merged work, not a general
+clean-up: on a fleet whose branches nobody has merged it takes nothing, and that is it
+working. So the honest answer to "why is this taking so much space" is: because the
+branches have not been merged, and merging them is what makes the space collectable. Never
+suggest it as a way to tidy up after a run.
+
+`blue gc --dry-run` shows the list without touching anything. `--force` takes the kept ones
+regardless, after listing what it costs and asking — mention it only if they ask for it,
+and say what it destroys: the checkout and anything uncommitted in it. Commits themselves
+survive on their branch.
+
+A recon's worktree never becomes collectable on its own — its report is either uncommitted
+or sitting on a branch nobody merges, so the safe sweep always keeps it. What changed is
+that forcing one away no longer costs the deliverable: the report was archived out (see
+above). That is the case to raise when a recon's directory is the thing taking up space.
 
 ---
 

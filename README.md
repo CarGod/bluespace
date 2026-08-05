@@ -145,11 +145,32 @@ Stated plainly, because these are the claims people assume:
   is an instruction to a model, not a boundary the code enforces. The isolation that
   *is* enforced is the Crew's: its own worktree, on a throwaway branch, proven distinct
   from your checkout by four separate checks before it is handed over (`src/worktree/`).
-- **Nothing reclaims a worktree.** A finished task keeps its worktree, because the
-  branch in it is the deliverable and deleting it would throw the work away at the
-  moment it succeeded. Only cancelling a task removes one. `~/.bluespace/worktrees/`
-  grows until you clear it yourself: `git worktree remove <path>` in the project, or
-  delete the directory and `git worktree prune`.
+- **Nothing reclaims a worktree on its own.** A finished task keeps its worktree,
+  because the branch in it is the deliverable and deleting it would throw the work away
+  at the moment it succeeded. Only cancelling a task removes one automatically. Nothing
+  sweeps on a timer, at exit, or behind your back.
+
+  What you can do is ask. `blue gc` reclaims the worktrees **whose work is already
+  merged into the base branch** — and only those. A worktree with uncommitted changes,
+  or with commits that are not in `main`, is kept and told to you with the reason,
+  because at that point the directory is the only copy of something. So the pile
+  shrinks when you merge, and not before: it is a sweep for merged work, not a
+  clean-up-everything command, and on a fleet whose branches you have not merged it
+  will correctly take nothing at all. It considers finished tasks' worktrees and any
+  it finds with no task attached; a task still running is never a candidate, at any
+  force level.
+
+  Two things it does not promise. It asks git what is dirty, and git does not count
+  files your `.gitignore` covers — a `.env` or a `dist/` a Crew wrote is not what keeps
+  a merged worktree alive, and goes with it. And a loose directory under
+  `~/.bluespace/worktrees/` that git cannot account for is reported, never removed,
+  unless you force it.
+
+  `blue gc --force` takes the ones it kept, after listing exactly what that costs and
+  making you confirm it. Commits survive on their branch even then — it reaps a branch
+  only once it has proved it merged — but uncommitted work does not. On a
+  non-interactive stdin there is nobody to confirm, so it refuses and exits non-zero;
+  `--yes` is the only way to force from a script, and it means what it says.
 
 ---
 
@@ -168,6 +189,10 @@ blue log <taskId>             replay one task's events from the Blackbox
 blue map                      start the Starmap server and print its URL (default :7777)
       --port <n>              port to listen on
       --orchestrate           also run the dispatch loop
+blue gc                       reclaim finished tasks' worktrees whose work is merged
+      -n, --dry-run           report what it would reclaim, change nothing
+      --force                 take unmerged and dirty ones too — lists them, then asks
+      -y, --yes               skip that question (the only way to force non-interactively)
 blue projects                 list registered projects
 blue projects add <path>      register a repo
       --name X --desc Y --delivery pr|local   (delivery is metadata; default pr)
@@ -361,7 +386,8 @@ src/session/      start a terminal session, address it, type into it. Never read
 src/transcript/   the event stream, recovered from the JSONL the CLI writes to disk
 src/pricing/      token counts -> USD, so the budget ceiling means something
 src/mcp/          the stdio MCP server `blue mcp` runs — BlueSpace's front door
-src/worktree/     git worktree lifecycle. Nothing else in the system shells out to git.
+src/worktree/     git worktree lifecycle, plus the `blue gc` sweep that reclaims the
+                  merged ones. Nothing else in the system shells out to git.
 src/orchestrator/ the engine room: dispatch, ordering, retry, budget, teardown + state machine
 src/agents/       Helm's nine tools, the Crew brief builder, the Sentinel. Helm's own
                   persona is not here — it lives in CLAUDE.md and skills/bluespace/
