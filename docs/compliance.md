@@ -125,9 +125,20 @@ Everything here was checked empirically, not inferred.
 
 | | |
 | --- | --- |
-| Claude Code | **2.1.222** |
+| Claude Code | **2.1.222** — full sweep, live runs included |
+| | **2.1.223** — flag surface only, re-checked 2026-08-05 |
 | Date | **2026-08-04** |
 | Platform | macOS (darwin 25.5.0), tmux 3.7b |
+
+**Read that second row carefully.** On 2.1.223 only the free half of
+`tests/compliance-smoke.test.ts` was re-run: every flag BlueSpace passes still
+exists, and `--permission-mode` still offers `auto` and `dontAsk`. That catches
+a renamed or deleted flag, which is the likeliest regression — and nothing else.
+The behaviours below that no flag list can prove (a positional prompt submitting
+itself, `auto` editing without a dialog, hooks firing on the schedule the adapter
+waits for) were **not** re-measured on 2.1.223. Run
+`BLUESPACE_LIVE_SMOKE=1 npx vitest run tests/compliance-smoke.test.ts` to do that;
+it spends real tokens, which is why it is not the default.
 
 What was verified working: `--session-id` fixes the transcript path before
 launch; `--settings` accepts inline JSON so the completion hook is per-run and
