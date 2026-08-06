@@ -63,6 +63,17 @@ const RETIRED_PERMISSION_MODES: Readonly<Record<string, { to: PermissionMode; wh
   },
 };
 
+/**
+ * Default token ceiling for one task.
+ *
+ * Sized against the ceiling it replaces: $5 of Opus input is 1M tokens, and $5
+ * of Opus cache reads is 10M, so a task that used to die at $5 died somewhere
+ * between those. 5M sits in the middle and is generous for one task's worth of
+ * work while still stopping a Crew that has started looping. Named because the
+ * migration warning quotes it.
+ */
+export const DEFAULT_MAX_TOKENS_PER_TASK = 5_000_000;
+
 export const EFFORT_LEVELS: readonly Effort[] = [
   'low',
   'medium',
@@ -88,7 +99,28 @@ export interface BlueConfig {
   /** Model id. Undefined means "whatever the harness defaults to". */
   model?: string;
   effort?: Effort;
-  /** Hard USD ceiling for a single task, across Crew + Sentinel runs. */
+  /**
+   * TOKEN ceiling for a single task, across its Crew and Sentinel runs, summed
+   * over input, output, cache-read and cache-creation tokens.
+   *
+   * THE CEILING THAT ACTUALLY STOPS A RUNAWAY TASK, because tokens are the only
+   * quantity every run reports and the only one that means anything on a
+   * subscription. 0 disables it — and disables the only ceiling a subscription
+   * run has, which `blue config` says out loud.
+   *
+   * The default is deliberately generous: cache reads dominate an agentic run
+   * (the whole conversation prefix is re-read every turn), so a normal task
+   * measures in millions of tokens and a ceiling set from intuition about
+   * "how many words is that" would kill healthy work. 5M is roughly what the
+   * old $5-of-Opus ceiling bought.
+   */
+  maxTokensPerTask: number;
+  /**
+   * USD ceiling for a single task — ENFORCED ONLY ON A METERED RUN, i.e. one
+   * launched with `ANTHROPIC_API_KEY` set. On a Claude subscription the tokens
+   * draw down a quota and are never invoiced, so there is no spend for this to
+   * bound; `maxTokensPerTask` is the ceiling that fires there. See README.
+   */
   maxBudgetUsdPerTask: number;
   /** How many Crew may be in flight at once. */
   maxConcurrentCrew: number;
@@ -135,6 +167,7 @@ export function defaultConfig(): BlueConfig {
   return {
     permissionMode: DEFAULT_PERMISSION_MODE,
     effort: 'high',
+    maxTokensPerTask: DEFAULT_MAX_TOKENS_PER_TASK,
     maxBudgetUsdPerTask: 5,
     maxConcurrentCrew: 4,
     maxRework: 2,
@@ -318,9 +351,32 @@ export function mergeConfig(base: BlueConfig, patch: Record<string, unknown>): B
     }
   }
 
+  if (patch.maxTokensPerTask !== undefined) {
+    const got = pickNumber(patch.maxTokensPerTask, 'maxTokensPerTask', { min: 0, integer: true });
+    if (got.ok) out.maxTokensPerTask = got.value;
+  }
+
   if (patch.maxBudgetUsdPerTask !== undefined) {
     const got = pickNumber(patch.maxBudgetUsdPerTask, 'maxBudgetUsdPerTask', { min: 0 });
     if (got.ok) out.maxBudgetUsdPerTask = got.value;
+    // A config written before the token ceiling existed is a config whose
+    // author believes `maxBudgetUsdPerTask` stops their tasks. On a
+    // subscription it never did anything but price a fiction, so they are told
+    // what it means now rather than left with a setting that silently changed
+    // meaning under them — the same courtesy RETIRED_PERMISSION_MODES extends.
+    //
+    // Keyed on the absence of `maxTokensPerTask` rather than on the presence of
+    // the budget (which `serialize` always writes), so the notice appears once
+    // and then stops: the next `blue config set` rewrites the file with both.
+    if (got.ok && got.value > 0 && patch.maxTokensPerTask === undefined) {
+      warn(
+        `maxBudgetUsdPerTask ${JSON.stringify(got.value)} now applies ONLY to metered runs ` +
+          '(ANTHROPIC_API_KEY set) — on a Claude subscription those tokens draw down a quota ' +
+          'and cost no dollars, so there was never any spend for it to bound. The ceiling that ' +
+          `stops a task now is maxTokensPerTask, defaulting to ${DEFAULT_MAX_TOKENS_PER_TASK.toLocaleString('en-US')} ` +
+          'tokens. Set it explicitly (`blue config set maxTokensPerTask <n>`) to silence this.',
+      );
+    }
   }
 
   if (patch.maxConcurrentCrew !== undefined) {
@@ -374,6 +430,7 @@ function serialize(cfg: BlueConfig): Record<string, unknown> {
     permissionMode: cfg.permissionMode,
     ...(cfg.model !== undefined ? { model: cfg.model } : {}),
     ...(cfg.effort !== undefined ? { effort: cfg.effort } : {}),
+    maxTokensPerTask: cfg.maxTokensPerTask,
     maxBudgetUsdPerTask: cfg.maxBudgetUsdPerTask,
     maxConcurrentCrew: cfg.maxConcurrentCrew,
     maxRework: cfg.maxRework,

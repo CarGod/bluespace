@@ -33,6 +33,7 @@ import { buildBrief } from '../src/agents/crew/index.js';
 import { Blackbox } from '../src/blackbox/index.js';
 import { ProjectRegistry, defaultConfig, type BlueConfig } from '../src/config/index.js';
 import { Orchestrator } from '../src/orchestrator/index.js';
+import { addTokenUsage, noTokenUsage } from '../src/types/domain.js';
 import type { Project, Verdict } from '../src/types/domain.js';
 import { WorktreeManager } from '../src/worktree/index.js';
 
@@ -172,7 +173,8 @@ describe('end-to-end: real blackbox + real worktrees + real registry', () => {
           reasoning: 'the diff adds the requested export',
           unmet: [],
           createdAt: Date.now(),
-          costUsd: 0.02,
+          tokens: addTokenUsage(noTokenUsage(), 'scripted', { input: 400, output: 80 }),
+          listPriceUsd: 0.02,
         };
       },
     });
@@ -231,7 +233,7 @@ describe('end-to-end: real blackbox + real worktrees + real registry', () => {
     expect(diff).not.toContain('Updated the greeting');
 
     // Cost is the Crew's run plus verification, billed to the task.
-    expect(final!.costUsd).toBeCloseTo(0.27, 5);
+    expect(final!.listPriceUsd).toBeCloseTo(0.27, 5);
 
     // The branch is the deliverable, so a landed task keeps its worktree.
     const wts = await new WorktreeManager(repo, {
@@ -258,7 +260,7 @@ describe('end-to-end: real blackbox + real worktrees + real registry', () => {
     await w.orch.whenIdle();
     expect(w.orch.task(task.id)?.state).toBe('landed');
 
-    const costBefore = w.orch.task(task.id)!.costUsd;
+    const costBefore = w.orch.task(task.id)!.listPriceUsd;
     w.bb.close();
 
     // Reopen the log from disk in a brand-new process-equivalent and re-project.
@@ -274,7 +276,7 @@ describe('end-to-end: real blackbox + real worktrees + real registry', () => {
     const after = revived.task(task.id);
     expect(after?.state).toBe('landed');
     expect(after?.title).toBe('Add a module');
-    expect(after?.costUsd).toBeCloseTo(costBefore, 5);
+    expect(after?.listPriceUsd).toBeCloseTo(costBefore, 5);
     reopened.close();
   });
 
@@ -335,7 +337,9 @@ describe('end-to-end: real blackbox + real worktrees + real registry', () => {
         dependsOn: [],
         createdAt: Date.now(),
         updatedAt: Date.now(),
-        costUsd: 0,
+        tokens: noTokenUsage(),
+        metered: false,
+        listPriceUsd: 0,
         reworkCount: 0,
       },
       project,

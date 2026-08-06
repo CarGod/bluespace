@@ -9,7 +9,7 @@
  * Deliberately dependency-free — it imports types only, never runtime code.
  */
 
-import type { TaskState } from '../types/domain.js';
+import type { TaskState, TokenCounts } from '../types/domain.js';
 import type { BlueEvent } from '../types/events.js';
 
 // ---------------------------------------------------------------------------
@@ -324,6 +324,57 @@ export function formatUsd(usd: number): string {
   return `$${n.toFixed(2)}`;
 }
 
+/**
+ * How to label a dollar figure that is NOT spend.
+ *
+ * Every surface that prints a subscription run's dollars uses this string, so
+ * there is exactly one place where the disclaimer can be got wrong, and so a
+ * captain reading `ps`, `log` and the Starmap sees the same claim three times
+ * rather than three different ones. See `TokenCounts` in types/domain.ts.
+ */
+export function formatUsdEquivalent(usd: number): string {
+  return `≈${formatUsd(usd)} at API list price`;
+}
+
+// ---------------------------------------------------------------------------
+// Tokens — the primary unit
+// ---------------------------------------------------------------------------
+
+/**
+ * `812`, `4.2k`, `3.1M`. Compact because these numbers are large and are read
+ * in a column: an agentic turn re-reads its whole cached prefix, so a normal
+ * task measures in millions and the exact digits answer nothing.
+ */
+export function formatTokens(n: number): string {
+  if (!Number.isFinite(n) || n <= 0) return '0';
+  if (n < 1_000) return String(Math.round(n));
+  if (n < 1_000_000) return `${trim(n / 1_000)}k`;
+  if (n < 1_000_000_000) return `${trim(n / 1_000_000)}M`;
+  return `${trim(n / 1_000_000_000)}B`;
+}
+
+/** One decimal below 100, none above — `4.2k`, `812k`, `3.1M`, `120M`. */
+function trim(value: number): string {
+  const text = value < 100 ? value.toFixed(1) : value.toFixed(0);
+  return text.endsWith('.0') ? text.slice(0, -2) : text;
+}
+
+/**
+ * `claude-opus-5 3.1M · claude-haiku-4-5 820k`, biggest first.
+ *
+ * The split is the point of the whole accounting change: a token total with no
+ * model attached cannot be compared to a quota, because 3M Haiku tokens and 3M
+ * Opus tokens are not the same amount of anything.
+ */
+export function formatTokensByModel(byModel: Record<string, TokenCounts>): string {
+  const parts = Object.entries(byModel)
+    .map(([model, c]) => ({ model, total: c.input + c.output + c.cacheRead + c.cacheCreation }))
+    .filter((p) => p.total > 0)
+    .sort((a, b) => b.total - a.total)
+    .map((p) => `${p.model} ${formatTokens(p.total)}`);
+  return parts.join(dim(' · '));
+}
+
 // ---------------------------------------------------------------------------
 // Disk
 // ---------------------------------------------------------------------------
@@ -397,8 +448,21 @@ export interface EventLine {
   detail: string;
 }
 
+export interface DescribeOptions {
+  /**
+   * Was the run this event came from billed per token?
+   *
+   * Defaults to false, and false means NO DOLLAR FIGURE IS PRINTED — the
+   * transcript's dollars are `src/pricing`'s list-price equivalent, and on a
+   * subscription run printing them next to a token count reads as spend no
+   * matter what the header of this file says. The caller knows: it is projected
+   * onto the task as `metered`.
+   */
+  metered?: boolean;
+}
+
 /** Render one Blackbox event as a label plus a human-readable detail string. */
-export function describeEvent(e: BlueEvent): EventLine {
+export function describeEvent(e: BlueEvent, opts: DescribeOptions = {}): EventLine {
   switch (e.type) {
     case 'task.created':
       return { label: cyan('created'), detail: `${e.kind} · ${e.title}` };
@@ -423,6 +487,16 @@ export function describeEvent(e: BlueEvent): EventLine {
       };
     case 'task.failed':
       return { label: red('failed'), detail: e.reason };
+    case 'task.merged':
+      return {
+        label: green('merged'),
+        // The target is named every time. This is the only event in the log that
+        // records a write to the captain's repository, and which branch it went
+        // to is the whole point of it.
+        detail: e.alreadyMerged
+          ? `${e.branch} was already in ${e.into} — nothing changed`
+          : `${e.branch} → ${e.into} · ${e.commit.slice(0, 12)}`,
+      };
     case 'crew.spawned':
       return {
         label: blue('crew up'),
@@ -444,13 +518,24 @@ export function describeEvent(e: BlueEvent): EventLine {
         label: e.ok ? dim('result') : red('result'),
         detail: e.resultPreview ? truncate(e.resultPreview, 110) : e.ok ? 'ok' : 'error',
       };
-    case 'crew.usage':
-      return {
-        label: dim('usage'),
-        detail: `${formatUsd(e.costUsd)} · ${e.inputTokens} in / ${e.outputTokens} out${
-          e.model ? ` · ${e.model}` : ''
-        }`,
-      };
+    case 'crew.usage': {
+      const cacheRead = e.cacheReadTokens ?? 0;
+      const cacheWrite = e.cacheCreationTokens ?? 0;
+      const total = e.inputTokens + e.outputTokens + cacheRead + cacheWrite;
+      // Tokens first and by model, because that is what was measured. The
+      // cache line items are shown because they are usually most of the total,
+      // and a captain comparing two tasks needs to see which one was cache-cold.
+      const parts = [
+        `${formatTokens(total)} tokens`,
+        `${formatTokens(e.inputTokens)} in / ${formatTokens(e.outputTokens)} out` +
+          (cacheRead + cacheWrite > 0
+            ? ` / ${formatTokens(cacheRead)} cache read / ${formatTokens(cacheWrite)} cache write`
+            : ''),
+        e.model ?? 'model not reported',
+      ];
+      if (opts.metered === true) parts.push(formatUsd(e.costUsd));
+      return { label: dim('usage'), detail: parts.join(' · ') };
+    }
     case 'crew.exited':
       return {
         label: e.ok ? dim('crew down') : red('crew down'),

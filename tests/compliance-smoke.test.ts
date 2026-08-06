@@ -112,6 +112,34 @@ describe('flag surface (free)', () => {
     const all = { ...pkg.dependencies, ...pkg.devDependencies };
     expect(Object.keys(all)).not.toContain('@anthropic-ai/claude-agent-sdk');
   });
+
+  it('still offers every option the `bluespace` launcher opens a Helm window with', async () => {
+    const text = await help();
+    if (text === '') return;
+
+    // Losing any of these does not break a Crew — it breaks the front door, and
+    // it breaks it into the exact shape BlueSpace deleted the old `claude mcp
+    // add` instruction to avoid: a window with some of Helm in it.
+    const required: Array<[flag: string, why: string]> = [
+      ['--mcp-config', "Helm's tools, inline, per invocation — the alternative is a global install"],
+      ['--strict-mcp-config', 'BLUESPACE_STRICT_MCP=1 isolates the window from the captain’s own servers'],
+      ['--append-system-prompt', 'carries CLAUDE.md, without which the tools are not Helm'],
+      ['--add-dir', 'lets the window read skills/bluespace/SKILL.md from the install root'],
+    ];
+    for (const [flag, why] of required) {
+      expect(text, `${flag} is gone — ${why}`).toContain(flag);
+    }
+  });
+
+  it('still takes a positional prompt, which is how the wake sweep opens', async () => {
+    const text = await help();
+    if (text === '') return;
+    // A bare `bluespace` passes one. If the CLI stops accepting a positional
+    // prompt, the window opens on an argument it treats as something else —
+    // measured on 2.1.223, `--mcp-config` and `--add-dir` both read a stray
+    // positional as one of their own values. See docs/compliance.md.
+    expect(text).toMatch(/Usage: claude \[options\][\s\S]{0,80}\[prompt\]/);
+  });
 });
 
 describe.skipIf(!LIVE)('live loop (spends tokens — BLUESPACE_LIVE_SMOKE=1)', () => {

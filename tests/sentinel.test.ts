@@ -20,7 +20,7 @@ import type {
 } from '../src/adapters/types.js';
 import { UnsupportedCapabilityError } from '../src/adapters/types.js';
 import type { DispatchProfile, Task } from '../src/types/domain.js';
-import { VERDICT_SCHEMA } from '../src/types/domain.js';
+import { noTokenUsage, totalTokens, VERDICT_SCHEMA } from '../src/types/domain.js';
 import { MAX_DIFF_CHARS, runSentinel, SENTINEL_MAX_TURNS } from '../src/agents/sentinel/index.js';
 
 // ---------------------------------------------------------------------------
@@ -100,7 +100,9 @@ function makeTask(overrides: Partial<Task> = {}): Task {
     dependsOn: [],
     createdAt: 1_700_000_000_000,
     updatedAt: 1_700_000_000_000,
-    costUsd: 0,
+    tokens: noTokenUsage(),
+    metered: false,
+    listPriceUsd: 0,
     reworkCount: 0,
     ...overrides,
   };
@@ -124,8 +126,8 @@ const DIFF = [
   '+}',
 ].join('\n');
 
-function usage(costUsd: number): AdapterEvent {
-  return { type: 'usage', costUsd, inputTokens: 100, outputTokens: 20 };
+function usage(costUsd: number, model = 'claude-opus-5'): AdapterEvent {
+  return { type: 'usage', costUsd, inputTokens: 100, outputTokens: 20, model };
 }
 
 function exitWith(structured: unknown, ok = true): AdapterEvent {
@@ -156,8 +158,36 @@ describe('runSentinel — pass verdict', () => {
     expect(verdict.reasoning).toBe('All three requirements are present in the diff.');
     expect(verdict.taskId).toBe('task-1');
     expect(verdict.id).toMatch(/^[0-9a-f-]{36}$/);
-    expect(verdict.costUsd).toBeCloseTo(0.02, 10);
+    expect(verdict.listPriceUsd).toBeCloseTo(0.02, 10);
     expect(fake.closes).toBe(1);
+  });
+
+  it('records the tokens verification consumed, by model', async () => {
+    // Verification runs a model too. Recording only its dollars made a
+    // Sentinel's consumption invisible to the ceiling that is meant to bound
+    // the task — and on a subscription, dollars were the one number that meant
+    // nothing.
+    const fake = fakeAdapter([
+      usage(0.02),
+      usage(0.01, 'claude-haiku-4-5'),
+      exitWith({ pass: true, reasoning: 'ok', unmet: [] }),
+    ]);
+
+    const verdict = await run(fake.adapter);
+
+    expect(totalTokens(verdict.tokens.totals)).toBe(240);
+    expect(verdict.tokens.byModel['claude-opus-5']).toMatchObject({ input: 100, output: 20 });
+    expect(verdict.tokens.byModel['claude-haiku-4-5']).toMatchObject({ input: 100, output: 20 });
+  });
+
+  it('still reports the tokens a verification burned when it could not produce a verdict', async () => {
+    // Failing closed must not also lose the accounting: those tokens were spent
+    // whether or not a verdict came back.
+    const fake = fakeAdapter([usage(0.02), exitWith(undefined)]);
+    const verdict = await run(fake.adapter);
+
+    expect(verdict.pass).toBe(false);
+    expect(totalTokens(verdict.tokens.totals)).toBe(120);
   });
 
   it('spawns with the verdict schema, the worktree cwd, and a derived profile', async () => {
@@ -281,7 +311,7 @@ describe('runSentinel — fails closed', () => {
     expect(verdict.reasoning).toMatch(/could not be completed/i);
     expect(verdict.reasoning).toMatch(/structured verdict/i);
     expect(verdict.unmet.length).toBeGreaterThan(0);
-    expect(verdict.costUsd).toBeCloseTo(0.03, 10);
+    expect(verdict.listPriceUsd).toBeCloseTo(0.03, 10);
     expect(fake.closes).toBe(1);
   });
 
@@ -302,7 +332,7 @@ describe('runSentinel — fails closed', () => {
 
     expect(verdict.pass).toBe(false);
     expect(verdict.reasoning).toMatch(/without an exit event/i);
-    expect(verdict.costUsd).toBeCloseTo(0.005, 10);
+    expect(verdict.listPriceUsd).toBeCloseTo(0.005, 10);
   });
 
   it('fails when the run was interrupted, even with structured output attached', async () => {
@@ -334,7 +364,7 @@ describe('runSentinel — fails closed', () => {
 
     expect(verdict.pass).toBe(false);
     expect(verdict.reasoning).toContain('harness pipe closed');
-    expect(verdict.costUsd).toBeCloseTo(0.07, 10);
+    expect(verdict.listPriceUsd).toBeCloseTo(0.07, 10);
     expect(fake.closes).toBe(1);
   });
 
@@ -367,13 +397,13 @@ describe('runSentinel — cost accumulation', () => {
 
     const verdict = await run(fake.adapter);
 
-    expect(verdict.costUsd).toBeCloseTo(0.035, 10);
+    expect(verdict.listPriceUsd).toBeCloseTo(0.035, 10);
   });
 
   it('is zero when the harness reports no usage', async () => {
     const fake = fakeAdapter([exitWith({ pass: true, reasoning: 'ok', unmet: [] })]);
     const verdict = await run(fake.adapter);
-    expect(verdict.costUsd).toBe(0);
+    expect(verdict.listPriceUsd).toBe(0);
   });
 
   it('ignores non-finite costs instead of poisoning the total', async () => {
@@ -385,7 +415,7 @@ describe('runSentinel — cost accumulation', () => {
 
     const verdict = await run(fake.adapter);
 
-    expect(verdict.costUsd).toBeCloseTo(0.02, 10);
+    expect(verdict.listPriceUsd).toBeCloseTo(0.02, 10);
   });
 });
 

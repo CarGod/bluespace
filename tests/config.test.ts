@@ -12,6 +12,7 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
+  DEFAULT_MAX_TOKENS_PER_TASK,
   ProjectRegistry,
   ProjectRegistryError,
   configPath,
@@ -65,10 +66,11 @@ describe('defaults', () => {
     expect(configPath()).toBe(path.join(home, 'config.json'));
   });
 
-  it('defaults to autonomous crews with a bounded budget', () => {
+  it('defaults to autonomous crews with a bounded token ceiling', () => {
     expect(defaultConfig()).toEqual({
       permissionMode: 'auto',
       effort: 'high',
+      maxTokensPerTask: DEFAULT_MAX_TOKENS_PER_TASK,
       maxBudgetUsdPerTask: 5,
       maxConcurrentCrew: 4,
       maxRework: 2,
@@ -125,6 +127,7 @@ describe('saveConfig / loadConfig roundtrip', () => {
       permissionMode: 'plan',
       effort: 'high',
       model: 'claude-x',
+      maxTokensPerTask: DEFAULT_MAX_TOKENS_PER_TASK,
       maxBudgetUsdPerTask: 5,
       maxConcurrentCrew: 1,
       maxRework: 2,
@@ -232,6 +235,50 @@ describe('invalid values are dropped, not fatal', () => {
     expect(cfg.maxRework).toBe(2);
     expect(cfg.model).toBeUndefined();
     expect(warnSpy).toHaveBeenCalledTimes(4);
+  });
+
+  it('drops a non-integer or negative maxTokensPerTask, keeping the default ceiling', () => {
+    writeConfig(JSON.stringify({ maxTokensPerTask: -5 }));
+    expect(loadConfig().maxTokensPerTask).toBe(DEFAULT_MAX_TOKENS_PER_TASK);
+    writeConfig(JSON.stringify({ maxTokensPerTask: 1.5 }));
+    expect(loadConfig().maxTokensPerTask).toBe(DEFAULT_MAX_TOKENS_PER_TASK);
+  });
+
+  it('accepts 0 as "no token ceiling" rather than treating it as invalid', () => {
+    // A captain who genuinely wants no ceiling can say so; `blue config set`
+    // is what warns them, because that is where a human is present to read it.
+    writeConfig(JSON.stringify({ maxTokensPerTask: 0 }));
+    expect(loadConfig().maxTokensPerTask).toBe(0);
+  });
+
+  it('tells a captain whose config predates the token ceiling what their budget now means', () => {
+    // The migration, in the spirit of RETIRED_PERMISSION_MODES: a value that
+    // quietly changed meaning is explained, not ignored. `maxBudgetUsdPerTask`
+    // only ever bounded dollars, and on a subscription there are none.
+    writeConfig(JSON.stringify({ maxBudgetUsdPerTask: 5 }));
+    const cfg = loadConfig();
+
+    expect(cfg.maxBudgetUsdPerTask).toBe(5);
+    expect(cfg.maxTokensPerTask).toBe(DEFAULT_MAX_TOKENS_PER_TASK);
+    const notice = warnSpy.mock.calls.map((c) => String(c[0])).join('\n');
+    expect(notice).toContain('maxBudgetUsdPerTask');
+    expect(notice).toContain('metered');
+    expect(notice).toContain('maxTokensPerTask');
+  });
+
+  it('stops explaining once the config names a token ceiling of its own', () => {
+    writeConfig(JSON.stringify({ maxBudgetUsdPerTask: 5, maxTokensPerTask: 2_000_000 }));
+    const cfg = loadConfig();
+    expect(cfg.maxTokensPerTask).toBe(2_000_000);
+    expect(warnSpy).not.toHaveBeenCalled();
+  });
+
+  it('a save writes the token ceiling, so the notice self-quiets', () => {
+    writeConfig(JSON.stringify({ maxBudgetUsdPerTask: 5 }));
+    saveConfig({ maxRework: 1 });
+    warnSpy.mockClear();
+    expect(loadConfig().maxTokensPerTask).toBe(DEFAULT_MAX_TOKENS_PER_TASK);
+    expect(warnSpy).not.toHaveBeenCalled();
   });
 
   it('a bad value in the file does not stop a later save from fixing it', () => {

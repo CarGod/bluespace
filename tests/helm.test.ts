@@ -16,8 +16,10 @@ import { describe, expect, it } from 'vitest';
 
 import type { ToolDef } from '../src/adapters/types.js';
 import { helmTools } from '../src/agents/helm/index.js';
+import type { Blackbox } from '../src/blackbox/index.js';
 import type { ProjectRegistry } from '../src/config/index.js';
 import type { Orchestrator } from '../src/orchestrator/index.js';
+import { addTokenUsage, noTokenUsage } from '../src/types/domain.js';
 import type { Decision, Project, Task } from '../src/types/domain.js';
 
 // ---------------------------------------------------------------------------
@@ -47,7 +49,14 @@ function makeTask(over: Partial<Task> = {}): Task {
     dependsOn: [],
     createdAt: 1_700_000_000_000,
     updatedAt: 1_700_000_000_100,
-    costUsd: 0.123_456,
+    tokens: addTokenUsage(noTokenUsage(), 'claude-opus-5', {
+      input: 1000,
+      output: 200,
+      cacheRead: 12_000,
+      cacheCreation: 800,
+    }),
+    metered: false,
+    listPriceUsd: 0.123_456,
     reworkCount: 1,
     ...over,
   };
@@ -73,6 +82,8 @@ interface Calls {
   resolved: Array<[string, string]>;
   steered: Array<[string, string]>;
   cancelled: string[];
+  /** Project ids handed to registry.remove — pure metadata, and nothing else. */
+  removed: string[];
 }
 
 function wire(
@@ -88,16 +99,28 @@ function wire(
   const tasks = opts.tasks ?? [makeTask()];
   const decisions = opts.decisions ?? [makeDecision()];
 
-  const calls: Calls = { created: [], resolved: [], steered: [], cancelled: [] };
+  const calls: Calls = { created: [], resolved: [], steered: [], cancelled: [], removed: [] };
 
   const registry = {
     list: () => projects,
     get: (id: string) => projects.find((p) => p.id === id),
+    remove: (id: string) => {
+      calls.removed.push(id);
+    },
     resolveScored: (hint: string) =>
       projects
         .filter((p) => p.name.includes(hint) || p.description.includes(hint))
         .map((project) => ({ project, score: 42 })),
   } as unknown as ProjectRegistry;
+
+  // Delivery needs a log and a git manager. This suite is deliberately stub-only
+  // — the tools that actually touch a repository are exercised against real git
+  // in tests/land.test.ts — so an empty log means no delivery lookup ever runs,
+  // and a manager that throws proves it.
+  const blackbox = {
+    read: () => [],
+    append: (body: unknown) => body,
+  } as unknown as Blackbox;
 
   const orch = {
     tasks: () => tasks,
@@ -121,7 +144,12 @@ function wire(
     },
   } as unknown as Orchestrator;
 
-  const list = helmTools(orch, registry);
+  const list = helmTools(orch, registry, {
+    blackbox,
+    worktreeFor: () => {
+      throw new Error('this suite never reaches a repository');
+    },
+  });
   return { tools: new Map(list.map((t) => [t.name, t])), list, calls };
 }
 
@@ -142,7 +170,7 @@ async function callJson(t: ToolDef, input: Record<string, unknown> = {}): Promis
 describe('helmTools — shape', () => {
   const { list } = wire();
 
-  it('returns the nine levers Helm has on the fleet', () => {
+  it('returns the levers Helm has on the fleet', () => {
     expect(list.map((t) => t.name)).toEqual([
       'list_projects',
       'resolve_project',
@@ -153,7 +181,41 @@ describe('helmTools — shape', () => {
       'answer_decision',
       'steer_task',
       'cancel_task',
+      'land_task',
+      'delivery_status',
+      'add_project',
+      'remove_project',
     ]);
+  });
+
+  /**
+   * `land_task` is the first tool in BlueSpace that writes to the captain's
+   * repository, and the only thing standing between Helm and a wrong merge is
+   * what this description says. It has to carry all three: what it does, what it
+   * refuses, and that main is never written to.
+   */
+  it('says in land_task’s own description that it never touches the default branch', () => {
+    const land = list.find((t) => t.name === 'land_task');
+    expect(land?.description).toMatch(/never touches the default branch/i);
+    expect(land?.description).toMatch(/main is reached only through a pull request/i);
+    expect(land?.description).toMatch(/REFUSES/);
+    expect(land?.description).toMatch(/recon/);
+    expect(land?.description).toMatch(/conflict/i);
+    // Only on the captain's word — the one trigger clause that matters here.
+    expect(land?.description).toMatch(/ONLY when the captain has said to land it/);
+  });
+
+  /**
+   * The captain's own framing: *"加入移除都是链接的形式，并不会真正删除这些本地的
+   * 项目."* Helm can only tell him that truthfully if the tool says so.
+   */
+  it('says plainly that registering and unregistering never touch the repository', () => {
+    const add = list.find((t) => t.name === 'add_project');
+    const remove = list.find((t) => t.name === 'remove_project');
+    expect(add?.description).toMatch(/does not copy, move, clone, modify or delete/i);
+    expect(add?.description).toMatch(/in place/i);
+    expect(remove?.description).toMatch(/DELETES NOTHING/);
+    expect(remove?.description).toMatch(/left exactly as they are/i);
   });
 
   it('describes every tool prescriptively — what it does AND when to call it', () => {
@@ -194,6 +256,10 @@ describe('helmTools — shape', () => {
     expect(required('answer_decision')).toEqual(['answer', 'decisionId']);
     expect(required('steer_task')).toEqual(['message', 'taskId']);
     expect(required('cancel_task')).toEqual(['taskId']);
+    expect(required('land_task')).toEqual(['taskId']);
+    expect(required('delivery_status')).toEqual([]); // every project by default
+    expect(required('add_project')).toEqual(['path']);
+    expect(required('remove_project')).toEqual(['projectId']);
   });
 
   it('offers the closed sets as enums so the model cannot invent a value', () => {
@@ -240,14 +306,22 @@ describe('helmTools — reads', () => {
 
   it('list_tasks summarizes the fleet and filters by state', async () => {
     const { tools } = wire({
-      tasks: [makeTask(), makeTask({ id: 'task-2', state: 'landed', costUsd: 1 })],
+      tasks: [makeTask(), makeTask({ id: 'task-2', state: 'landed', listPriceUsd: 1 })],
     });
 
     const all = await callJson(tools.get('list_tasks')!);
     expect(all.filter).toBe('all');
     expect(all.count).toBe(2);
     expect(all.byState).toEqual({ working: 1, landed: 1 });
-    expect(all.totalCostUsd).toBeCloseTo(1.1235, 4);
+    // Tokens are the fleet total Helm reports; both fixtures burned the same
+    // 14,000 measured tokens on one model.
+    expect(all.totalTokens).toBe(28_000);
+    expect(all.tokensByModel).toEqual({ 'claude-opus-5': 28_000 });
+    // Neither task was metered, so the dollars are offered as an equivalence
+    // under a key that cannot be mistaken for spend — and `meteredCostUsd`,
+    // which would be spend, is absent entirely.
+    expect(all.subscriptionApiListPriceEquivalentUsd).toBeCloseTo(1.1235, 4);
+    expect(all.meteredCostUsd).toBeUndefined();
     // The project name is resolved for the captain's benefit.
     expect(all.tasks[0].project).toBe('uploader');
 
@@ -256,6 +330,38 @@ describe('helmTools — reads', () => {
     expect(landed.tasks[0].id).toBe('task-2');
     // Counts stay fleet-wide even when the list is filtered.
     expect(landed.byState).toEqual({ working: 1, landed: 1 });
+  });
+
+  it('reports a subscription task in tokens, and never as a cost', async () => {
+    // The defect this whole accounting exists to prevent: a Crew is the
+    // captain's own Claude Code session on their own login, so its tokens draw
+    // down a plan quota and are never billed. A `costUsd` field here is a
+    // number Helm will repeat to the captain as money they spent.
+    const { tools } = wire();
+    const one = await callJson(tools.get('get_task')!, { taskId: 'task-1' });
+
+    expect(one.metered).toBe(false);
+    expect(one.costUsd).toBeUndefined();
+    expect(one.tokens.total).toBe(14_000);
+    expect(one.tokens.byModel['claude-opus-5']).toMatchObject({
+      total: 14_000,
+      input: 1000,
+      output: 200,
+      cacheRead: 12_000,
+      cacheCreation: 800,
+    });
+    expect(one.apiListPriceEquivalentUsd).toBeCloseTo(0.1235, 4);
+    expect(String(one.costNote)).toContain('NOT a cost');
+  });
+
+  it('reports a metered task as real spend, under a key that says so', async () => {
+    const { tools } = wire({ tasks: [makeTask({ metered: true })] });
+    const one = await callJson(tools.get('get_task')!, { taskId: 'task-1' });
+
+    expect(one.metered).toBe(true);
+    expect(one.costUsd).toBeCloseTo(0.1235, 4);
+    expect(one.apiListPriceEquivalentUsd).toBeUndefined();
+    expect(one.tokens.total).toBe(14_000);
   });
 
   it('get_task carries the brief that list_tasks omits', async () => {
@@ -362,6 +468,23 @@ describe('helmTools — writes', () => {
     });
     expect(calls.steered).toEqual([['task-1', 'only retry idempotent requests']]);
     expect(result.steered).toBe(true);
+  });
+
+  it('remove_project unregisters through the registry and promises nothing was deleted', async () => {
+    const { tools, calls } = wire();
+    const result = await callJson(tools.get('remove_project')!, { projectId: 'proj-1' });
+
+    expect(calls.removed).toEqual(['proj-1']);
+    expect(result.unregistered.path).toBe('/repos/uploader');
+    expect(String(result.note)).toMatch(/Nothing on disk was moved, modified or deleted/);
+  });
+
+  it('remove_project refuses an unknown id rather than silently doing nothing', async () => {
+    const { tools, calls } = wire();
+    await expect(tools.get('remove_project')!.handler({ projectId: 'ghost' })).rejects.toThrow(
+      /No project with id ghost/,
+    );
+    expect(calls.removed).toEqual([]);
   });
 
   it('cancel_task cancels and reports the state it landed in', async () => {

@@ -23,10 +23,15 @@
  */
 
 import * as fs from 'node:fs';
+import * as os from 'node:os';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { assertClaudeCliAvailable, createClaudeCliAdapter } from '../adapters/claude-cli.js';
+import {
+  assertClaudeCliAvailable,
+  createClaudeCliAdapter,
+  resolveAuth,
+} from '../adapters/claude-cli.js';
 import type { HarnessAdapter } from '../adapters/types.js';
 import { Blackbox, projectCrewLog } from '../blackbox/index.js';
 import {
@@ -37,9 +42,16 @@ import {
   saveConfig,
 } from '../config/index.js';
 import type { BlueConfig } from '../config/index.js';
+import { landTask, pendingDelivery, LandRefusedError } from '../land/index.js';
 import { Orchestrator } from '../orchestrator/index.js';
-import { WorktreeManager } from '../worktree/index.js';
-import { isTerminal } from '../types/domain.js';
+import {
+  DevBranchConflictError,
+  INTEGRATION_BRANCH,
+  MergeConflictError,
+  WorktreeManager,
+  ensureIntegrationBranch,
+} from '../worktree/index.js';
+import { addTokenCounts, isTerminal, noTokens, totalTokens } from '../types/domain.js';
 import type {
   DeliveryMode,
   Effort,
@@ -47,6 +59,7 @@ import type {
   Project,
   Task,
   TaskState,
+  TokenCounts,
 } from '../types/domain.js';
 import type { BlueEvent } from '../types/events.js';
 
@@ -59,7 +72,10 @@ import {
   cyan,
   describeEvent,
   dim,
+  formatTokens,
+  formatTokensByModel,
   formatUsd,
+  formatUsdEquivalent,
   green,
   padEnd,
   red,
@@ -205,11 +221,12 @@ function usage(): string {
   L.push('');
   L.push(bold('COMMANDS'));
   const rows: Array<[string, string]> = [
-    ['mcp', "serve Helm's tools over stdio  ← your Claude Code window runs this"],
+    ['mcp', "serve Helm's tools over stdio  ← `bluespace` starts this for you"],
     ['inbox', 'read the decisions waiting on you (answer them through Helm)'],
     ['ps', 'what the fleet is doing, and how to watch a worker'],
     ['log <taskId>', "replay one task's events from the Blackbox"],
     ['map', 'start the Starmap server and print its URL'],
+    ['land <taskId>', `merge a verified task into ${INTEGRATION_BRANCH}  (never into main)`],
     ['gc', 'reclaim the worktrees whose work is merged  [--dry-run] [--force]'],
     ['projects', 'list registered projects'],
     ['projects add <path>', 'register a repo  [--name X] [--desc Y] [--delivery pr|local]'],
@@ -221,9 +238,15 @@ function usage(): string {
   for (const [k, v] of rows) L.push(`  ${padEnd(k, w)}  ${dim(v)}`);
   L.push('');
   L.push(bold('TALKING TO HELM'));
-  L.push(`  ${cyan(MCP_ADD_COMMAND)}`);
-  L.push(`  ${dim('register once, then say what you want built in your own Claude Code window.')}`);
-  L.push(`  ${dim('`blue mcp` is not for typing into: stdout is the protocol stream.')}`);
+  L.push(`  ${cyan(LAUNCH_COMMAND)}${dim('  — opens a Claude Code window that IS Helm. Nothing to register.')}`);
+  L.push(`  ${dim('run it in any repo; it takes claude’s own flags: bluespace --model opus, bluespace "…"')}`);
+  L.push(`  ${dim('plain `claude` stays plain. `blue mcp` is not for typing into: stdout is the protocol.')}`);
+  L.push(`  ${dim(`ran \`claude mcp add\` for BlueSpace before? undo it: ${REMOVE_COMMAND}`)}`);
+  L.push('');
+  L.push(bold('ENVIRONMENT'));
+  L.push(`  ${dim('BLUESPACE_STRICT_MCP=1')}  ${dim('(bluespace) load only BlueSpace’s MCP server, drop your own')}`);
+  L.push(`  ${dim('BLUESPACE_NO_WAKE=1')}     ${dim('(bluespace) open silently instead of on a wake sweep')}`);
+  L.push(`  ${dim('CLAUDE_CLI_PATH')}         ${dim('point at a `claude` that is not on PATH')}`);
   L.push('');
   L.push(bold('CONFIG KEYS'));
   // Spelled from the same constants `blue config set` validates against. Help
@@ -233,7 +256,7 @@ function usage(): string {
   L.push(`  ${dim('permissionMode')} ${PERMISSION_MODES.join('|')}`);
   L.push(`  ${dim('effort')} ${EFFORTS.join('|')}   ${dim('model')} <string>`);
   L.push(
-    `  ${dim('maxConcurrentCrew')} <int>   ${dim('maxRework')} <int>   ${dim('maxBudgetUsdPerTask')} <number>`,
+    `  ${dim('maxConcurrentCrew')} <int>   ${dim('maxRework')} <int>   ${dim('maxTokensPerTask')} <int>   ${dim('maxBudgetUsdPerTask')} <number>`,
   );
   L.push('');
   L.push(bold('OPTIONS'));
@@ -253,24 +276,56 @@ function usage(): string {
 }
 
 /**
- * The one line that wires BlueSpace into the captain's Claude Code window.
+ * The one word that reaches Helm.
  *
- * Written out in full rather than described, because the whole product is
- * unreachable until it has been run once and a command you can paste is the
- * difference between a setup step and a support question. `-s user` registers
- * it for every directory: Helm is fleet-wide, and a server scoped to whichever
- * folder the captain happened to be in would vanish the moment they moved.
+ * This used to be `claude mcp add -s user bluespace -- blue mcp`, and that
+ * instruction is gone rather than softened. It was wrong twice. It put the fleet
+ * tools in every Claude Code session on the machine, permanently, for a tool the
+ * captain was only trying out — and it never produced Helm anyway, because an
+ * MCP server supplies tools and Helm's rules live in `CLAUDE.md`, which loads
+ * only when the working directory is the BlueSpace repo. In the captain's own
+ * project it delivered the levers and no contract: a model that can create
+ * tasks without knowing that `create_task` only enqueues.
+ *
+ * `bluespace` supplies both halves for one invocation and leaves nothing behind.
+ * See `src/cli/bluespace.ts`. Anyone who already ran the old command should undo
+ * it — `REMOVE_COMMAND` below.
  */
-const MCP_ADD_COMMAND = 'claude mcp add -s user bluespace -- blue mcp';
+const LAUNCH_COMMAND = 'bluespace';
+
+/** For captains who ran the old instruction; harmless if they never did. */
+const REMOVE_COMMAND = 'claude mcp remove -s user bluespace';
+
+/**
+ * Did a previous version's instruction leave a user-scoped server behind?
+ *
+ * Read-only, and offered rather than acted on: `~/.claude.json` is the captain's
+ * file and BlueSpace does not write it — that is the entire point of the
+ * launcher. Detecting it means the removal advice is shown to the people who
+ * need it and to nobody else, which is the difference between help and noise.
+ */
+function hasUserScopedMcpRegistration(): boolean {
+  return (
+    safe(() => {
+      const raw = fs.readFileSync(path.join(os.homedir(), '.claude.json'), 'utf8');
+      const parsed = JSON.parse(raw) as { mcpServers?: Record<string, unknown> };
+      return parsed.mcpServers?.['bluespace'] !== undefined;
+    }) === true
+  );
+}
 
 /** The installed package root — `dist/cli/index.js` sits two levels down. */
 function installRoot(): string {
   return path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 }
 
-/** This exact file, for a captain who needs to spell the MCP command out in full. */
-function entryPath(): string {
-  return fileURLToPath(import.meta.url);
+/**
+ * The launcher that ships beside this file, for a captain whose PATH does not
+ * have it. Derived from this module's own location rather than from the install
+ * root, so it stays right in a linked checkout too.
+ */
+function launcherPath(): string {
+  return path.join(path.dirname(fileURLToPath(import.meta.url)), 'bluespace.js');
 }
 
 /**
@@ -388,12 +443,46 @@ function attachCommands(b: Boot): Map<string, string> {
   return byCrew;
 }
 
-function cmdPs(b: Boot): number {
+/**
+ * What is merged onto an integration branch and still outside the default one.
+ *
+ * Printed rather than nagged: it is a fact about the repository, so it goes
+ * where the captain is already looking (`blue ps`, `blue projects`) and says
+ * nothing at all when there is nothing waiting. BlueSpace does not open the pull
+ * request, and no line here pretends otherwise.
+ */
+async function printPendingDelivery(b: Boot): Promise<void> {
+  let pending;
+  try {
+    pending = await pendingDelivery({
+      blackbox: b.blackbox,
+      registry: b.registry,
+      worktreeFor: b.worktreeFor,
+    });
+  } catch {
+    return; // a git failure is not a reason to fail a read-only view
+  }
+  if (pending.length === 0) return;
+
+  out('');
+  out(bold('Waiting on a pull request'));
+  for (const d of pending) {
+    out(
+      `  ${cyan(d.project)}  ${d.devBranch} ${dim('→')} ${d.defaultBranch}  ${dim(
+        `${plural(d.tasks, 'landed task')} · ${plural(d.commits, 'commit')}${
+          d.behind > 0 ? ` · ${plural(d.behind, 'commit')} behind` : ''
+        }`,
+      )}`,
+    );
+  }
+  out(dim('  BlueSpace never opens one — ask Helm for the `gh pr create` command.'));
+}
+
+async function cmdPs(b: Boot): Promise<number> {
   const tasks = b.orch.tasks();
   if (tasks.length === 0) {
     out('');
-    out(dim('No tasks yet. Ask Helm for something in your Claude Code window.'));
-    out(dim(`Not set up yet? ${MCP_ADD_COMMAND}`));
+    out(dim('No tasks yet. Ask Helm for something — run `bluespace` and say what you want built.'));
     out('');
     return 0;
   }
@@ -410,12 +499,17 @@ function cmdPs(b: Boot): number {
     return p ? p.name : shortId(id);
   };
 
+  // TOKENS, NOT DOLLARS, IN THE COLUMN. A Crew is the captain's own Claude Code
+  // session on their own login, so its tokens come out of a subscription quota
+  // and no dollar amount is charged for them; the only number that is measured
+  // rather than modelled is the token count. See `TokenCounts` in
+  // types/domain.ts. Dollars come back below, once, for the metered case.
   const rows = sorted.map((t) => [
     `${stateGlyph(t.state)} ${dim(shortId(t.id))}`,
     colourState(t.state),
     cyan(truncate(projectName(t.projectId), 18)),
     truncate(t.title, 46),
-    formatUsd(t.costUsd),
+    formatTokens(totalTokens(t.tokens.totals)),
     dim(relTime(t.createdAt)),
   ]);
 
@@ -427,7 +521,7 @@ function cmdPs(b: Boot): number {
         { header: 'state' },
         { header: 'project' },
         { header: 'title', max: 46 },
-        { header: 'cost', align: 'right' },
+        { header: 'tokens', align: 'right' },
         { header: 'age', align: 'right' },
       ],
       rows,
@@ -435,10 +529,18 @@ function cmdPs(b: Boot): number {
   );
 
   const counts = new Map<TaskState, number>();
-  let total = 0;
+  let fleetTokens: TokenCounts = noTokens();
+  const fleetByModel: Record<string, TokenCounts> = {};
+  let meteredUsd = 0;
+  let unmeteredUsd = 0;
   for (const t of sorted) {
     counts.set(t.state, (counts.get(t.state) ?? 0) + 1);
-    total += t.costUsd;
+    fleetTokens = addTokenCounts(fleetTokens, t.tokens.totals);
+    for (const [model, c] of Object.entries(t.tokens.byModel)) {
+      fleetByModel[model] = addTokenCounts(fleetByModel[model] ?? noTokens(), c);
+    }
+    if (t.metered) meteredUsd += t.listPriceUsd;
+    else unmeteredUsd += t.listPriceUsd;
   }
 
   const summary = [...counts.entries()]
@@ -447,7 +549,22 @@ function cmdPs(b: Boot): number {
     .join(dim(' · '));
 
   out('');
-  out(`${summary}${dim('  ·  ')}${bold(formatUsd(total))} ${dim('spent')}`);
+  out(
+    `${summary}${dim('  ·  ')}${bold(formatTokens(totalTokens(fleetTokens)))} ${dim('tokens')}`,
+  );
+  const byModel = formatTokensByModel(fleetByModel);
+  if (byModel !== '') out(dim('  by model: ') + byModel);
+  // Two figures, never added together: one is an invoice, the other is not.
+  if (meteredUsd > 0) {
+    out(`${dim('  metered (ANTHROPIC_API_KEY): ')}${bold(formatUsd(meteredUsd))} ${dim('spent')}`);
+  }
+  if (unmeteredUsd > 0) {
+    out(
+      dim(
+        `  on your Claude subscription: no dollar cost — those tokens draw down your plan's quota (${formatUsdEquivalent(unmeteredUsd)})`,
+      ),
+    );
+  }
 
   // A task's `crewId` is its LATEST dispatch, which is what makes this lookup
   // correct across rework: an earlier crew's window is gone with the crew.
@@ -465,6 +582,8 @@ function cmdPs(b: Boot): number {
     out(dim('watch a crew — a live session you can read and type into:'));
     for (const [id, command] of watchable) out(`  ${dim(id)}  ${cyan(command)}`);
   }
+
+  await printPendingDelivery(b);
 
   const open = b.orch.openDecisions();
   const nudge = decisionNudge(open);
@@ -492,8 +611,8 @@ function resolveTask(b: Boot, hint: string): Task | undefined {
   return byTitle.length === 1 ? byTitle[0] : undefined;
 }
 
-function eventLine(e: BlueEvent): string {
-  const { label, detail } = describeEvent(e);
+function eventLine(e: BlueEvent, metered: boolean): string {
+  const { label, detail } = describeEvent(e, { metered });
   const head = `${dim(clockTime(e.at))} ${padEnd(label, 12)}`;
   const gutter = ' '.repeat(visibleWidth(head) + 1);
   const [first = '', ...rest] = detail.split('\n');
@@ -548,11 +667,24 @@ async function cmdLog(b: Boot, hint: string | undefined, flags: Flags): Promise<
   out(`${stateGlyph(task.state)} ${bold(task.title)} ${dim(`(${shortId(task.id)})`)}`);
   out(
     dim(
-      `${task.kind} · ${project ? project.name : task.projectId} · ${formatUsd(task.costUsd)} · ${
-        task.reworkCount
-      } rework · created ${relTime(task.createdAt)}`,
+      `${task.kind} · ${project ? project.name : task.projectId} · ${formatTokens(
+        totalTokens(task.tokens.totals),
+      )} tokens · ${task.reworkCount} rework · created ${relTime(task.createdAt)}`,
     ) + `  ${colourState(task.state)}`,
   );
+  // The split, on its own line, because it is the answer to "what did this
+  // cost" that is actually true: which model spent how much of the quota.
+  const byModel = formatTokensByModel(task.tokens.byModel);
+  if (byModel !== '') out(dim('tokens: ') + byModel);
+  if (task.metered) {
+    out(dim(`metered run (ANTHROPIC_API_KEY) · ${formatUsd(task.listPriceUsd)} spent`));
+  } else if (task.listPriceUsd > 0) {
+    out(
+      dim(
+        `Claude subscription run — these tokens drew down your plan's quota and were not billed (${formatUsdEquivalent(task.listPriceUsd)})`,
+      ),
+    );
+  }
   if (task.worktree !== undefined) out(dim(`worktree ${task.worktree}`));
   out('');
 
@@ -572,7 +704,7 @@ async function cmdLog(b: Boot, hint: string | undefined, flags: Flags): Promise<
   if (shown.length < events.length) {
     out(dim(`… ${events.length - shown.length} earlier events hidden`));
   }
-  for (const e of shown) out(eventLine(e));
+  for (const e of shown) out(eventLine(e, task.metered));
 
   if (!flagBool(flags, 'follow', 'f')) {
     out('');
@@ -615,7 +747,7 @@ async function cmdLog(b: Boot, hint: string | undefined, flags: Flags): Promise<
         }
         const belongs =
           ('taskId' in e && e.taskId === task.id) || ('crewId' in e && crewIds.has(e.crewId));
-        if (belongs) out(eventLine(e));
+        if (belongs) out(eventLine(e, task.metered));
       }
     }, 400);
 
@@ -633,7 +765,7 @@ async function cmdLog(b: Boot, hint: string | undefined, flags: Flags): Promise<
 // blue projects
 // ---------------------------------------------------------------------------
 
-function cmdProjects(b: Boot, rest: string[], flags: Flags): number {
+async function cmdProjects(b: Boot, rest: string[], flags: Flags): Promise<number> {
   const sub = rest[0];
 
   if (sub === undefined || sub === 'list' || sub === 'ls') {
@@ -669,6 +801,7 @@ function cmdProjects(b: Boot, rest: string[], flags: Flags): number {
         out(`${dim(shortId(p.id))}  ${dim(truncate(p.description, 100))}`);
       }
     }
+    await printPendingDelivery(b);
     out('');
     return 0;
   }
@@ -684,8 +817,16 @@ function cmdProjects(b: Boot, rest: string[], flags: Flags): number {
       errOut(red(`Not a directory: ${abs}`));
       return 1;
     }
+    // A hard refusal now, where it used to be a warning: registration creates
+    // the integration branch, so a directory git knows nothing about fails a
+    // few lines below with git's wording instead of ours. The registry refuses
+    // it too — this is just the message the captain can act on.
     if (!fs.existsSync(path.join(abs, '.git'))) {
-      errOut(yellow(`Warning: ${abs} has no .git — Crew worktrees need a git repo.`));
+      errOut(red(`Not a git repository root: ${abs}`));
+      errOut(
+        dim('BlueSpace works on repos in place — point it at the directory containing .git.'),
+      );
+      return 1;
     }
 
     const deliveryRaw = flagStr(flags, 'delivery');
@@ -697,12 +838,44 @@ function cmdProjects(b: Boot, rest: string[], flags: Flags): number {
     const name = flagStr(flags, 'name') ?? path.basename(abs);
     const description = flagStr(flags, 'desc', 'description') ?? '';
 
+    // THE DEV BRANCH IS MADE BEFORE THE REGISTRY ENTRY, and a repository that
+    // cannot hold it is never registered at all. Doing it the other way round
+    // would leave a project in the registry that nothing can ever land, and the
+    // refusal would surface inside a merge weeks later instead of here.
+    //
+    // No prompt: `blue/dev` is namespaced precisely so that it cannot collide
+    // with a branch a human already has, which is what makes create-or-adopt
+    // safe to do silently.
+    let devBranch: string;
+    let devNote: string;
+    try {
+      const setup = await ensureIntegrationBranch(
+        new WorktreeManager(abs, { root: b.worktreeRoot }),
+        INTEGRATION_BRANCH,
+      );
+      devBranch = setup.branch;
+      devNote = setup.created
+        ? `created ${setup.branch} off ${setup.base}`
+        : `adopted the existing ${setup.branch}`;
+    } catch (e) {
+      errOut(red(`Could not register: ${errorMessage(e)}`));
+      if (e instanceof DevBranchConflictError) {
+        errOut(
+          dim(
+            'Every BlueSpace branch lives under blue/, so this repository cannot be managed until that name is free.',
+          ),
+        );
+      }
+      return 1;
+    }
+
     const input: {
       name: string;
       path: string;
       description: string;
       delivery?: DeliveryMode;
-    } = { name, path: abs, description };
+      devBranch: string;
+    } = { name, path: abs, description, devBranch };
     if (deliveryRaw !== undefined) input.delivery = deliveryRaw;
 
     try {
@@ -710,6 +883,7 @@ function cmdProjects(b: Boot, rest: string[], flags: Flags): number {
       out('');
       out(`${green('✓')} registered ${bold(project.name)} ${dim(`(${shortId(project.id)})`)}`);
       out(dim(`  ${project.path}  ·  delivery ${project.delivery}`));
+      out(dim(`  ${devNote} — landed work is merged there, never into your default branch`));
       if (project.description.trim() === '') {
         out(
           dim(
@@ -771,11 +945,29 @@ function cmdProjects(b: Boot, rest: string[], flags: Flags): number {
 const EFFORTS: readonly Effort[] = ['low', 'medium', 'high', 'xhigh', 'max'];
 
 function printConfig(config: BlueConfig): void {
+  // Read here rather than stored: this line describes what WOULD happen to a
+  // task dispatched from this shell, which is a property of the environment,
+  // not of the config file. What a past task actually cost is recorded on the
+  // task itself (`Task.metered`).
+  const metered = resolveAuth().kind === 'api-key';
   const rows: Array<[string, string]> = [
     ['permissionMode', config.permissionMode],
     ['model', config.model ?? dim('(harness default)')],
     ['effort', config.effort ?? dim('(harness default)')],
-    ['maxBudgetUsdPerTask', formatUsd(config.maxBudgetUsdPerTask)],
+    [
+      'maxTokensPerTask',
+      config.maxTokensPerTask > 0
+        ? `${config.maxTokensPerTask.toLocaleString('en-US')} ${dim('(the ceiling that stops a task)')}`
+        : red('0 — no token ceiling; nothing stops a runaway task'),
+    ],
+    [
+      'maxBudgetUsdPerTask',
+      `${formatUsd(config.maxBudgetUsdPerTask)} ${dim(
+        metered
+          ? '(enforced — this shell has ANTHROPIC_API_KEY set)'
+          : '(not enforced: no ANTHROPIC_API_KEY, so runs draw on your Claude subscription and cost no dollars)',
+      )}`,
+    ],
     ['maxConcurrentCrew', String(config.maxConcurrentCrew)],
     ['maxRework', String(config.maxRework)],
     ['dataDir', dim(config.dataDir)],
@@ -808,7 +1000,7 @@ function cmdConfig(b: Boot, rest: string[]): number {
     errOut(red('blue config set needs a key and a value.'));
     errOut(
       dim(
-        'Keys: permissionMode, model, effort, maxConcurrentCrew, maxRework, maxBudgetUsdPerTask',
+        'Keys: permissionMode, model, effort, maxConcurrentCrew, maxRework, maxTokensPerTask, maxBudgetUsdPerTask',
       ),
     );
     return 1;
@@ -855,11 +1047,36 @@ function cmdConfig(b: Boot, rest: string[]): number {
       patch[key] = n;
       break;
     }
+    case 'maxTokensPerTask': {
+      const n = Number.parseInt(value, 10);
+      if (!Number.isInteger(n) || n < 0 || String(n) !== value.trim()) {
+        errOut(red(`maxTokensPerTask must be a non-negative integer, got "${value}".`));
+        return 1;
+      }
+      if (n === 0) {
+        // Allowed, because a captain who means it should be able to; said out
+        // loud, because on a subscription this is the ONLY ceiling there is.
+        errOut(
+          yellow(
+            'maxTokensPerTask 0 disables the token ceiling. On a Claude subscription that leaves a task with no consumption ceiling at all.',
+          ),
+        );
+      }
+      patch.maxTokensPerTask = n;
+      break;
+    }
     case 'maxBudgetUsdPerTask': {
       const n = Number.parseFloat(value);
       if (!Number.isFinite(n) || n <= 0) {
         errOut(red(`maxBudgetUsdPerTask must be a positive number, got "${value}".`));
         return 1;
+      }
+      if (resolveAuth().kind !== 'api-key') {
+        errOut(
+          dim(
+            'Note: maxBudgetUsdPerTask only bounds a metered run (ANTHROPIC_API_KEY set). Crews on your Claude subscription spend quota, not dollars — maxTokensPerTask is what stops them.',
+          ),
+        );
       }
       patch.maxBudgetUsdPerTask = n;
       break;
@@ -872,7 +1089,7 @@ function cmdConfig(b: Boot, rest: string[]): number {
       errOut(red(`Unknown config key "${key}".`));
       errOut(
         dim(
-          'Keys: permissionMode, model, effort, maxConcurrentCrew, maxRework, maxBudgetUsdPerTask',
+          'Keys: permissionMode, model, effort, maxConcurrentCrew, maxRework, maxTokensPerTask, maxBudgetUsdPerTask',
         ),
       );
       return 1;
@@ -981,14 +1198,119 @@ async function cmdGc(b: Boot, flags: Flags): Promise<number> {
 }
 
 // ---------------------------------------------------------------------------
+// blue land <taskId>
+// ---------------------------------------------------------------------------
+
+/**
+ * Merge one verified task's branch into the project's integration branch.
+ *
+ * The captain's own hands on the same implementation Helm's `land_task` calls —
+ * `src/land/`. Nothing is decided here: this resolves the task id the way every
+ * other `blue` command does, hands it over, and renders whatever comes back.
+ *
+ * The two outcomes worth reading carefully are the refusals. A task that never
+ * passed verification and a merge that conflicts BOTH change nothing at all, and
+ * both are reported as answers rather than as crashes — with, in the conflict
+ * case, the files to look at.
+ */
+async function cmdLand(b: Boot, hint: string | undefined): Promise<number> {
+  if (hint === undefined || hint === '') {
+    errOut(red('blue land needs a task id.'));
+    errOut(dim('Run `blue ps` to see them.'));
+    return 1;
+  }
+
+  const task = resolveTask(b, hint);
+  if (task === undefined) {
+    errOut(red(`No single task matches "${hint}".`));
+    errOut(dim('Run `blue ps` to see them.'));
+    return 1;
+  }
+
+  try {
+    const report = await landTask(
+      { blackbox: b.blackbox, registry: b.registry, worktreeFor: b.worktreeFor },
+      task.id,
+    );
+
+    out('');
+    if (report.alreadyMerged) {
+      out(
+        `${dim('·')} ${bold(report.title)} ${dim(`(${shortId(report.taskId)})`)} was already in ${cyan(report.devBranch)} ${dim('— nothing changed')}`,
+      );
+    } else {
+      out(
+        `${green('✓')} merged ${cyan(report.branch)} into ${bold(cyan(report.devBranch))} ${dim(`· ${report.commit.slice(0, 12)}`)}`,
+      );
+      out(`  ${dim(report.title)}`);
+    }
+    // Said every time, on purpose: this is the promise the whole design rests
+    // on, and a captain should be able to confirm it at a glance.
+    out(dim(`  ${report.defaultBranch} was not touched — it is reached only by a pull request you open.`));
+    if (report.defaultBranchMoved) {
+      out(
+        yellow(
+          `  note: ${report.defaultBranch} moved while this ran. That is a commit in the repository, not BlueSpace.`,
+        ),
+      );
+    }
+    if (report.adoptedDevBranch) {
+      out(dim(`  ${report.devBranch} is now this project's integration branch (it predates delivery).`));
+    }
+
+    const ahead = report.status.ahead;
+    if (ahead > 0) {
+      out('');
+      out(
+        `${cyan(report.devBranch)} is ${bold(plural(ahead, 'commit'))} ahead of ${report.status.defaultBranch}` +
+          (report.status.behind > 0 ? dim(` · ${plural(report.status.behind, 'commit')} behind`) : ''),
+      );
+      out(dim('  `blue projects` → delivery; ask Helm for the `gh pr create` command when you want it.'));
+    }
+    out('');
+    return 0;
+  } catch (e) {
+    out('');
+    if (e instanceof MergeConflictError) {
+      errOut(`${red('✗')} ${bold('conflict')} — nothing was merged, nothing was changed.`);
+      for (const file of e.files) errOut(`  ${yellow(file)}`);
+      errOut(
+        dim(
+          `  ${e.into} and ${e.branch} are exactly as they were. Resolve it yourself, or task a Crew with the rebase.`,
+        ),
+      );
+      return 1;
+    }
+    if (e instanceof LandRefusedError) {
+      errOut(`${red('✗')} ${errorMessage(e)}`);
+      return 1;
+    }
+    if (e instanceof DevBranchConflictError) {
+      errOut(`${red('✗')} ${errorMessage(e)}`);
+      return 1;
+    }
+    errOut(red(`Could not land: ${errorMessage(e)}`));
+    return 1;
+  }
+}
+
+/** `3 commits` / `1 commit` — the CLI says numbers with their nouns. */
+function plural(n: number, one: string): string {
+  return `${n} ${one}${n === 1 ? '' : 's'}`;
+}
+
+// ---------------------------------------------------------------------------
 // blue mcp
 // ---------------------------------------------------------------------------
 
 /**
- * Hand Helm's tools to the captain's own Claude Code window.
+ * Hand Helm's tools to a Claude Code window.
  *
- * This is the front door: the captain talks to Helm in a window they already
- * had, and BlueSpace is a stdio MCP server it launched. Nothing in this function
+ * Not a command the captain runs: `bluespace` names it in the `--mcp-config` it
+ * passes, and the window spawns it. Left reachable by hand because it is how the
+ * server is debugged, and because a captain who prefers to wire it up their own
+ * way should not be prevented — only warned that tools without `CLAUDE.md` are
+ * half of Helm (see `LAUNCH_COMMAND`). Nothing in this function
  * may print — stdout is the protocol stream from the moment `runMcp` starts, and
  * a single stray line desynchronizes the client into what looks like a hang.
  * `requireClaudeCli` writes to stderr, which is why it is safe here.
@@ -999,7 +1321,14 @@ async function cmdMcp(b: Boot): Promise<number> {
   // stderr, where the client puts it in its MCP log.
   if (!requireClaudeCli()) return 1;
   const { runMcp } = await import('../mcp/index.js');
-  return await runMcp({ orch: b.orch, registry: b.registry });
+  return await runMcp({
+    orch: b.orch,
+    registry: b.registry,
+    // What `land_task` needs to merge and to record the merge. Same log and
+    // same managers the orchestrator uses, so a landed task's merge event sits
+    // in the same stream as the verdict that justified it.
+    deps: { blackbox: b.blackbox, worktreeFor: b.worktreeFor },
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -1022,20 +1351,24 @@ async function cmdMcp(b: Boot): Promise<number> {
  */
 function cmdFrontDoor(): number {
   out('');
-  out(`${bold('BlueSpace')} ${dim('· you talk to Helm in your own Claude Code window')}`);
+  out(`${bold('BlueSpace')} ${dim('· you talk to Helm in a real Claude Code window')}`);
   out('');
-  out('There is no prompt here any more. Helm is an MCP server that your Claude Code');
-  out('window launches, so the session you type into is a real interactive one — which');
-  out(`is the whole point; see ${dim(complianceDoc())}.`);
+  out('There is no prompt here. Helm is a Claude Code session — the levers arrive as an');
+  out('MCP server and the rules as a system prompt, both for that window only — so the');
+  out(`thing you type into is a real interactive session; see ${dim(complianceDoc())}.`);
   out('');
-  out(bold('Set it up once'));
-  out(`  ${cyan(MCP_ADD_COMMAND)}`);
-  // The absolute path is worth the ugly line: `blue` is only on PATH after a
-  // global install, and this is the exact file that is running right now.
-  out(dim(`  blue not on your PATH? Replace \`blue mcp\` with: node ${entryPath()} mcp`));
-  out('');
-  out(bold('Then'));
-  out(`  ${cyan('claude')}${dim('  — in any repo, and say what you want built. Helm briefs the crew.')}`);
+  out(bold('Open it'));
+  out(`  ${cyan(LAUNCH_COMMAND)}${dim('  — in any repo. Nothing to register, nothing left behind.')}`);
+  // The absolute path is worth the ugly line: the bin is only on PATH after a
+  // global install, and this is the package that is running right now.
+  out(dim(`  bluespace not on your PATH? Run: node ${launcherPath()}`));
+  out(dim(`  plain \`claude\` is unchanged — no BlueSpace tools, no BlueSpace rules.`));
+  if (hasUserScopedMcpRegistration()) {
+    out('');
+    out(bold('You still have the old global install'));
+    out(`  ${cyan(REMOVE_COMMAND)}`);
+    out(dim('  it puts the fleet tools in every session you open, with none of Helm’s rules.'));
+  }
   out('');
   out(bold('From this terminal'));
   const rows: Array<[string, string]> = [
@@ -1107,7 +1440,7 @@ async function main(argv: string[]): Promise<number> {
     switch (command) {
       case 'ps':
       case 'status':
-        return cmdPs(b);
+        return await cmdPs(b);
 
       case 'inbox':
         return await runInbox(
@@ -1120,7 +1453,10 @@ async function main(argv: string[]): Promise<number> {
 
       case 'projects':
       case 'project':
-        return cmdProjects(b, positionals.slice(1), flags);
+        return await cmdProjects(b, positionals.slice(1), flags);
+
+      case 'land':
+        return await cmdLand(b, positionals[1]);
 
       case 'config':
         return cmdConfig(b, positionals.slice(1));

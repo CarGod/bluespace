@@ -22,6 +22,15 @@ export type AdapterEvent =
   | { type: 'thinking' }
   | { type: 'tool_use'; toolUseId: string; name: string; input: unknown }
   | { type: 'tool_result'; toolUseId: string; ok: boolean; result?: string }
+  /**
+   * What one message consumed.
+   *
+   * The token counts and `model` are MEASURED — the transcript said so. `costUsd`
+   * is DERIVED: those counts multiplied by a list-price table (`src/pricing`).
+   * It is money only if `HarnessAdapter.metered` is true; on a subscription it is
+   * what the same tokens would have cost on the API. Everything above this layer
+   * accounts in tokens for exactly that reason.
+   */
   | {
       type: 'usage';
       costUsd: number;
@@ -49,7 +58,11 @@ export interface AdapterCapabilities {
   interrupt: boolean;
   /** Can a finished session be resumed or forked from a checkpoint? */
   fork: boolean;
-  /** Does the stream report real token cost? */
+  /**
+   * Does the stream report per-message consumption at all — token counts and
+   * the model that spent them? Whether those tokens are billed in dollars is a
+   * separate question, answered by `HarnessAdapter.metered`.
+   */
   cost: boolean;
   /** Does the stream expose individual tool calls, not just final text? */
   toolEvents: boolean;
@@ -194,6 +207,21 @@ export interface Session {
 export interface HarnessAdapter {
   readonly name: string;
   readonly capabilities: AdapterCapabilities;
+  /**
+   * True when this adapter's runs are BILLED PER TOKEN — an API key, a cloud
+   * provider endpoint, anything that produces an invoice.
+   *
+   * A capability describes what an adapter can do; this describes what its runs
+   * cost, which is a different axis and the one that decides whether a dollar
+   * figure may be shown to the captain at all. On the default path (the
+   * captain's own Claude subscription) tokens draw down a quota and the dollars
+   * `src/pricing` computes are an equivalence, not spend.
+   *
+   * Optional, and absent means NOT metered: an adapter that has not thought
+   * about the question has not earned the right to have its estimates called
+   * money.
+   */
+  readonly metered?: boolean;
   /** Run a one-shot worker (a Crew, or a Sentinel). */
   spawn(req: SpawnRequest): Promise<Session>;
   /**

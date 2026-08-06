@@ -10,13 +10,16 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
   Blackbox,
+  UNKNOWN_MODEL,
   projectAllDecisions,
   projectCost,
   projectCrewLog,
   projectOpenDecisions,
   projectTask,
   projectTasks,
+  projectUsage,
 } from '../src/blackbox/index.js';
+import { totalTokens } from '../src/types/domain.js';
 import type { BlueEvent } from '../src/types/events.js';
 
 let bb: Blackbox;
@@ -295,7 +298,7 @@ describe('projectTasks', () => {
     expect(task?.crewId).toBe('c1');
     expect(task?.worktree).toBe('/tmp/wt/t1');
     expect(task?.reworkCount).toBe(1);
-    expect(task?.costUsd).toBeCloseTo(0.45, 10);
+    expect(task?.listPriceUsd).toBeCloseTo(0.45, 10);
     expect(task?.createdAt).toBe(1_700_000_000_000);
     expect(task?.updatedAt).toBe(landedAt);
 
@@ -312,7 +315,7 @@ describe('projectTasks', () => {
     const tasks = projectTasks(bb.read());
     expect(tasks.size).toBe(2);
     expect(tasks.get('t1')?.state).toBe('queued');
-    expect(tasks.get('t1')?.costUsd).toBe(0);
+    expect(tasks.get('t1')?.listPriceUsd).toBe(0);
     expect(tasks.get('t2')?.state).toBe('failed');
   });
 
@@ -338,8 +341,8 @@ describe('projectTasks', () => {
     });
 
     const tasks = projectTasks(bb.read());
-    expect(tasks.get('t1')?.costUsd).toBe(0);
-    expect(tasks.get('t2')?.costUsd).toBe(0.75);
+    expect(tasks.get('t1')?.listPriceUsd).toBe(0);
+    expect(tasks.get('t2')?.listPriceUsd).toBe(0.75);
   });
 
   it('counts only entries into needs_rework', () => {
@@ -410,11 +413,165 @@ describe('projectCost', () => {
     const modelSum = Object.values(cost.byModel).reduce((a, b) => a + b, 0);
     expect(modelSum).toBeCloseTo(cost.totalUsd, 10);
     // The task projection agrees with the cost projection.
-    expect(projectTasks(bb.read()).get('t1')?.costUsd).toBe(cost.byTask['t1']);
+    expect(projectTasks(bb.read()).get('t1')?.listPriceUsd).toBe(cost.byTask['t1']);
   });
 
   it('returns zeroed totals for an empty log', () => {
     expect(projectCost([])).toEqual({ totalUsd: 0, byTask: {}, byModel: {} });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Token accounting — the primary unit
+// ---------------------------------------------------------------------------
+
+describe('token accounting', () => {
+  it('accumulates a task\'s tokens per model and per kind', () => {
+    // The ground truth in a transcript is `message.usage` and `message.model`.
+    // A task that ran on two models has two answers, and one number covering
+    // both cannot be compared to a quota.
+    createTask('t1');
+    bb.append({ type: 'crew.spawned', crewId: 'c1', taskId: 't1', cwd: '/wt/1' });
+    bb.append({
+      type: 'crew.usage',
+      crewId: 'c1',
+      costUsd: 0.1,
+      inputTokens: 1000,
+      outputTokens: 500,
+      cacheReadTokens: 20_000,
+      cacheCreationTokens: 3000,
+      model: 'claude-opus-5',
+    });
+    bb.append({
+      type: 'crew.usage',
+      crewId: 'c1',
+      costUsd: 0.01,
+      inputTokens: 100,
+      outputTokens: 50,
+      model: 'claude-haiku-4-5',
+    });
+
+    const task = projectTasks(bb.read()).get('t1');
+    expect(task?.tokens.totals).toEqual({
+      input: 1100,
+      output: 550,
+      cacheRead: 20_000,
+      cacheCreation: 3000,
+    });
+    expect(totalTokens(task!.tokens.totals)).toBe(24_650);
+    expect(task?.tokens.byModel['claude-opus-5']).toEqual({
+      input: 1000,
+      output: 500,
+      cacheRead: 20_000,
+      cacheCreation: 3000,
+    });
+    expect(task?.tokens.byModel['claude-haiku-4-5']).toEqual({
+      input: 100,
+      output: 50,
+      cacheRead: 0,
+      cacheCreation: 0,
+    });
+  });
+
+  it('counts a Sentinel\'s tokens against the task it verified', () => {
+    // Verification is not free, and its tokens used to vanish: the verdict
+    // event carried dollars and nothing else, so every token total in the
+    // system — including the ceiling — silently excluded every Sentinel run.
+    createTask('t1');
+    bb.append({ type: 'crew.spawned', crewId: 'c1', taskId: 't1', cwd: '/wt/1' });
+    bb.append({
+      type: 'crew.usage',
+      crewId: 'c1',
+      costUsd: 0.1,
+      inputTokens: 1000,
+      outputTokens: 100,
+      model: 'claude-opus-5',
+    });
+    bb.append({
+      type: 'sentinel.verdict',
+      taskId: 't1',
+      verdictId: 'v1',
+      pass: true,
+      reasoning: 'ok',
+      unmet: [],
+      costUsd: 0.05,
+      tokensByModel: {
+        'claude-opus-5': { input: 4000, output: 200, cacheRead: 0, cacheCreation: 0 },
+      },
+    });
+
+    const task = projectTasks(bb.read()).get('t1');
+    expect(totalTokens(task!.tokens.totals)).toBe(5300);
+    expect(task?.tokens.byModel['claude-opus-5']?.input).toBe(5000);
+  });
+
+  it('buckets tokens with no model under `unknown` rather than dropping them', () => {
+    createTask('t1');
+    bb.append({ type: 'crew.spawned', crewId: 'c1', taskId: 't1', cwd: '/wt/1' });
+    bb.append({ type: 'crew.usage', crewId: 'c1', costUsd: 0, inputTokens: 7, outputTokens: 3 });
+
+    const task = projectTasks(bb.read()).get('t1');
+    expect(task?.tokens.byModel[UNKNOWN_MODEL]).toMatchObject({ input: 7, output: 3 });
+  });
+
+  it('reports a task as unmetered unless its Crew was spawned with an API key', () => {
+    // The flag decides whether anything downstream may call `listPriceUsd`
+    // spend. An event written before the flag existed reads as false, which
+    // errs toward calling a list-price equivalent what it is.
+    createTask('t1');
+    createTask('t2', 'Second');
+    bb.append({ type: 'crew.spawned', crewId: 'c1', taskId: 't1', cwd: '/wt/1' });
+    bb.append({ type: 'crew.spawned', crewId: 'c2', taskId: 't2', cwd: '/wt/2', metered: true });
+
+    const tasks = projectTasks(bb.read());
+    expect(tasks.get('t1')?.metered).toBe(false);
+    expect(tasks.get('t2')?.metered).toBe(true);
+  });
+
+  it('latches metering ON across rework, because that money was really spent', () => {
+    createTask('t1');
+    bb.append({ type: 'crew.spawned', crewId: 'c1', taskId: 't1', cwd: '/wt/1', metered: true });
+    bb.append({ type: 'crew.spawned', crewId: 'c2', taskId: 't1', cwd: '/wt/1', metered: false });
+
+    expect(projectTasks(bb.read()).get('t1')?.metered).toBe(true);
+  });
+
+  it('projectUsage answers for the whole fleet, and only calls it metered if everything was', () => {
+    createTask('t1');
+    createTask('t2', 'Second');
+    bb.append({ type: 'crew.spawned', crewId: 'c1', taskId: 't1', cwd: '/wt/1', metered: true });
+    bb.append({ type: 'crew.spawned', crewId: 'c2', taskId: 't2', cwd: '/wt/2' });
+    bb.append({
+      type: 'crew.usage',
+      crewId: 'c1',
+      costUsd: 0.1,
+      inputTokens: 10,
+      outputTokens: 5,
+      model: 'claude-opus-5',
+    });
+    bb.append({
+      type: 'crew.usage',
+      crewId: 'c2',
+      costUsd: 0.2,
+      inputTokens: 20,
+      outputTokens: 5,
+      cacheReadTokens: 1000,
+      model: 'claude-sonnet-5',
+    });
+
+    const usage = projectUsage(bb.read());
+    expect(usage.total).toBe(1040);
+    expect(usage.byModel['claude-opus-5']).toMatchObject({ input: 10, output: 5 });
+    expect(totalTokens(usage.byTask['t2']!.totals)).toBe(1025);
+    // One subscription run in the fleet, so there is no single spend figure.
+    expect(usage.metered).toBe(false);
+    expect(usage.listPrice.totalUsd).toBeCloseTo(0.3, 10);
+  });
+
+  it('an empty log is not a metered fleet', () => {
+    const usage = projectUsage([]);
+    expect(usage.total).toBe(0);
+    expect(usage.metered).toBe(false);
   });
 });
 

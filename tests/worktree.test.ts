@@ -153,6 +153,24 @@ describe('create', () => {
     await mgr.create(id);
     await expect(mgr.create(id)).rejects.toThrow();
   });
+
+  /**
+   * The same ambiguous-ref class as `hasUnlandedCommits` below, at the other end
+   * of the lifecycle. `git worktree add -b blue/x <path> main` in a repository
+   * that also has a TAG called `main` does not quietly pick one: it exits 128
+   * with "fatal: ambiguous object name: 'main'", and NO Crew can ever be
+   * dispatched against that repository — `add_project` succeeds (it qualifies
+   * its ref) and every task afterwards fails at worktree creation.
+   */
+  it('cuts from the default BRANCH in a repo that also has a tag of that name', async () => {
+    await git(['tag', 'main', 'HEAD'], repoPath);
+    const mainTip = (await git(['rev-parse', 'refs/heads/main'], repoPath)).trim();
+
+    const wt = await mgr.create(taskId());
+
+    expect((await git(['rev-parse', 'HEAD'], wt.path)).trim()).toBe(mainTip);
+    expect((await git(['symbolic-ref', 'HEAD'], wt.path)).trim()).toBe(`refs/heads/${wt.branch}`);
+  });
 });
 
 describe('assertIsolated', () => {

@@ -69,6 +69,105 @@ export function isTerminal(state: TaskState): boolean {
   return TERMINAL_TASK_STATES.includes(state);
 }
 
+// ---------------------------------------------------------------------------
+// Tokens — the only quantity a run actually reports
+// ---------------------------------------------------------------------------
+
+/**
+ * THE PRIMARY UNIT OF CONSUMPTION IN BLUESPACE. Read this before adding a
+ * dollar figure anywhere.
+ *
+ * A Claude Code transcript reports two facts about what a turn consumed:
+ * `message.usage` (four token counts) and `message.model`. That is the whole
+ * ground truth. Dollars are not in it, and on BlueSpace's default and
+ * documented path — the captain's own Claude subscription, see
+ * `docs/compliance.md` — dollars do not exist at all: those tokens draw down a
+ * quota, and no invoice is ever produced for them. `src/pricing/` can say what
+ * the same tokens WOULD cost at API list price, which is a real answer to a
+ * different question and a precise-looking fiction if presented as spend.
+ *
+ * So tokens are what BlueSpace accumulates, ceilings, and reports. Dollars are
+ * derived, labelled, and only shown when the run is actually metered.
+ */
+export interface TokenCounts {
+  input: number;
+  output: number;
+  /** Tokens served from an existing prompt cache. Usually the largest count. */
+  cacheRead: number;
+  /** Tokens written into the prompt cache. */
+  cacheCreation: number;
+}
+
+/** Bucket for tokens whose model the transcript did not name. */
+export const UNKNOWN_MODEL = 'unknown';
+
+export function noTokens(): TokenCounts {
+  return { input: 0, output: 0, cacheRead: 0, cacheCreation: 0 };
+}
+
+/**
+ * All four kinds summed.
+ *
+ * The kinds are NOT interchangeable — a cache read is a tenth of an input token
+ * at list price, and cache reads dominate an agentic run — so this total is a
+ * volume measure, not a value one. It is what `maxTokensPerTask` bounds, which
+ * makes the ceiling honest (it counts what the transcript counts) and blunt
+ * (a cache-heavy task reaches it sooner than an equally expensive uncached one).
+ * That tradeoff is deliberate: the alternative is a weighted total, and a weight
+ * is a price by another name.
+ */
+export function totalTokens(counts: TokenCounts): number {
+  return counts.input + counts.output + counts.cacheRead + counts.cacheCreation;
+}
+
+export function addTokenCounts(a: TokenCounts, b: Partial<TokenCounts>): TokenCounts {
+  return {
+    input: a.input + (b.input ?? 0),
+    output: a.output + (b.output ?? 0),
+    cacheRead: a.cacheRead + (b.cacheRead ?? 0),
+    cacheCreation: a.cacheCreation + (b.cacheCreation ?? 0),
+  };
+}
+
+/**
+ * Tokens accumulated over one or more runs, kept BY MODEL.
+ *
+ * The breakdown is not decoration: "3.1M tokens" answers nothing on its own,
+ * because 3.1M Haiku tokens and 3.1M Opus tokens are different amounts of the
+ * captain's quota. `totals` is the sum of every entry in `byModel`, always.
+ */
+export interface TokenUsage {
+  totals: TokenCounts;
+  byModel: Record<string, TokenCounts>;
+}
+
+export function noTokenUsage(): TokenUsage {
+  return { totals: noTokens(), byModel: {} };
+}
+
+/** Fold one run's counts into a {@link TokenUsage}, returning a new value. */
+export function addTokenUsage(
+  usage: TokenUsage,
+  model: string | undefined,
+  counts: Partial<TokenCounts>,
+): TokenUsage {
+  const key = model !== undefined && model !== '' ? model : UNKNOWN_MODEL;
+  const existing = usage.byModel[key] ?? noTokens();
+  return {
+    totals: addTokenCounts(usage.totals, counts),
+    byModel: { ...usage.byModel, [key]: addTokenCounts(existing, counts) },
+  };
+}
+
+/** Fold two accumulations together — a Sentinel's tokens into its task's. */
+export function mergeTokenUsage(a: TokenUsage, b: TokenUsage): TokenUsage {
+  let out: TokenUsage = { totals: a.totals, byModel: { ...a.byModel } };
+  for (const [model, counts] of Object.entries(b.byModel)) {
+    out = addTokenUsage(out, model, counts);
+  }
+  return out;
+}
+
 export interface Task {
   id: TaskId;
   kind: TaskKind;
@@ -97,8 +196,53 @@ export interface Task {
   artifact?: string;
   /** The one-line outcome recorded with `artifact`; says so when there is none. */
   summary?: string;
-  /** Accumulated USD across every Crew and Sentinel run for this task. */
-  costUsd: number;
+  /**
+   * The integration branch this task's branch was merged into, once the captain
+   * landed it. Absent until then, and absent forever for work that landed
+   * nowhere.
+   *
+   * NOT the same thing as the `landed` state, which means only that verification
+   * is over. This field is the record of an actual git merge, and it is what
+   * entitles `blue gc` to reclaim the worktree: the safe rule is "the commits
+   * are already in the branch they were merged into", and this names that
+   * branch. A task without it is measured against the default branch exactly as
+   * before, which is what keeps landing-nowhere from becoming reclaimable.
+   */
+  mergedInto?: string;
+  /** Commit id of the merge on {@link mergedInto}. */
+  mergeCommit?: string;
+  mergedAt?: number;
+  /**
+   * Tokens consumed by every Crew and Sentinel run for this task, by model.
+   * THE quantity: it is measured, not inferred, and it is what `maxTokensPerTask`
+   * bounds. See {@link TokenCounts}.
+   */
+  tokens: TokenUsage;
+  /**
+   * Whether this task's runs were billed per token.
+   *
+   * True when the Crew was launched with `ANTHROPIC_API_KEY` in the environment
+   * (`resolveAuth` in `src/adapters/claude-cli.ts`), which is the only case where
+   * {@link listPriceUsd} is money anybody is charged. Recorded per task rather
+   * than read from the current environment because it is a fact about the RUN:
+   * `blue ps` may be typed months later, in a shell configured differently, and
+   * "what did this cost" must not change answer because of that.
+   *
+   * False for a task dispatched before this was recorded. A task nobody could
+   * prove was metered is reported as a subscription task, because the failure
+   * that matters is presenting a quota draw-down as spend.
+   */
+  metered: boolean;
+  /**
+   * What {@link tokens} would cost at API list price, per `src/pricing`.
+   *
+   * SPEND ONLY WHEN {@link metered} IS TRUE. On a subscription this is an
+   * equivalence, not a charge — the tokens came out of a quota — and every
+   * surface that prints it must say so. Kept because it is genuinely useful
+   * (it is the one number that compares an Opus task to a Haiku one), and
+   * because an API-key run needs a real cost.
+   */
+  listPriceUsd: number;
   /** Verification attempts so far; bounded by orchestrator config. */
   reworkCount: number;
 }
@@ -167,6 +311,14 @@ export interface DispatchProfile {
    */
   maxBudgetUsd?: number;
   /**
+   * TOKEN ceiling for a single run, and the one denominated in something every
+   * run actually reports. Same advisory status as `maxBudgetUsd` — no
+   * `claude` flag enforces it either — but unlike dollars it is meaningful on
+   * a subscription, so the orchestrator's per-task version of this is the
+   * ceiling that stops a runaway Crew. See `#enforceCeilings`.
+   */
+  maxTokens?: number;
+  /**
    * Cap on agentic turns for a single run. Same story as `maxBudgetUsd`: the SDK
    * enforced it, the interactive CLI has no `--max-turns` at all, and the honest
    * backstop is the adapter's turn timeout.
@@ -210,7 +362,10 @@ export interface Verdict {
   /** Requirements from the brief that the diff does not satisfy. */
   unmet: string[];
   createdAt: number;
-  costUsd: number;
+  /** Tokens the verification consumed, by model. Billed to the task it verified. */
+  tokens: TokenUsage;
+  /** List-price equivalent of {@link tokens}. See `Task.listPriceUsd`. */
+  listPriceUsd: number;
 }
 
 /**
@@ -253,11 +408,16 @@ export const VERDICT_SCHEMA = {
 /**
  * How the captain intends to take delivery of a project's branches.
  *
- * METADATA, NOT BEHAVIOUR. Nothing in BlueSpace pushes, opens a pull request, or
- * merges, and `pr` does not change that — it is context Helm can read when it
- * writes a brief (say, to ask for commits shaped for review). Every task ends the
- * same way in either mode: a local branch in a worktree that the captain moves by
- * hand. `pr` is the default only because it is the commoner intent.
+ * METADATA, NOT BEHAVIOUR. Nothing in BlueSpace pushes or opens a pull request,
+ * and `pr` does not change that — it is context Helm can read when it writes a
+ * brief (say, to ask for commits shaped for review). Every task ends the same way
+ * in either mode: a local branch in a worktree.
+ *
+ * It does not select the delivery path either. There is exactly one, and it is
+ * the same in both modes: the captain says to land a verified task, it is merged
+ * into {@link Project.devBranch}, and reaching the default branch from there is a
+ * pull request they open by hand. `pr` is the default only because it is the
+ * commoner intent.
  */
 export type DeliveryMode = 'pr' | 'local';
 
@@ -272,5 +432,20 @@ export interface Project {
   /** Per-project override of the global permission posture. */
   permissionMode?: PermissionMode;
   defaultBranch?: string;
+  /**
+   * The integration branch every landed task in this project is merged into —
+   * `blue/dev`, created or adopted at registration.
+   *
+   * RECORDED PER PROJECT rather than read from the constant at merge time, so
+   * that renaming `INTEGRATION_BRANCH` in a future version cannot silently
+   * retarget the merges of a project already using the old name. The recorded
+   * value always wins.
+   *
+   * Absent on projects registered before delivery existed. Those are adopted on
+   * first use — the same create-or-adopt rule runs then, and the result is
+   * written back here — rather than being rejected or crashing. See
+   * `src/land/land.ts`.
+   */
+  devBranch?: string;
   addedAt: number;
 }

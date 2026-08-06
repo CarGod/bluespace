@@ -4,7 +4,7 @@
  * BlueSpace used to own a readline REPL and drive Helm through an SDK
  * conversation. It no longer does: the captain talks to Helm in their own
  * interactive Claude Code window, and this module is what puts Helm's levers in
- * that window's hands. The nine `ToolDef`s in `src/agents/helm/tools.ts` are
+ * that window's hands. The `ToolDef`s in `src/agents/helm/tools.ts` are
  * already exactly the shape MCP wants — a name, a prescriptive description, a
  * JSON Schema, and a handler returning text — so this is a transport, not a
  * redesign. It calls those handlers and nothing else.

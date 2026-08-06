@@ -24,9 +24,12 @@ import { requireCapability, type HarnessAdapter, type Session } from '../../adap
 import {
   DEFAULT_PERMISSION_MODE,
   VERDICT_SCHEMA,
+  addTokenUsage,
+  noTokenUsage,
   type DispatchProfile,
   type PermissionMode,
   type Task,
+  type TokenUsage,
   type Verdict,
 } from '../../types/domain.js';
 
@@ -146,7 +149,13 @@ export async function runSentinel(input: RunSentinelInput): Promise<Verdict> {
   const verdictId = randomUUID();
   const prompt = buildSentinelPrompt({ task, diff });
 
-  let costUsd = 0;
+  // Both are accumulated, and they are not the same kind of number: `tokens` is
+  // what the transcript measured, `listPriceUsd` is what `src/pricing` says
+  // those tokens would cost. Verification used to record only the second, so a
+  // Sentinel's tokens were invisible to every token total in the system —
+  // including the ceiling that is supposed to stop a task.
+  let tokens: TokenUsage = noTokenUsage();
+  let listPriceUsd = 0;
   let sawExit = false;
   let exitOk = false;
   let exitReason: string | undefined;
@@ -172,7 +181,13 @@ export async function runSentinel(input: RunSentinelInput): Promise<Verdict> {
 
     for await (const event of session.events()) {
       if (event.type === 'usage') {
-        costUsd += Number.isFinite(event.costUsd) ? event.costUsd : 0;
+        tokens = addTokenUsage(tokens, event.model, {
+          input: event.inputTokens,
+          output: event.outputTokens,
+          cacheRead: event.cacheReadTokens ?? 0,
+          cacheCreation: event.cacheCreationTokens ?? 0,
+        });
+        listPriceUsd += Number.isFinite(event.costUsd) ? event.costUsd : 0;
       } else if (event.type === 'exit') {
         sawExit = true;
         exitOk = event.ok;
@@ -202,7 +217,8 @@ export async function runSentinel(input: RunSentinelInput): Promise<Verdict> {
     reasoning,
     unmet,
     createdAt: Date.now(),
-    costUsd,
+    tokens,
+    listPriceUsd,
   });
 
   if (streamError !== undefined) {
@@ -270,7 +286,8 @@ export async function runSentinel(input: RunSentinelInput): Promise<Verdict> {
     reasoning: value.reasoning,
     unmet: value.pass ? [] : value.unmet,
     createdAt: Date.now(),
-    costUsd,
+    tokens,
+    listPriceUsd,
   };
 }
 
@@ -377,6 +394,7 @@ function sentinelProfile(profile: DispatchProfile): DispatchProfile {
   if (profile.model !== undefined) derived.model = profile.model;
   if (profile.effort !== undefined) derived.effort = profile.effort;
   if (profile.maxBudgetUsd !== undefined) derived.maxBudgetUsd = profile.maxBudgetUsd;
+  if (profile.maxTokens !== undefined) derived.maxTokens = profile.maxTokens;
   return derived;
 }
 

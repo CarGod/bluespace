@@ -8,6 +8,7 @@
 
 export type { BlueConfig } from './config.js';
 export {
+  DEFAULT_MAX_TOKENS_PER_TASK,
   EFFORT_LEVELS,
   PERMISSION_MODES,
   configPath,

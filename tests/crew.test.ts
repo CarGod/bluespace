@@ -10,6 +10,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { buildBrief, NEEDS_DECISION_MARKER } from '../src/agents/crew/index.js';
+import { noTokenUsage } from '../src/types/domain.js';
 import type { Project, Task } from '../src/types/domain.js';
 import type { Worktree } from '../src/worktree/index.js';
 
@@ -40,7 +41,9 @@ function makeTask(overrides: Partial<Task> = {}): Task {
     dependsOn: [],
     createdAt: 0,
     updatedAt: 0,
-    costUsd: 0,
+    tokens: noTokenUsage(),
+    metered: false,
+    listPriceUsd: 0,
     reworkCount: 0,
     ...overrides,
   };

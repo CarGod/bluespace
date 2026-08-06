@@ -14,7 +14,10 @@
  *                       what it renders (THE ONE RULE, session/types.ts).
  *   `src/transcript/` — the event stream, recovered from the JSONL the CLI
  *                       writes to `~/.claude/projects/**​/<uuid>.jsonl`.
- *   `src/pricing/`    — token counts to dollars, injected into the reader.
+ *   `src/pricing/`    — token counts to LIST-PRICE dollars, injected into the
+ *                       reader. Tokens are what the transcript reports and what
+ *                       BlueSpace accounts in; the dollars are an equivalence
+ *                       unless `metered` below is true.
  *
  * THE LAUNCH PROTOCOL, verified empirically against Claude Code 2.1.222 on
  * 2026-08-04. None of it is a documented API; re-verify after every upgrade and
@@ -1228,6 +1231,19 @@ export class ClaudeCliAdapter implements HarnessAdapter {
   readonly name = 'claude-cli';
   readonly capabilities: AdapterCapabilities = CLAUDE_CLI_CAPABILITIES;
 
+  /**
+   * Whether a worker launched by this adapter is billed per token.
+   *
+   * Resolved ONCE, at construction, from the same environment the workers get —
+   * `resolveAuth` over `process.env` merged with `opts.env`, which is the merge
+   * the transcript root already uses, because for a long-lived tmux server this
+   * process's environment is not the worker's. Frozen at construction rather
+   * than read per spawn so that every run of one fleet agrees; a key exported
+   * halfway through an afternoon must not make two tasks in the same log
+   * disagree about what a dollar means.
+   */
+  readonly metered: boolean;
+
   readonly #opts: ClaudeCliAdapterOptions;
   readonly #backend: SessionBackend;
   readonly #transcriptRoot: string;
@@ -1239,9 +1255,9 @@ export class ClaudeCliAdapter implements HarnessAdapter {
     this.#opts = opts;
     this.#backend = opts.backend ?? new TmuxBackend();
     this.#markerDir = opts.markerDir ?? os.tmpdir();
-    this.#transcriptRoot =
-      opts.transcriptRoot ??
-      transcriptRoot({ ...process.env, ...stripUndefined(opts.env ?? {}) } as NodeJS.ProcessEnv);
+    const workerEnv = { ...process.env, ...stripUndefined(opts.env ?? {}) } as NodeJS.ProcessEnv;
+    this.#transcriptRoot = opts.transcriptRoot ?? transcriptRoot(workerEnv);
+    this.metered = resolveAuth(workerEnv).kind === 'api-key';
     this.#claudePath = opts.claudePath;
   }
 

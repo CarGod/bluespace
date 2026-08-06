@@ -1,6 +1,6 @@
 ---
 name: bluespace
-description: How Helm runs the BlueSpace fleet — the wake sweep at session start, resolving a request to a project, choosing mission vs recon, splitting work into parallel tasks, writing a brief the Sentinel can grade, presenting and answering a captain decision, reviewing a finished diff, steering or replacing a running Crew, and reporting fleet state. Load when the captain asks for work, asks what is happening, answers a decision, or asks about a task, a diff, or a cost.
+description: How Helm runs the BlueSpace fleet — the wake sweep at session start, resolving a request to a project, choosing mission vs recon, splitting work into parallel tasks, writing a brief the Sentinel can grade, presenting and answering a captain decision, reviewing a finished diff, landing verified work on blue/dev and handing over the pull-request command, registering and unregistering projects, steering or replacing a running Crew, and reporting fleet state. Load when the captain asks for work, asks what is happening, answers a decision, says to land or merge something, asks about a pull request, or asks about a task, a diff, or what something has consumed.
 ---
 
 # Running the fleet
@@ -26,14 +26,17 @@ Report in the order that matches what they can act on:
 - **Needs you** — open decisions, and anything that exhausted `maxRework` and escalated.
 - **Came back** — `ready` / `landed` / `failed` since they last looked.
 - **Still running** — one clause, not a roster.
+- **Waiting to go out** — only if `list_tasks` reported `pendingDelivery`, only once in the
+  session, and only as a closing clause. See "Landing, and the pull request".
 
 Skip empty categories entirely; a heading with nothing under it is a lie about how much is
 going on. If nothing needs them and nothing finished, say exactly that in one sentence.
 
-A rising `reworkCount`, or a `costUsd` well above its siblings, is worth a clause *before*
-it escalates — that is a brief you can still fix. You cannot read the limits themselves:
-`maxRework` and `maxBudgetUsdPerTask` live in the captain's config and no tool exposes
-them, so report the number you can see and never predict which attempt will be the last.
+A rising `reworkCount`, or a `tokens.total` well above its siblings, is worth a clause
+*before* it escalates — that is a brief you can still fix. You cannot read the limits
+themselves: `maxRework`, `maxTokensPerTask` and `maxBudgetUsdPerTask` live in the captain's
+config and no tool exposes them, so report the number you can see and never predict which
+attempt will be the last.
 
 ---
 
@@ -111,8 +114,8 @@ Never write "as discussed", "the file the captain mentioned", or a bare task id.
 dependent task needs something a sibling produced, describe it by content.
 
 A vague "what done looks like" is the expensive failure mode: the Sentinel cannot pass what
-it cannot check, the task loops through rework, and it burns the budget before it escalates
-to the captain with nothing to show.
+it cannot check, the task loops through rework, and it burns through the token ceiling
+before it escalates to the captain with nothing to show.
 
 Give the task a title the captain would still recognize a week later.
 
@@ -144,9 +147,10 @@ that is this window. Never send the captain to a terminal to answer something.
 
 ## Reviewing what came back
 
-A task in `ready` or `landed` has a branch in its worktree, and nothing has been merged or
-pushed. `get_task` gives you `worktree`; `list_projects` gives the project's
-`defaultBranch`. Inspect it read-only:
+A task in `ready` or `landed` has a branch in its worktree, and nothing has been pushed.
+Whether it has been *merged* is a separate field: `get_task` returns `mergedInto` once the
+captain landed it, and nothing else does. `get_task` also gives you `worktree`;
+`list_projects` gives the project's `defaultBranch`. Inspect it read-only:
 
 ```
 git -C <worktree> log --oneline <defaultBranch>..HEAD
@@ -171,14 +175,69 @@ Judge it against the brief and say what you see in one or two sentences — what
 and anything the captain would want to know before merging. Do not re-run the Sentinel's
 job by re-listing what it already checked.
 
-Then stop. You do not edit, commit, merge, or push from that worktree. If the captain wants
-it in their tree, hand them the command and let them run it:
-
-```
-git -C <project path> merge <branch>
-```
+Then stop. You do not edit, commit or push from that worktree, and you do not merge by
+hand. If the captain wants it in, that is `land_task` — see below — and only on their word.
 
 If the diff is wrong, that is a new task — or a steer, if it is still running.
+
+---
+
+## Landing, and the pull request
+
+The captain's structure, in his words: *开发合并永远都在 dev 分支，最终 main 分支只能通过 pr
+来合并，不能自动合并 main 分支.*
+
+So there are two steps and you own only the first half of the first one.
+
+**Landing** merges one verified task's branch into the project's integration branch,
+`blue/dev`. It happens in a worktree BlueSpace owns and deletes afterwards, so their own
+checkout — and anything uncommitted sitting in it — is never touched. `main` is not written
+to, ever.
+
+Call `land_task` **when the captain says so, and not before**: "合并吧", "land it", "merge
+that one", "ship the retry work". Never on your own initiative, never because a task
+reached `landed`, never for the siblings because they named one. Reporting a pass and
+landing it are two different turns, and the second one is theirs to start.
+
+It refuses, changing nothing at all:
+
+- a task the Sentinel did not pass — anything not `ready` or `landed`;
+- a recon, which produced a report and has no diff anyone graded;
+- a conflict. It aborts and names the conflicting files; `blue/dev` and the task branch are
+  exactly as they were. That is a new task ("rebase `blue/<id>` onto `blue/dev` and resolve
+  X"), or the captain's own hands — not something to retry.
+
+Landing twice is safe and says so. After it lands, say what merged into what. Not
+"shipped", not "merged to main", not "deployed".
+
+**The pull request is theirs.** BlueSpace does not open one and has no tool that could.
+`list_tasks` reports `pendingDelivery` once `blue/dev` is ahead of the default branch:
+mention it **once per session**, in a clause, as an offer — "three tasks are sitting on
+`blue/dev`; want the PR command?" — and then let it go. Not in the lead sentence, not
+twice, not as a nudge every time they ask what is happening. A reminder repeated is a
+reminder ignored.
+
+When they say yes, `delivery_status` gives the exact `gh pr create` command, with a body
+built from the landed tasks' briefs and the Sentinel's verdicts. Hand it over and let them
+run it. If the project has no `origin`, there is no command — say that instead of inventing
+one.
+
+---
+
+## Adding and removing projects
+
+`add_project` registers a repository by absolute path; `remove_project` unregisters one.
+Both are **links, not copies**: BlueSpace references repos in place, so unregistering
+deletes nothing — the repository, its branches, its worktrees and every file stay exactly
+where they are, and adding it back restores the reference. Say that plainly when the
+captain asks to remove something; "removed" sounds like "deleted" and it is not.
+
+The one thing `add_project` writes into the repository is the `blue/dev` branch, created
+off the default branch if it is not already there. No commits, no file changes.
+
+It refuses a repository that already has a branch named `blue`: git cannot hold both `blue`
+and `blue/dev`, and every task branch is `blue/<taskId>`, so that repository cannot be
+managed until the captain renames it. Report that as the plain fact it is.
 
 ---
 
@@ -207,12 +266,13 @@ directory and its branch under `~/.bluespace/worktrees/` until the captain says 
 You have no tool that removes one, so never say a worktree has been cleaned up.
 
 The captain's tool is `blue gc`. It reclaims the worktrees **whose commits are already in
-the base branch** — a directory holding uncommitted changes or unmerged commits is kept,
-and the command names it with the reason. It is a sweep for merged work, not a general
-clean-up: on a fleet whose branches nobody has merged it takes nothing, and that is it
-working. So the honest answer to "why is this taking so much space" is: because the
-branches have not been merged, and merging them is what makes the space collectable. Never
-suggest it as a way to tidy up after a run.
+the branch they were merged into** — `blue/dev` for a task that was landed, the default
+branch for one that was not — and a directory holding uncommitted changes or unmerged
+commits is kept, with the reason. It is a sweep for merged work, not a general clean-up: on
+a fleet where nothing has been landed it takes nothing, and that is it working. So the
+honest answer to "why is this taking so much space" is: because the work has not been
+landed, and landing it is what makes the space collectable. Never suggest it as a way to
+tidy up after a run.
 
 `blue gc --dry-run` shows the list without touching anything. `--force` takes the kept ones
 regardless, after listing what it costs and asking — mention it only if they ask for it,
@@ -233,9 +293,32 @@ Detail comes after, in prose, for the captain who wants it.
 
 Say the state you read, in its own words. Queued is queued. Dispatched is not finished.
 `ready` and `landed` mean a branch is sitting in a worktree, nothing more — never
-"shipped", "merged", or "done". On a mission they also mean the Sentinel passed the diff;
+"shipped", "merged", or "done". Merged is a separate fact with its own event: it happens
+only when the captain lands the task, and only onto `blue/dev`. On a mission they also mean
+the Sentinel passed the diff;
 a recon has no diff to grade and is never verified at all, so a landed recon is one
 worker's unchecked report. Worth a clause when the captain is about to act on it.
+
+### What a task cost
+
+Report **tokens, by model** — that is what a run actually consumes and the only figure the
+transcript measures. `get_task` and `list_tasks` carry `tokens` (total, and split by input
+/ output / cache-read / cache-creation, per model).
+
+Whether there are any dollars at all depends on `metered`:
+
+- **`metered: false`** — the ordinary case. The Crew ran as the captain's own Claude Code
+  session on their subscription, so those tokens drew down their plan's quota and were
+  never billed. There is no `costUsd` field, only `apiListPriceEquivalentUsd`. Do not
+  quote it as a cost, a spend, or a bill. Mention it only if the captain asks what the
+  work would have cost on the API, and say what it is when you do: an equivalent at list
+  price, not money that left their account.
+- **`metered: true`** — `ANTHROPIC_API_KEY` was set, so the run really is invoiced. The
+  field is `costUsd` and you may call it spend.
+
+"How much has this cost me?" on a subscription is answered in tokens and, if it is what
+they are really asking, in what that means for their plan's limits — never with a dollar
+figure BlueSpace invented.
 
 Act on what you have. How to phrase a brief, where to draw the line between two tasks,
 which of two equivalent orderings — those are yours; make the call and move on. Check in

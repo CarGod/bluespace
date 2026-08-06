@@ -20,6 +20,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import type { ToolDef } from '../src/adapters/types.js';
 import { helmTools } from '../src/agents/helm/index.js';
+import type { Blackbox } from '../src/blackbox/index.js';
 import type { ProjectRegistry } from '../src/config/index.js';
 import {
   FrameReader,
@@ -29,6 +30,7 @@ import {
   type McpServerHandle,
 } from '../src/mcp/index.js';
 import type { Orchestrator } from '../src/orchestrator/index.js';
+import { addTokenUsage, noTokenUsage } from '../src/types/domain.js';
 import type { Decision, Project, Task } from '../src/types/domain.js';
 
 // ---------------------------------------------------------------------------
@@ -54,7 +56,9 @@ const TASK: Task = {
   dependsOn: [],
   createdAt: 1_700_000_000_000,
   updatedAt: 1_700_000_000_100,
-  costUsd: 0.5,
+  tokens: addTokenUsage(noTokenUsage(), 'claude-opus-5', { input: 1000, output: 200 }),
+  metered: false,
+  listPriceUsd: 0.5,
   reworkCount: 0,
 };
 
@@ -86,7 +90,20 @@ function fleetTools(): ToolDef[] {
     cancelTask: async () => undefined,
   } as unknown as Orchestrator;
 
-  return helmTools(orch, registry);
+  // The delivery tools need a log and a git manager. This suite is about the
+  // transport, so neither is ever reached: no task.merged event means no
+  // delivery lookup, and nothing here calls land_task.
+  const blackbox = {
+    read: () => [],
+    append: (body: unknown) => body,
+  } as unknown as Blackbox;
+
+  return helmTools(orch, registry, {
+    blackbox,
+    worktreeFor: () => {
+      throw new Error('the transport suite never reaches a repository');
+    },
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -279,7 +296,7 @@ describe('initialize', () => {
 // ---------------------------------------------------------------------------
 
 describe('tools/list', () => {
-  it('serves Helm’s nine levers with their schemas, unmodified', async () => {
+  it('serves Helm’s levers with their schemas, unmodified', async () => {
     const tools = fleetTools();
     const client = connect(tools);
     await client.request('initialize', { protocolVersion: LATEST });
@@ -298,6 +315,10 @@ describe('tools/list', () => {
       'answer_decision',
       'steer_task',
       'cancel_task',
+      'land_task',
+      'delivery_status',
+      'add_project',
+      'remove_project',
     ]);
 
     // Not merely the same names: the same descriptions and the same JSON Schema

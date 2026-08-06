@@ -40,7 +40,8 @@ import {
   pathTo,
   type SentinelRunner,
 } from '../src/orchestrator/index.js';
-import type { Project, Task, TaskState, Verdict } from '../src/types/domain.js';
+import { addTokenUsage, noTokenUsage, totalTokens } from '../src/types/domain.js';
+import type { Project, Task, TaskState, TokenCounts, Verdict } from '../src/types/domain.js';
 import type { BlueEvent } from '../src/types/events.js';
 import type { Worktree, WorktreeManager } from '../src/worktree/index.js';
 
@@ -106,15 +107,27 @@ class FakeSession implements Session {
     wake?.();
   }
 
-  /** A whole Crew turn: some work, a cost, and an exit. */
-  turn(opts: { text?: string; costUsd?: number; ok?: boolean; reason?: string } = {}): void {
+  /** A whole Crew turn: some work, the tokens it burned, and an exit. */
+  turn(
+    opts: {
+      text?: string;
+      costUsd?: number;
+      inputTokens?: number;
+      outputTokens?: number;
+      cacheReadTokens?: number;
+      model?: string;
+      ok?: boolean;
+      reason?: string;
+    } = {},
+  ): void {
     if (opts.text !== undefined) this.push({ type: 'text', text: opts.text });
     this.push({
       type: 'usage',
       costUsd: opts.costUsd ?? 0.01,
-      inputTokens: 1000,
-      outputTokens: 200,
-      model: 'fake-model',
+      inputTokens: opts.inputTokens ?? 1000,
+      outputTokens: opts.outputTokens ?? 200,
+      cacheReadTokens: opts.cacheReadTokens ?? 0,
+      model: opts.model ?? 'fake-model',
     });
     this.push({ type: 'exit', ok: opts.ok ?? true, reason: opts.reason });
   }
@@ -167,6 +180,14 @@ class FakeAdapter implements HarnessAdapter {
   readonly name = 'fake';
 
   capabilities: AdapterCapabilities = { ...ALL_CAPABILITIES };
+
+  /**
+   * Defaults to a SUBSCRIPTION run, because that is BlueSpace's default and
+   * documented path — no API key, so no dollar figure is real. The tests that
+   * exercise the money ceiling flip it, which is the only way that ceiling
+   * applies at all.
+   */
+  metered = false;
 
   readonly spawns: Array<{ request: SpawnRequest; session: FakeSession }> = [];
 
@@ -269,7 +290,8 @@ interface VerdictSpec {
   pass: boolean;
   unmet?: string[];
   reasoning?: string;
-  costUsd?: number;
+  listPriceUsd?: number;
+  tokens?: Partial<TokenCounts>;
 }
 
 interface Harness {
@@ -332,7 +354,12 @@ function harness(
       reasoning: resolved.reasoning ?? (resolved.pass ? 'Satisfies the brief.' : 'Falls short.'),
       unmet: resolved.unmet ?? (resolved.pass ? [] : ['the brief asked for tests']),
       createdAt: Date.now(),
-      costUsd: resolved.costUsd ?? 0.02,
+      tokens: addTokenUsage(
+        noTokenUsage(),
+        'fake-model',
+        resolved.tokens ?? { input: 500, output: 100 },
+      ),
+      listPriceUsd: resolved.listPriceUsd ?? 0.02,
     };
     return verdict;
   };
@@ -344,6 +371,9 @@ function harness(
       // `auto` is the default posture now: it edits and runs commands unattended
       // with no dialog and no machine-wide config write. See types/domain.ts.
       permissionMode: 'auto',
+      // High enough to be out of the way of every test that is not about a
+      // ceiling; the ceiling tests set their own.
+      maxTokensPerTask: 100_000_000,
       maxBudgetUsdPerTask: 25,
       maxConcurrentCrew: 4,
       maxRework: 2,
@@ -541,7 +571,27 @@ describe('dispatch', () => {
     expect(spawn).toBeDefined();
     expect(spawn!.request.profile.permissionMode).toBe('plan');
     expect(spawn!.request.cwd).toBe(h.worktrees.created[0]!.path);
+    // Both ceilings are stated to the adapter. Neither is enforceable by the
+    // interactive CLI, so the orchestrator is what acts on them — but an
+    // adapter that COULD honour them must be told, and a profile that silently
+    // dropped one would make the day someone adds enforcement a surprise.
+    expect(spawn!.request.profile.maxTokens).toBe(100_000_000);
     expect(spawn!.request.profile.maxBudgetUsd).toBe(25);
+  });
+
+  it('records on the run itself whether its tokens are billed', async () => {
+    // Metering is a fact about the run, not about the shell that later reads
+    // the log: `blue ps` in a different environment must not re-decide it.
+    const h = harness();
+    h.adapter.metered = true;
+    const task = newTask(h);
+    await h.orch.tick();
+
+    const spawned = h.bb
+      .read()
+      .find((e: BlueEvent) => e.type === 'crew.spawned' && e.taskId === task.id);
+    expect(spawned && spawned.type === 'crew.spawned' ? spawned.metered : undefined).toBe(true);
+    expect(h.orch.task(task.id)!.metered).toBe(true);
   });
 
   it('records where to attach to the Crew it just started', async () => {
@@ -629,7 +679,7 @@ describe('a mission that works', () => {
     expect(h.sentinelRuns[0]!.diff).toBe(h.worktrees.diffText);
 
     // Crew cost plus verification cost, billed to the task.
-    expect(h.orch.task(task.id)!.costUsd).toBeCloseTo(0.52, 5);
+    expect(h.orch.task(task.id)!.listPriceUsd).toBeCloseTo(0.52, 5);
 
     // A landed task keeps its worktree: the branch is the deliverable.
     expect(h.worktrees.removed).toHaveLength(0);
@@ -858,7 +908,14 @@ describe('rework', () => {
     const elsewhere = new Orchestrator({
       blackbox: h.bb,
       adapter: h.adapter,
-      config: { permissionMode: 'auto', maxBudgetUsdPerTask: 25, maxConcurrentCrew: 4, maxRework: 2, dataDir: DATA_DIR },
+      config: {
+        permissionMode: 'auto',
+        maxTokensPerTask: 100_000_000,
+        maxBudgetUsdPerTask: 25,
+        maxConcurrentCrew: 4,
+        maxRework: 2,
+        dataDir: DATA_DIR,
+      },
       registry: fakeRegistry([h.project]),
       worktreeFor: () => h.worktrees as unknown as WorktreeManager,
     });
@@ -1028,6 +1085,14 @@ describe('cancelTask', () => {
 // Steering and budget
 // ---------------------------------------------------------------------------
 
+/** The `task.failed` reason for a task, or '' — every ceiling test reads it. */
+function failureReason(h: Harness, taskId: string): string {
+  const failure = h.bb
+    .read()
+    .find((e: BlueEvent) => e.type === 'task.failed' && e.taskId === taskId);
+  return failure && failure.type === 'task.failed' ? failure.reason : '';
+}
+
 describe('captain controls', () => {
   it('pushes a steer into the live session', async () => {
     const h = harness();
@@ -1040,8 +1105,70 @@ describe('captain controls', () => {
     await expect(h.orch.steer('nope', 'hello')).rejects.toThrow(/no live crew/);
   });
 
-  it('kills a task that blows its budget', async () => {
+  it('kills a task that blows its TOKEN ceiling, on a subscription, where no dollar ceiling could', async () => {
+    // The default path: no ANTHROPIC_API_KEY, so the adapter is not metered and
+    // the dollars `src/pricing` computes are an equivalence nobody is charged.
+    // A ceiling denominated in them would never be allowed to fire, so tokens
+    // are what stops a runaway Crew.
+    const h = harness({ maxTokensPerTask: 5000, maxBudgetUsdPerTask: 1 });
+    const task = newTask(h);
+
+    await h.orch.tick();
+    const crew = h.adapter.crewFor(task.id);
+    crew.turn({ inputTokens: 4000, outputTokens: 500, cacheReadTokens: 3000, costUsd: 0.001 });
+    await h.orch.whenIdle();
+
+    expect(crew.interrupted).toBe(true);
+    expect(stateOf(h, task.id)).toBe('failed');
+    expect(h.sentinelRuns).toHaveLength(0);
+    const reason = failureReason(h, task.id);
+    expect(reason).toContain('token_ceiling_exceeded');
+    // The message names the number to change and which model burned it —
+    // "7,500 tokens" alone tells a captain nothing actionable.
+    expect(reason).toContain('7,500');
+    expect(reason).toContain('maxTokensPerTask');
+    expect(reason).toContain('fake-model');
+  });
+
+  it('counts cache tokens toward the ceiling, since that is what the transcript counts', async () => {
+    // Cache reads are usually most of an agentic run's tokens. A ceiling that
+    // ignored them would be off by an order of magnitude on every real task.
+    const h = harness({ maxTokensPerTask: 10_000 });
+    const task = newTask(h);
+
+    await h.orch.tick();
+    const crew = h.adapter.crewFor(task.id);
+    crew.turn({ inputTokens: 10, outputTokens: 10, cacheReadTokens: 50_000 });
+    await h.orch.whenIdle();
+
+    expect(stateOf(h, task.id)).toBe('failed');
+    expect(h.orch.task(task.id)!.tokens.byModel['fake-model']?.cacheRead).toBe(50_000);
+  });
+
+  it('does NOT enforce the dollar ceiling on a subscription run — it would be a fiction', async () => {
+    // maxBudgetUsdPerTask is not silently inert: the config loader explains it,
+    // `blue config` annotates it, and README says it. What it must not do is
+    // kill a task over an invoice nobody will ever send.
+    const h = harness({ maxBudgetUsdPerTask: 1, maxTokensPerTask: 100_000_000 });
+    const task = newTask(h);
+
+    await h.orch.tick();
+    const crew = h.adapter.crewFor(task.id);
+    crew.turn({ text: 'Done.', costUsd: 9.5 });
+    await h.orch.whenIdle();
+
+    // It ran to completion and was verified — the $1 ceiling never fired.
+    // (`interrupted` is not the tell here: a landed task is torn down too.)
+    expect(stateOf(h, task.id)).toBe('landed');
+    expect(failureReason(h, task.id)).toBe('');
+    // The number is still accumulated and still labelled — it is just not a kill.
+    expect(h.orch.task(task.id)!.metered).toBe(false);
+    expect(h.orch.task(task.id)!.listPriceUsd).toBeGreaterThan(1);
+  });
+
+  it('kills a metered task that blows its budget — an API key makes the dollars real', async () => {
     const h = harness({ maxBudgetUsdPerTask: 1 });
+    h.adapter.metered = true;
     const task = newTask(h);
 
     await h.orch.tick();
@@ -1052,21 +1179,35 @@ describe('captain controls', () => {
     expect(crew.interrupted).toBe(true);
     expect(stateOf(h, task.id)).toBe('failed');
     expect(h.sentinelRuns).toHaveLength(0);
-    const failure = h.bb
-      .read()
-      .find((e: BlueEvent) => e.type === 'task.failed' && e.taskId === task.id);
-    expect(failure && failure.type === 'task.failed' ? failure.reason : '').toContain(
-      'budget_exceeded',
-    );
+    const reason = failureReason(h, task.id);
+    expect(reason).toContain('budget_exceeded');
+    expect(reason).toContain('maxBudgetUsdPerTask');
+    // And the task carries the metering, so `blue ps` months later still calls
+    // this spend rather than re-deciding from whatever shell it runs in.
+    expect(h.orch.task(task.id)!.metered).toBe(true);
   });
 
-  it('kills the session outright when the budget interrupt fails', async () => {
+  it('lets whichever ceiling trips first stop the task, when both apply', async () => {
+    // Both are enforceable on a metered run. They are independent bounds, not a
+    // pair to reconcile: the first one crossed ends the task and names itself.
+    const h = harness({ maxTokensPerTask: 2000, maxBudgetUsdPerTask: 1000 });
+    h.adapter.metered = true;
+    const task = newTask(h);
+
+    await h.orch.tick();
+    h.adapter.crewFor(task.id).turn({ inputTokens: 5000, outputTokens: 10, costUsd: 0.01 });
+    await h.orch.whenIdle();
+
+    expect(failureReason(h, task.id)).toContain('token_ceiling_exceeded');
+  });
+
+  it('kills the session outright when the ceiling interrupt fails', async () => {
     // The ceiling latches after one attempt, so a swallowed interrupt is a
     // ceiling that logs a line and stops nothing: the Crew keeps spending until
     // the turn timeout, hours later, with the captain told it was capped. This
     // turn NEVER emits an exit — reaching `failed` at all proves the escalation
     // ended the run rather than something downstream tidying up afterwards.
-    const h = harness({ maxBudgetUsdPerTask: 1 });
+    const h = harness({ maxTokensPerTask: 1000 });
     const task = newTask(h);
 
     await h.orch.tick();
@@ -1075,16 +1216,22 @@ describe('captain controls', () => {
       throw new Error('tmux went away');
     };
 
-    crew.push({ type: 'usage', costUsd: 9.5, inputTokens: 1000, outputTokens: 200 });
-    await until(() => stateOf(h, task.id) === 'failed', 'the over-budget crew is stopped');
+    crew.push({ type: 'usage', costUsd: 9.5, inputTokens: 9000, outputTokens: 200 });
+    await until(() => stateOf(h, task.id) === 'failed', 'the over-ceiling crew is stopped');
 
     expect(crew.closed, 'a failed interrupt left the crew running').toBe(true);
-    const failure = h.bb
-      .read()
-      .find((e: BlueEvent) => e.type === 'task.failed' && e.taskId === task.id);
-    expect(failure && failure.type === 'task.failed' ? failure.reason : '').toContain(
-      'budget_exceeded',
-    );
+    expect(failureReason(h, task.id)).toContain('token_ceiling_exceeded');
+  });
+
+  it('disables the ceiling at 0 rather than treating it as "no tokens allowed"', async () => {
+    const h = harness({ maxTokensPerTask: 0, maxBudgetUsdPerTask: 0 });
+    const task = newTask(h);
+
+    await h.orch.tick();
+    h.adapter.crewFor(task.id).turn({ text: 'Done.', inputTokens: 10_000_000 });
+    await h.orch.whenIdle();
+
+    expect(stateOf(h, task.id)).toBe('landed');
   });
 });
 

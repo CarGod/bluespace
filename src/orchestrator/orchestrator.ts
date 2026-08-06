@@ -39,6 +39,7 @@ import type { BlueConfig, ProjectRegistry } from '../config/index.js';
 import type { Worktree, WorktreeManager } from '../worktree/index.js';
 import {
   isTerminal,
+  totalTokens,
   type CrewId,
   type Decision,
   type DecisionId,
@@ -50,6 +51,7 @@ import {
   type TaskId,
   type TaskKind,
   type TaskState,
+  type TokenCounts,
   type Verdict,
 } from '../types/domain.js';
 import type { BlueEventBody } from '../types/events.js';
@@ -217,8 +219,13 @@ interface LiveCrew {
   baseBranch: string;
   /** True while a pump loop is draining this session; guards double-pumping. */
   pumping: boolean;
-  /** Set when the task blew its budget, so the exit is reported honestly. */
-  overBudget: boolean;
+  /**
+   * Why a ceiling stopped this task, in the captain's words — set once, by
+   * `#enforceCeilings`, so `#afterExit` reports the stop honestly instead of
+   * blaming the interrupt it had to send. Undefined while the task is within
+   * its ceilings, which is also the latch that keeps the kill from firing twice.
+   */
+  ceilingBreach: string | undefined;
   /** Set by cancelTask so a racing pump does not resurrect the task. */
   closed: boolean;
 }
@@ -518,7 +525,7 @@ export class Orchestrator {
         worktrees,
         baseBranch,
         pumping: false,
-        overBudget: false,
+        ceilingBreach: undefined,
         closed: false,
       };
       this.#live.set(task.id, live);
@@ -582,6 +589,12 @@ export class Orchestrator {
         // processes with nothing but the log — can only learn where to attach if
         // we write it down at spawn. Undefined for a headless adapter.
         attachCommand: session.attachCommand,
+        // Whether this run's tokens are billed per token, recorded WITH the run
+        // rather than looked up when someone reads the log. A captain who
+        // exports an API key next week must not retroactively turn this week's
+        // subscription tasks into spend, and one who unsets it must not turn
+        // real charges into "free". See `HarnessAdapter.metered`.
+        metered: this.#metered(),
       },
     ]);
 
@@ -596,8 +609,24 @@ export class Orchestrator {
     };
     if (cfg.model !== undefined) profile.model = cfg.model;
     if (cfg.effort !== undefined) profile.effort = cfg.effort;
+    if (cfg.maxTokensPerTask > 0) profile.maxTokens = cfg.maxTokensPerTask;
+    // Stated for an adapter that can enforce it; on a subscription it is not
+    // even a meaningful number, which is why `#enforceCeilings` only acts on it
+    // for a metered run.
     if (cfg.maxBudgetUsdPerTask > 0) profile.maxBudgetUsd = cfg.maxBudgetUsdPerTask;
     return profile;
+  }
+
+  /**
+   * Is a run launched by this fleet billed per token?
+   *
+   * Asked of the adapter rather than of `process.env`, because the adapter is
+   * what knows the environment its workers actually get (a long-lived tmux
+   * server does not inherit this process's). An adapter that declares nothing is
+   * treated as unmetered: see `HarnessAdapter.metered`.
+   */
+  #metered(): boolean {
+    return this.#deps.adapter.metered === true;
   }
 
   // -----------------------------------------------------------------------
@@ -692,7 +721,7 @@ export class Orchestrator {
               cacheCreationTokens: event.cacheCreationTokens,
               model: event.model,
             });
-            this.#enforceBudget(live);
+            this.#enforceCeilings(live);
             break;
 
           case 'exit':
@@ -744,12 +773,9 @@ export class Orchestrator {
     // context, and stop pumping until resolveDecision() wakes it.
     if (task.state === 'awaiting_decision') return 'stop';
 
-    if (live.overBudget) {
+    if (live.ceilingBreach !== undefined) {
       await this.#teardown(taskId, { removeWorktree: false });
-      this.#failTask(
-        taskId,
-        `budget_exceeded: task cost passed the $${this.#deps.config.maxBudgetUsdPerTask} ceiling`,
-      );
+      this.#failTask(taskId, live.ceilingBreach);
       return 'stop';
     }
 
@@ -822,7 +848,11 @@ export class Orchestrator {
         pass: verdict.pass,
         reasoning: verdict.reasoning,
         unmet: [...verdict.unmet],
-        costUsd: verdict.costUsd,
+        // Both, and in that order of importance: the tokens are what the
+        // verification actually consumed and what the task's ceiling counts,
+        // the dollars are `src/pricing`'s equivalent of them.
+        tokensByModel: { ...verdict.tokens.byModel },
+        costUsd: verdict.listPriceUsd,
       });
       return verdict;
     } catch (err) {
@@ -1034,42 +1064,79 @@ export class Orchestrator {
   }
 
   // -----------------------------------------------------------------------
-  // Budget
+  // Ceilings
   // -----------------------------------------------------------------------
 
   /**
-   * THE ONLY COST CEILING THAT EXISTS. It used to be the second of two.
+   * THE ONLY CONSUMPTION CEILING THAT EXISTS. It used to be the second of two.
    *
-   * `DispatchProfile.maxBudgetUsd` is still threaded to the adapter, and an
-   * adapter that can enforce a per-run ceiling still should — but the one
-   * BlueSpace runs on cannot: an interactive Claude Code session has no
-   * `--max-turns`, and `--max-budget-usd` only works with `--print`, which is
+   * `DispatchProfile.maxTokens` / `maxBudgetUsd` are still threaded to the
+   * adapter, and an adapter that can enforce a per-run ceiling still should —
+   * but the one BlueSpace runs on cannot: an interactive Claude Code session has
+   * no `--max-turns`, and `--max-budget-usd` only works with `--print`, which is
    * the non-interactive mode `docs/compliance.md` forbids. So the belt is gone
    * and this is the braces.
    *
-   * Which makes the shape of this check the thing to understand rather than
-   * tidy: it fires on a `usage` event, and usage arrives when a message
-   * completes, so the ceiling is crossed BEFORE it is noticed. A task can
-   * overshoot by roughly one message — and, for a Crew that delegates, by
-   * whatever its subagents spent during the turn, since those land at the end of
-   * the turn (see `src/adapters/claude-cli.ts`, header 6). It is a ceiling with
-   * overshoot, not a hard stop, and calling it anything else would be a lie the
-   * captain pays for.
+   * TWO CEILINGS, AND WHICH ONE APPLIES IS NOT A PREFERENCE:
    *
-   * WHAT IT MAY NOT DO IS FAIL QUIETLY. `overBudget` is latched, so this runs
+   *   `maxTokensPerTask` is checked on EVERY run. Tokens are what the transcript
+   *   reports, so this ceiling is measured rather than modelled, and it is the
+   *   only one that means anything on the default path — a Claude subscription,
+   *   where tokens draw down a quota and no dollar figure exists to bound.
+   *
+   *   `maxBudgetUsdPerTask` is checked ONLY when the run is metered (an
+   *   `ANTHROPIC_API_KEY` is in play). There it bounds real money and is exactly
+   *   as accurate as `src/pricing`'s table. On a subscription it is deliberately
+   *   not enforced: killing a task over an invoice nobody will ever send is a
+   *   ceiling denominated in fiction, and the config loader says so in words
+   *   rather than leaving the setting to look effective.
+   *
+   * When both apply, WHICHEVER TRIPS FIRST STOPS THE TASK — they are independent
+   * bounds on the same run, not a pair to reconcile, and the failure names the
+   * one that fired so the captain knows which number to change.
+   *
+   * The shape of the check is the thing to understand rather than tidy: it fires
+   * on a `usage` event, and usage arrives when a message completes, so a ceiling
+   * is crossed BEFORE it is noticed. A task can overshoot by roughly one message
+   * — and, for a Crew that delegates, by whatever its subagents spent during the
+   * turn, since those land at the end of the turn (see
+   * `src/adapters/claude-cli.ts`, header 6). It is a ceiling with overshoot, not
+   * a hard stop, and calling it anything else would be a lie the captain pays
+   * for.
+   *
+   * WHAT IT MAY NOT DO IS FAIL QUIETLY. `ceilingBreach` latches, so this runs
    * once per task; if the one interrupt it sends is swallowed, nothing tries
    * again and the Crew keeps spending until the turn timeout hours later —
    * a ceiling that logged a line and stopped nothing. So a failed interrupt
    * escalates to closing the session outright, which the wait loop sees
    * immediately.
    */
-  #enforceBudget(live: LiveCrew): void {
-    const cap = this.#deps.config.maxBudgetUsdPerTask;
-    if (!(cap > 0) || live.overBudget) return;
+  #enforceCeilings(live: LiveCrew): void {
+    if (live.ceilingBreach !== undefined) return;
+    const cfg = this.#deps.config;
     const task = this.task(live.taskId);
-    if (!task || task.costUsd <= cap) return;
+    if (!task) return;
 
-    live.overBudget = true;
+    const used = totalTokens(task.tokens.totals);
+    let breach: string | undefined;
+    if (cfg.maxTokensPerTask > 0 && used > cfg.maxTokensPerTask) {
+      breach =
+        `token_ceiling_exceeded: task used ${used.toLocaleString('en-US')} tokens ` +
+        `(${describeByModel(task.tokens.byModel)}), past the ` +
+        `${cfg.maxTokensPerTask.toLocaleString('en-US')} maxTokensPerTask ceiling`;
+    } else if (
+      this.#metered() &&
+      cfg.maxBudgetUsdPerTask > 0 &&
+      task.listPriceUsd > cfg.maxBudgetUsdPerTask
+    ) {
+      breach =
+        `budget_exceeded: metered run passed the $${cfg.maxBudgetUsdPerTask} ` +
+        `maxBudgetUsdPerTask ceiling ($${task.listPriceUsd.toFixed(2)} at list price, ` +
+        `${used.toLocaleString('en-US')} tokens)`;
+    }
+    if (breach === undefined) return;
+
+    live.ceilingBreach = breach;
     this.#track(
       (async () => {
         try {
@@ -1078,16 +1145,16 @@ export class Orchestrator {
             return;
           }
         } catch (err) {
-          this.#log(`budget interrupt ${live.taskId}`, err);
+          this.#log(`ceiling interrupt ${live.taskId}`, err);
         }
         // Either the adapter cannot interrupt, or the interrupt failed. Killing
         // the session is the blunter instrument and the only one left; the
         // stream still drains and the exit is still reported honestly, because
-        // `overBudget` is what `#afterExit` reads, not the exit reason.
+        // `ceilingBreach` is what `#afterExit` reads, not the exit reason.
         try {
           await live.session.close();
         } catch (err) {
-          this.#log(`budget close ${live.taskId}`, err);
+          this.#log(`ceiling close ${live.taskId}`, err);
         }
       })(),
     );
@@ -1318,6 +1385,23 @@ function reportFileName(taskId: TaskId): string {
 /** ENOENT, whatever wrapper it arrives in. A missing report is not an error. */
 function isNotFound(err: unknown): boolean {
   return typeof err === 'object' && err !== null && (err as { code?: unknown }).code === 'ENOENT';
+}
+
+/**
+ * `claude-opus-5 4.1M, claude-haiku-4-5 900k` — the per-model split, for a
+ * failure message.
+ *
+ * Named in the failure because "5,102,331 tokens" does not tell a captain what
+ * to change, and which model burned them usually does. Biggest first, and only
+ * the models that actually ran.
+ */
+function describeByModel(byModel: Record<string, TokenCounts>): string {
+  const parts = Object.entries(byModel)
+    .map(([model, counts]) => ({ model, total: totalTokens(counts) }))
+    .filter((p) => p.total > 0)
+    .sort((a, b) => b.total - a.total)
+    .map((p) => `${p.model} ${p.total.toLocaleString('en-US')}`);
+  return parts.length > 0 ? parts.join(', ') : 'no model reported';
 }
 
 function byCreation(a: Task, b: Task): number {

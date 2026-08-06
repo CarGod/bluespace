@@ -8,9 +8,9 @@
  *
  * Two things happen for as long as the pipe is open:
  *
- *  1. The nine `ToolDef`s are served, verbatim. `helmTools(orch, registry)` is
- *     called once and handed straight to the transport — a fork of those
- *     handlers would be a second control surface that drifts from the first.
+ *  1. Helm's `ToolDef`s are served, verbatim. `helmTools(...)` is called once
+ *     and handed straight to the transport — a fork of those handlers would be
+ *     a second control surface that drifts from the first.
  *
  *  2. The orchestrator's dispatch loop runs. `create_task` only enqueues; if
  *     nothing is turning the crank, every task the captain asks for sits in
@@ -21,7 +21,7 @@
  * captures into its MCP log.
  */
 
-import { helmTools } from '../agents/helm/index.js';
+import { helmTools, type HelmToolDeps } from '../agents/helm/index.js';
 import type { ProjectRegistry } from '../config/index.js';
 import type { Orchestrator } from '../orchestrator/index.js';
 import { MCP_SERVER_NAME, serveMcp } from './server.js';
@@ -29,6 +29,12 @@ import { MCP_SERVER_NAME, serveMcp } from './server.js';
 export interface RunMcpOptions {
   orch: Orchestrator;
   registry: ProjectRegistry;
+  /**
+   * What the delivery tools need: the log to record a merge in, and the git
+   * managers to perform it with. Threaded from `blue mcp`, which already has
+   * both — see `boot()` in `src/cli/index.ts`.
+   */
+  deps: HelmToolDeps;
   /**
    * Run the dispatch loop for the lifetime of the connection. Default true;
    * false is for a second `blue mcp` attached to the same data directory, where
@@ -49,13 +55,13 @@ export interface RunMcpOptions {
  * BlueSpace has is a fold over that log rather than something held here.
  */
 export async function runMcp(options: RunMcpOptions): Promise<number> {
-  const { orch, registry } = options;
+  const { orch, registry, deps } = options;
   const orchestrate = options.orchestrate !== false;
 
   if (orchestrate) orch.start();
 
   const serveOptions: Parameters<typeof serveMcp>[0] = {
-    tools: helmTools(orch, registry),
+    tools: helmTools(orch, registry, deps),
     serverName: MCP_SERVER_NAME,
   };
   if (options.input !== undefined) serveOptions.input = options.input;

@@ -18,5 +18,6 @@ export {
   projectOpenDecisions,
   projectTask,
   projectTasks,
+  projectUsage,
 } from './projections.js';
-export type { CostProjection } from './projections.js';
+export type { CostProjection, UsageProjection } from './projections.js';

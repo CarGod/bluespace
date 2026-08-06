@@ -17,16 +17,35 @@
  * so Helm can read the message and correct itself.
  */
 
+import * as path from 'node:path';
+
 import type { ToolDef } from '../../adapters/types.js';
-import type { Decision, Project, Task, TaskKind, TaskState } from '../../types/domain.js';
+import { totalTokens } from '../../types/domain.js';
+import type {
+  Decision,
+  DeliveryMode,
+  Project,
+  Task,
+  TaskKind,
+  TaskState,
+} from '../../types/domain.js';
+import type { Blackbox } from '../../blackbox/index.js';
 import type { ProjectRegistry } from '../../config/index.js';
+import { landTask, pendingDelivery, type LandDeps, type PendingDelivery } from '../../land/index.js';
 import type { Orchestrator } from '../../orchestrator/index.js';
+import {
+  INTEGRATION_BRANCH,
+  ensureIntegrationBranch,
+  type WorktreeManager,
+} from '../../worktree/index.js';
 
 // ---------------------------------------------------------------------------
 // Schema vocabulary (mirrors src/types/domain.ts)
 // ---------------------------------------------------------------------------
 
 const TASK_KINDS = ['mission', 'recon'] as const satisfies readonly TaskKind[];
+
+const DELIVERY_MODES = ['pr', 'local'] as const satisfies readonly DeliveryMode[];
 
 const TASK_STATES = [
   'queued',
@@ -115,6 +134,13 @@ function requireEnum<T extends string>(
   return value;
 }
 
+function optionalString(input: Record<string, unknown>, field: string): string | undefined {
+  const value = input[field];
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== 'string') throw new Error(`${field} must be a string.`);
+  return value.trim() === '' ? undefined : value;
+}
+
 function optionalStringArray(
   input: Record<string, unknown>,
   field: string,
@@ -152,6 +178,51 @@ function projectView(p: Project): Record<string, unknown> {
     description: p.description,
     delivery: p.delivery,
     defaultBranch: p.defaultBranch,
+    // Where landed work is merged to. Absent on a project registered before
+    // delivery existed; it is adopted the first time something lands there.
+    devBranch: p.devBranch,
+  };
+}
+
+/**
+ * What a task consumed, in the only unit that is measured.
+ *
+ * The dollar figure is deliberately keyed DIFFERENTLY depending on whether the
+ * run was metered, rather than carrying one `costUsd` field with a caveat
+ * beside it. A caveat is something a model can skim; a key named
+ * `apiListPriceEquivalentUsd` cannot be reported as spend without noticing.
+ * On the default path — the captain's Claude subscription — those tokens drew
+ * down a plan quota and no dollar amount was ever charged.
+ */
+function usageView(t: Task): Record<string, unknown> {
+  const tokens = {
+    total: totalTokens(t.tokens.totals),
+    input: t.tokens.totals.input,
+    output: t.tokens.totals.output,
+    cacheRead: t.tokens.totals.cacheRead,
+    cacheCreation: t.tokens.totals.cacheCreation,
+    byModel: Object.fromEntries(
+      Object.entries(t.tokens.byModel).map(([model, c]) => [
+        model,
+        { total: totalTokens(c), ...c },
+      ]),
+    ),
+  };
+  if (t.metered) {
+    return {
+      tokens,
+      metered: true,
+      costUsd: usd(t.listPriceUsd),
+      costNote:
+        'Metered run (ANTHROPIC_API_KEY): this is real spend, priced from BlueSpace\'s own list-price table.',
+    };
+  }
+  return {
+    tokens,
+    metered: false,
+    apiListPriceEquivalentUsd: usd(t.listPriceUsd),
+    costNote:
+      'NOT a cost. This task ran on the captain\'s Claude subscription, where tokens draw down a plan quota and are never billed in dollars. Report tokens by model; quote the equivalent only if asked what the same work would cost on the API.',
   };
 }
 
@@ -164,7 +235,7 @@ function taskView(t: Task, projectName?: string): Record<string, unknown> {
     projectId: t.projectId,
     project: projectName,
     dependsOn: t.dependsOn,
-    costUsd: usd(t.costUsd),
+    ...usageView(t),
     reworkCount: t.reworkCount,
     crewId: t.crewId,
     worktree: t.worktree,
@@ -173,6 +244,10 @@ function taskView(t: Task, projectName?: string): Record<string, unknown> {
     // `artifact` is the report archived out of it.
     artifact: t.artifact,
     outcome: t.summary,
+    // Merged is not the same as landed, and Helm has to be able to tell the
+    // captain which one happened. Absent until `land_task` merged the branch.
+    mergedInto: t.mergedInto,
+    mergedAt: iso(t.mergedAt),
     createdAt: iso(t.createdAt),
     updatedAt: iso(t.updatedAt),
   };
@@ -191,6 +266,38 @@ function decisionView(d: Decision): Record<string, unknown> {
   };
 }
 
+/**
+ * The same accounting for a whole fleet. Split by metering rather than summed:
+ * a fleet with one API-key task and twenty subscription ones has no single
+ * dollar figure, and adding them would report the quota draw-down as money.
+ */
+function fleetUsageView(tasks: Task[]): Record<string, unknown> {
+  let total = 0;
+  const byModel: Record<string, number> = {};
+  let meteredUsd = 0;
+  let unmeteredUsd = 0;
+  for (const t of tasks) {
+    total += totalTokens(t.tokens.totals);
+    for (const [model, c] of Object.entries(t.tokens.byModel)) {
+      byModel[model] = (byModel[model] ?? 0) + totalTokens(c);
+    }
+    if (t.metered) meteredUsd += t.listPriceUsd;
+    else unmeteredUsd += t.listPriceUsd;
+  }
+  return {
+    totalTokens: total,
+    tokensByModel: byModel,
+    ...(meteredUsd > 0 ? { meteredCostUsd: usd(meteredUsd) } : {}),
+    ...(unmeteredUsd > 0
+      ? {
+          subscriptionApiListPriceEquivalentUsd: usd(unmeteredUsd),
+          subscriptionNote:
+            'Subscription tasks have no dollar cost; the figure above is what their tokens would cost at API list price.',
+        }
+      : {}),
+  };
+}
+
 function countByState(tasks: Task[]): Record<string, number> {
   const counts: Record<string, number> = {};
   for (const t of tasks) {
@@ -199,19 +306,92 @@ function countByState(tasks: Task[]): Record<string, number> {
   return counts;
 }
 
+/**
+ * The pull-request reminder, in its short form.
+ *
+ * Carried on `list_tasks` because that is the tool Helm must call before saying
+ * anything about the fleet: a reminder that rides on a tool nobody is obliged to
+ * call is a reminder that never arrives. The `gh` command deliberately is NOT
+ * here — see `delivery_status` — because it is long, and because the captain has
+ * not asked for it yet at the moment this fires.
+ */
+function deliveryView(entries: PendingDelivery[]): Record<string, unknown> | undefined {
+  if (entries.length === 0) return undefined;
+  return {
+    projects: entries.map((d) => ({
+      projectId: d.projectId,
+      project: d.project,
+      devBranch: d.devBranch,
+      defaultBranch: d.defaultBranch,
+      landedTasksNotInDefaultBranch: d.tasks,
+      commitsAhead: d.commits,
+      commitsBehind: d.behind,
+    })),
+    note:
+      'Verified work is merged and waiting on a pull request the captain opens by hand — BlueSpace ' +
+      'does not open one. Worth ONE clause the first time you notice it in a session, phrased as an ' +
+      'offer, not a prompt. Do not repeat it, and never make it the lead. Call delivery_status when ' +
+      'they want the command.',
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Public surface
 // ---------------------------------------------------------------------------
 
 /**
- * Helm's nine tools, described vendor-neutrally.
+ * What the tools need beyond the orchestrator and the registry.
+ *
+ * Only the delivery tools use these — landing is the one thing Helm does that
+ * reaches a real repository, and it needs a git manager to do it and the log to
+ * record it. Required rather than optional: a tool surface that silently loses
+ * `land_task` because a caller forgot an argument is worse than a compile error.
+ */
+export interface HelmToolDeps {
+  /** The append-only log. `land_task` records the merge here. */
+  blackbox: Blackbox;
+  /** The same per-project managers the orchestrator dispatches with. */
+  worktreeFor(projectPath: string): WorktreeManager;
+}
+
+/**
+ * Helm's tools, described vendor-neutrally.
  *
  * `src/mcp/run.ts` hands them straight to the stdio server, which is what puts
  * them in the captain's Claude Code window as `mcp__bluespace__*`. Nothing here
  * knows that; a second transport would need no change on this side.
+ *
+ * Thirteen of them now, and exactly two reach the captain's repository at all:
+ * `land_task`, the only tool in BlueSpace's history that writes a COMMIT, and
+ * `add_project`, which creates the `blue/dev` ref and nothing else. That count
+ * is the same one `CLAUDE.md` states as Helm's boundary; if a third ever writes,
+ * both have to change together. `remove_project` writes only to BlueSpace's own
+ * registry, described so plainly that Helm can promise the captain, truthfully,
+ * that unregistering a project does not touch a single file in it.
  */
-export function helmTools(orch: Orchestrator, registry: ProjectRegistry): ToolDef[] {
+export function helmTools(
+  orch: Orchestrator,
+  registry: ProjectRegistry,
+  deps: HelmToolDeps,
+): ToolDef[] {
   const nameOf = (projectId: string): string | undefined => registry.get(projectId)?.name;
+  const landDeps: LandDeps = {
+    blackbox: deps.blackbox,
+    registry,
+    worktreeFor: deps.worktreeFor,
+  };
+
+  /** Best effort: a git failure must never take down a plain fleet read. */
+  const delivery = async (projectId?: string): Promise<PendingDelivery[]> => {
+    try {
+      return await pendingDelivery(
+        landDeps,
+        projectId === undefined ? {} : { projectId },
+      );
+    } catch {
+      return [];
+    }
+  };
 
   const listProjects: ToolDef = {
     name: 'list_projects',
@@ -307,9 +487,10 @@ export function helmTools(orch: Orchestrator, registry: ProjectRegistry): ToolDe
   const listTasks: ToolDef = {
     name: 'list_tasks',
     description: [
-      'List tasks across the whole fleet with their state, project, cost and dependencies.',
+      'List tasks across the whole fleet with their state, project, token usage by model, and dependencies.',
       'Call this before answering any question about what is running, what finished, or what is stuck, and before reporting progress — so what you tell the captain matches what is actually true.',
       'Pass state to narrow to one lifecycle stage.',
+      'It also reports pendingDelivery when landed work is sitting on a project\'s integration branch and is not in the default branch yet — that is the pull-request reminder; read the note it carries before mentioning it.',
     ].join(' '),
     inputSchema: object({
       state: enumOf(TASK_STATES, 'Optional lifecycle filter. Omit to see the whole fleet.'),
@@ -318,11 +499,13 @@ export function helmTools(orch: Orchestrator, registry: ProjectRegistry): ToolDe
       const state = optionalEnum(input, 'state', TASK_STATES);
       const all = orch.tasks();
       const tasks = state === undefined ? all : all.filter((t) => t.state === state);
+      const pending = deliveryView(await delivery());
       return ok({
         filter: state ?? 'all',
         count: tasks.length,
         byState: countByState(all),
-        totalCostUsd: usd(all.reduce((sum, t) => sum + t.costUsd, 0)),
+        ...fleetUsageView(all),
+        ...(pending !== undefined ? { pendingDelivery: pending } : {}),
         tasks: tasks.map((t) => taskView(t, nameOf(t.projectId))),
       });
     },
@@ -331,7 +514,7 @@ export function helmTools(orch: Orchestrator, registry: ProjectRegistry): ToolDe
   const getTask: ToolDef = {
     name: 'get_task',
     description: [
-      'Fetch one task in full: its current state, brief, accumulated cost, rework count, worktree, dependencies, and once it has landed, its artifact and outcome.',
+      'Fetch one task in full: its current state, brief, tokens consumed by model, rework count, worktree, dependencies, and once it has landed, its artifact and outcome.',
       'Call this when the captain asks about a specific piece of work, and before saying that any single task is finished — the state here is the only thing that entitles you to say so.',
       "artifact is the deliverable: the branch name for a mission, and for a recon the path of the report, which was archived out of the worktree and is what you should read. Prefer it over worktree, which is a directory `blue gc` may have reclaimed. A landed recon with no artifact wrote no report — say that rather than guessing.",
     ].join(' '),
@@ -422,6 +605,181 @@ export function helmTools(orch: Orchestrator, registry: ProjectRegistry): ToolDe
     },
   };
 
+  // -------------------------------------------------------------------------
+  // Delivery — the only tools that reach a real repository
+  // -------------------------------------------------------------------------
+
+  const landTaskTool: ToolDef = {
+    name: 'land_task',
+    description: [
+      "Merge one verified task's branch into its project's integration branch (`blue/dev`), in a temporary worktree BlueSpace owns and deletes afterwards.",
+      'Call this ONLY when the captain has said to land it — "合并吧", "land it", "merge that one". Never on your own initiative, never because a task looks finished, and never for several tasks because they asked about one.',
+      'IT NEVER TOUCHES THE DEFAULT BRANCH. Nothing in BlueSpace merges into main; main is reached only through a pull request the captain opens by hand. It also never touches the captain\'s own checkout — the merge happens in a separate worktree, so uncommitted work in their working copy is not at risk.',
+      'It REFUSES, changing nothing: a task the Sentinel did not pass (anything not ready or landed), a recon (it produced a report, not a diff, and nothing verified it), a task whose project is no longer registered, and any merge that conflicts — a conflict aborts and reports the conflicting files, leaving both branches exactly as they were.',
+      'Those refusals are NOT a licence to call it and let it decide. The one thing they do not cover is the only one that matters here: a merge the captain did not ask for succeeds, and it is a real commit in their repository.',
+      'Re-landing the SAME task is harmless — the second call reports the branch is already contained and merges nothing. That is idempotence, not permission to land anything else.',
+      'After it lands, say what merged and into what, and never call it shipped, pushed, deployed or merged to main.',
+    ].join(' '),
+    inputSchema: object(
+      { taskId: str('Task id of a verified (ready or landed) mission.') },
+      ['taskId'],
+    ),
+    handler: async (input) => {
+      const taskId = requireString(input, 'taskId');
+      const report = await landTask(landDeps, taskId);
+      return ok({
+        landed: {
+          taskId: report.taskId,
+          title: report.title,
+          project: report.project,
+          branch: report.branch,
+          mergedInto: report.devBranch,
+          mergeCommit: report.commit,
+          alreadyMerged: report.alreadyMerged,
+          repo: report.repoPath,
+        },
+        untouched: {
+          defaultBranch: report.defaultBranch,
+          note: `${report.defaultBranch} was not written to. Landing never merges into it.`,
+          ...(report.defaultBranchMoved
+            ? {
+                warning: `${report.defaultBranch} moved while this merge ran — that is someone committing in the repository, not BlueSpace.`,
+              }
+            : {}),
+        },
+        ...(report.adoptedDevBranch
+          ? {
+              adoptedDevBranch: `${report.devBranch} is now recorded as this project's integration branch; it was registered before delivery existed.`,
+            }
+          : {}),
+        pendingDelivery: {
+          devBranch: report.devBranch,
+          defaultBranch: report.status.defaultBranch,
+          commitsAhead: report.status.ahead,
+          commitsBehind: report.status.behind,
+          note: 'Say what landed. Mention the pull request only as an offer, and only once per session — call delivery_status if they want the command.',
+        },
+      });
+    },
+  };
+
+  const deliveryStatus: ToolDef = {
+    name: 'delivery_status',
+    description: [
+      "Report what is waiting to be delivered: the landed tasks sitting on each project's integration branch that the default branch does not have yet, with their briefs, the Sentinel's verdicts, and the exact `gh pr create` command that opens the pull request.",
+      'Call this when the captain asks about a pull request, asks what is waiting to go out, says to open one, or when they take up a reminder you raised from list_tasks.',
+      'BlueSpace does NOT open the pull request. Hand the captain the command and let them run it; there is no tool here that pushes or opens one.',
+      'An empty result means nothing is waiting — say that rather than inventing a reason.',
+    ].join(' '),
+    inputSchema: object({
+      projectId: str('Optional project id. Omit for every project with work waiting.'),
+    }),
+    handler: async (input) => {
+      const projectId = optionalString(input, 'projectId');
+      const entries = await pendingDelivery(landDeps, {
+        detail: true,
+        ...(projectId !== undefined ? { projectId } : {}),
+      });
+      return ok({
+        count: entries.length,
+        projects: entries,
+        note:
+          entries.length === 0
+            ? 'Nothing is waiting for delivery: no landed task is sitting on an integration branch outside the default branch.'
+            : 'prCommand is for the captain to run in their own shell. BlueSpace does not push and does not open pull requests.',
+      });
+    },
+  };
+
+  // -------------------------------------------------------------------------
+  // Fleet management — registry metadata, and nothing but
+  // -------------------------------------------------------------------------
+
+  const addProject: ToolDef = {
+    name: 'add_project',
+    description: [
+      'Register a git repository with BlueSpace so tasks can be created against it, by absolute path.',
+      'Call this when the captain gives you a path and asks for it to be added, or when a request names a repository that resolve_project does not know.',
+      'THIS REGISTERS A REFERENCE. BlueSpace works on repos in place: it does not copy, move, clone, modify or delete the repository, and it does not change any file in it. The one thing it writes is the `blue/dev` integration branch, created off the default branch if it is not already there — a branch ref, no commits, no working-tree changes.',
+      'It refuses a path that is not a git repository root, one already registered, and a repository with a branch named `blue` (git cannot hold both `blue` and `blue/dev`, and every task branch is `blue/<taskId>`) — the captain has to rename that branch first.',
+      'A description is worth insisting on: it is what resolve_project routes ambiguous requests by.',
+    ].join(' '),
+    inputSchema: object(
+      {
+        path: str('Absolute path to the repository root — the directory containing .git.'),
+        name: str('Short name the captain uses for it. Defaults to the directory name.'),
+        description: str(
+          'What the project is, in one line. Used to route ambiguous requests; ask for it if the captain did not say.',
+        ),
+        delivery: enumOf(
+          DELIVERY_MODES,
+          "How the captain takes delivery. Metadata only — nothing here pushes or opens a PR. Defaults to 'pr'.",
+        ),
+      },
+      ['path'],
+    ),
+    handler: async (input) => {
+      const repoPath = requireString(input, 'path');
+      const name = optionalString(input, 'name');
+      const description = optionalString(input, 'description') ?? '';
+      const deliveryMode = optionalEnum(input, 'delivery', DELIVERY_MODES);
+
+      // The branch is made BEFORE the registry write, so a repository that
+      // cannot hold `blue/dev` is never registered at all — the refusal happens
+      // here, once, rather than inside the first merge weeks later.
+      const setup = await ensureIntegrationBranch(
+        deps.worktreeFor(repoPath),
+        INTEGRATION_BRANCH,
+      );
+
+      const project = registry.add({
+        // The registry insists on a name; the directory is the one the captain
+        // would have used anyway, and they can rename it later.
+        name: name ?? path.basename(path.resolve(repoPath)),
+        path: repoPath,
+        description,
+        ...(deliveryMode !== undefined ? { delivery: deliveryMode } : {}),
+        devBranch: setup.branch,
+      });
+
+      return ok({
+        registered: projectView(project),
+        devBranch: setup.created
+          ? `created ${setup.branch} off ${setup.base}`
+          : `adopted the existing ${setup.branch}`,
+        note: 'The repository was not moved, copied or modified. BlueSpace references it in place.',
+      });
+    },
+  };
+
+  const removeProject: ToolDef = {
+    name: 'remove_project',
+    description: [
+      'Unregister a project: BlueSpace forgets where the repository is and stops offering it as a destination for work.',
+      'Call this ONLY when the captain has asked for the project itself to be unregistered — "remove that project", "unlink it", "deregister it", "stop tracking that repo", "别管这个项目了". Never on your own initiative.',
+      'Pausing is not unregistering. "Stop working on X", "park that for now", "deprioritise it", "cancel that task" are all about WORK, not about the registry: answer them with cancel_task or with nothing at all. Unregistering is what breaks every task id already pointing at it, and the captain did not ask for that.',
+      'THIS DELETES NOTHING. It removes one entry from BlueSpace\'s own registry file. The repository, its branches (including `blue/dev` and any `blue/<taskId>`), its worktrees, its history and every file in it are left exactly as they are — you can tell the captain that plainly. add_project puts it straight back.',
+      'Two consequences worth saying out loud: tasks already in the log keep pointing at a project id that no longer resolves, and `blue gc` stops managing that repository\'s worktrees, so any disk they hold stays held until it is registered again.',
+    ].join(' '),
+    inputSchema: object({ projectId: str('Project id from list_projects or resolve_project.') }, [
+      'projectId',
+    ]),
+    handler: async (input) => {
+      const projectId = requireString(input, 'projectId');
+      const project = registry.get(projectId);
+      if (!project) {
+        throw new Error(
+          `No project with id ${projectId}. Use list_projects to see the registered ids.`,
+        );
+      }
+      registry.remove(projectId);
+      return ok({
+        unregistered: projectView(project),
+        note: `BlueSpace no longer references ${project.path}. Nothing on disk was moved, modified or deleted.`,
+      });
+    },
+  };
+
   return [
     listProjects,
     resolveProject,
@@ -432,5 +790,9 @@ export function helmTools(orch: Orchestrator, registry: ProjectRegistry): ToolDe
     answerDecision,
     steerTask,
     cancelTask,
+    landTaskTool,
+    deliveryStatus,
+    addProject,
+    removeProject,
   ];
 }

@@ -12,17 +12,33 @@
  * re-sorts a copy so a hand-assembled or merged array can't corrupt the fold.
  */
 
+import {
+  addTokenCounts,
+  addTokenUsage,
+  noTokenUsage,
+  noTokens,
+  totalTokens,
+  UNKNOWN_MODEL,
+} from '../types/domain.js';
 import type {
   CrewId,
   Decision,
   Task,
   TaskId,
   TaskState,
+  TokenCounts,
+  TokenUsage,
 } from '../types/domain.js';
 import type { BlueEvent } from '../types/events.js';
 
-/** Bucket for costs whose model the harness did not report. */
-export const UNKNOWN_MODEL = 'unknown';
+/**
+ * Bucket for tokens whose model the harness did not report.
+ *
+ * Re-exported rather than redeclared: the fold here and the accumulator in
+ * types/domain.ts must agree on the key, or a task's `byModel` would carry two
+ * spellings of "we don't know".
+ */
+export { UNKNOWN_MODEL } from '../types/domain.js';
 
 /**
  * Money is accumulated as floating point, so 0.1 + 0.2 must not surface as
@@ -35,6 +51,23 @@ function round(usd: number): number {
 
 function bySeq(events: BlueEvent[]): BlueEvent[] {
   return [...events].sort((a, b) => a.seq - b.seq);
+}
+
+/**
+ * A `crew.usage` event's four counts, in the domain's vocabulary.
+ *
+ * The event's names are the harness's (`inputTokens`, `cacheReadTokens`, …) and
+ * two of them are optional, because an older transcript carried neither cache
+ * field. Missing is read as zero rather than as unknown: the alternative is a
+ * total that cannot be added up.
+ */
+function usageTokens(e: Extract<BlueEvent, { type: 'crew.usage' }>): TokenCounts {
+  return {
+    input: e.inputTokens,
+    output: e.outputTokens,
+    cacheRead: e.cacheReadTokens ?? 0,
+    cacheCreation: e.cacheCreationTokens ?? 0,
+  };
 }
 
 /**
@@ -60,9 +93,15 @@ function crewOwners(events: BlueEvent[]): Map<CrewId, TaskId> {
  * Fold the log into the current Task for every task ever created.
  *
  * Contributing events: task.created, task.dispatched, task.state_changed,
- * task.completed, task.failed, crew.usage, sentinel.verdict. `updatedAt` is the
- * `at` of the last such event, so it answers "when did this task last actually
- * move", not "when did a crew last print a line".
+ * task.completed, task.failed, crew.spawned, crew.usage, sentinel.verdict.
+ * `updatedAt` is the `at` of the last such event, so it answers "when did this
+ * task last actually move", not "when did a crew last print a line".
+ *
+ * Consumption is folded TWICE, into two fields that are not the same kind of
+ * thing: `tokens` (measured, per model, the ceiling's unit) and `listPriceUsd`
+ * (derived from a price table, and money only when `metered`). Nothing here
+ * decides which of them to show a human — that is a reporting decision, and the
+ * `metered` flag is projected so every reporter can make it the same way.
  */
 export function projectTasks(events: BlueEvent[]): Map<TaskId, Task> {
   const ordered = bySeq(events);
@@ -104,7 +143,9 @@ export function projectTasks(events: BlueEvent[]): Map<TaskId, Task> {
           dependsOn: [...e.dependsOn],
           createdAt: e.at,
           updatedAt: e.at,
-          costUsd: 0,
+          tokens: noTokenUsage(),
+          metered: false,
+          listPriceUsd: 0,
           reworkCount: 0,
         });
         break;
@@ -116,6 +157,21 @@ export function projectTasks(events: BlueEvent[]): Map<TaskId, Task> {
         task.crewId = e.crewId;
         task.worktree = e.worktree;
         transition(task, 'dispatched');
+        break;
+      }
+
+      case 'crew.spawned': {
+        // Only `metered` is read here; the task's crew id comes from
+        // task.dispatched, which is written in the same batch.
+        //
+        // LATCHED ON, never off: a task whose first Crew ran on an API key and
+        // whose rework Crew ran on a subscription did spend real money, and a
+        // reader that flipped the flag back would report that spend as free.
+        // The reverse (one metered run in a mostly-subscription task) overstates
+        // what is spend, which is the error that costs a captain nothing.
+        const task = tasks.get(e.taskId);
+        if (!task) break;
+        if (e.metered === true) task.metered = true;
         break;
       }
 
@@ -145,10 +201,25 @@ export function projectTasks(events: BlueEvent[]): Map<TaskId, Task> {
         break;
       }
 
+      case 'task.merged': {
+        // NOT a state change: `landed` already means verification is over, and a
+        // merge is a separate fact about the captain's repository. It is folded
+        // onto the task because it is the only thing that can tell a later sweep
+        // which branch this task's commits actually reached — see
+        // `Task.mergedInto` and `src/worktree/reclaim.ts`.
+        const task = touch(e.taskId, e.at);
+        if (!task) break;
+        task.mergedInto = e.into;
+        task.mergeCommit = e.commit;
+        task.mergedAt = e.at;
+        break;
+      }
+
       case 'crew.usage': {
         const task = touch(owners.get(e.crewId), e.at);
         if (!task) break;
-        task.costUsd = round(task.costUsd + e.costUsd);
+        task.tokens = addTokenUsage(task.tokens, e.model, usageTokens(e));
+        task.listPriceUsd = round(task.listPriceUsd + e.costUsd);
         break;
       }
 
@@ -156,7 +227,10 @@ export function projectTasks(events: BlueEvent[]): Map<TaskId, Task> {
         // Verification is billed to the task it verified, not to the crew.
         const task = touch(e.taskId, e.at);
         if (!task) break;
-        task.costUsd = round(task.costUsd + e.costUsd);
+        for (const [model, counts] of Object.entries(e.tokensByModel ?? {})) {
+          task.tokens = addTokenUsage(task.tokens, model, counts);
+        }
+        task.listPriceUsd = round(task.listPriceUsd + e.costUsd);
         break;
       }
 
@@ -246,8 +320,71 @@ function byOpenedOldestFirst(a: DecisionFold, b: DecisionFold): number {
 }
 
 // ---------------------------------------------------------------------------
-// Cost
+// Consumption — tokens first, dollars derived
 // ---------------------------------------------------------------------------
+
+/**
+ * Fleet-wide token consumption: the honest answer to "what has this cost me".
+ *
+ * `metered` is the flag that decides whether {@link listPrice} may be called
+ * spend. It is true only if EVERY run in the log was launched with an API key —
+ * a fleet that mixes a metered run with subscription ones has no single dollar
+ * figure, and quoting the sum as spend would overstate the invoice by whatever
+ * the subscription runs "cost". Mixed fleets report tokens and, if they insist
+ * on dollars, a labelled equivalent.
+ */
+export interface UsageProjection {
+  totals: TokenCounts;
+  /** Total across all four kinds — what `maxTokensPerTask` counts. */
+  total: number;
+  byModel: Record<string, TokenCounts>;
+  byTask: Record<string, TokenUsage>;
+  metered: boolean;
+  /** Derived from the counts above by `src/pricing`, at spawn time. */
+  listPrice: CostProjection;
+}
+
+export function projectUsage(events: BlueEvent[]): UsageProjection {
+  const ordered = bySeq(events);
+  const owners = crewOwners(ordered);
+
+  let totals: TokenCounts = noTokens();
+  const byModel: Record<string, TokenCounts> = {};
+  const byTask: Record<string, TokenUsage> = {};
+
+  let sawRun = false;
+  let allMetered = true;
+
+  const addTo = (taskId: string | undefined, model: string | undefined, counts: TokenCounts): void => {
+    const key = model !== undefined && model !== '' ? model : UNKNOWN_MODEL;
+    totals = addTokenCounts(totals, counts);
+    byModel[key] = addTokenCounts(byModel[key] ?? noTokens(), counts);
+    if (taskId === undefined) return;
+    byTask[taskId] = addTokenUsage(byTask[taskId] ?? noTokenUsage(), key, counts);
+  };
+
+  for (const e of ordered) {
+    if (e.type === 'crew.spawned') {
+      sawRun = true;
+      if (e.metered !== true) allMetered = false;
+    } else if (e.type === 'crew.usage') {
+      addTo(owners.get(e.crewId), e.model, usageTokens(e));
+    } else if (e.type === 'sentinel.verdict') {
+      for (const [model, counts] of Object.entries(e.tokensByModel ?? {})) {
+        addTo(e.taskId, model, counts);
+      }
+    }
+  }
+
+  return {
+    totals,
+    total: totalTokens(totals),
+    byModel,
+    byTask,
+    metered: sawRun && allMetered,
+    listPrice: projectCost(ordered),
+  };
+}
 
 export interface CostProjection {
   totalUsd: number;
@@ -256,13 +393,18 @@ export interface CostProjection {
 }
 
 /**
- * Total spend, split by task and by model. Sentinel verdicts are billed to the
- * task they verified; since the harness does not report a model for structured
- * verdicts they land in the `unknown` model bucket, which keeps
- * `sum(byModel) === totalUsd` true.
+ * The LIST-PRICE EQUIVALENT of everything in the log, split by task and by model.
+ *
+ * Not spend unless `projectUsage(...).metered` is true — on a subscription these
+ * tokens drew down a quota and were never invoiced. Callers that print this
+ * without checking are the bug this whole module was reshaped to prevent.
+ *
+ * Sentinel verdicts are billed to the task they verified; since the verdict
+ * event carries dollars without a model split they land in the `unknown` model
+ * bucket, which keeps `sum(byModel) === totalUsd` true.
  *
  * Crew usage from a crew that was never observed spawning still counts toward
- * the total — the money was spent — but cannot be attributed to a task.
+ * the total — the tokens were spent — but cannot be attributed to a task.
  */
 export function projectCost(events: BlueEvent[]): CostProjection {
   const ordered = bySeq(events);

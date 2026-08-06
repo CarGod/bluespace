@@ -92,6 +92,14 @@ function parseProject(value: unknown): Project | undefined {
   if (typeof r.defaultBranch === 'string' && r.defaultBranch !== '') {
     project.defaultBranch = r.defaultBranch;
   }
+  // Absent in every entry written before delivery existed. Left absent rather
+  // than defaulted to the current constant: a project is adopted (and this
+  // written) the first time something lands, so the recorded value always
+  // describes a branch that was actually created or found, never one that a
+  // reader assumed. See `Project.devBranch`.
+  if (typeof r.devBranch === 'string' && r.devBranch !== '') {
+    project.devBranch = r.devBranch;
+  }
   return project;
 }
 
@@ -280,7 +288,18 @@ export class ProjectRegistry {
    * must contain a `.git` entry — a directory for a normal clone, a file for a
    * worktree or submodule checkout).
    */
-  add(input: { name: string; path: string; description: string; delivery?: DeliveryMode }): Project {
+  add(input: {
+    name: string;
+    path: string;
+    description: string;
+    delivery?: DeliveryMode;
+    /**
+     * The integration branch, already created or adopted in the repository by
+     * the caller (`ensureIntegrationBranch`). This registry is metadata only —
+     * it never runs git — so the branch is made first and recorded here.
+     */
+    devBranch?: string;
+  }): Project {
     this.#refresh();
 
     const name = input.name.trim();
@@ -329,13 +348,25 @@ export class ProjectRegistry {
       delivery: input.delivery ?? 'pr',
       addedAt: Date.now(),
     };
+    if (input.devBranch !== undefined && input.devBranch.trim() !== '') {
+      project.devBranch = input.devBranch.trim();
+    }
 
     this.#projects.push(project);
     this.#persist();
     return { ...project };
   }
 
-  /** Forget a project. Idempotent: removing an unknown id is a no-op. */
+  /**
+   * Forget a project — a pure metadata operation.
+   *
+   * This filters an array and writes a JSON file. It does not move, modify or
+   * delete the repository, its branches, its worktrees or anything else on disk;
+   * BlueSpace references repos in place, so unregistering one is exactly as
+   * destructive as deleting a bookmark. `add()` puts it straight back.
+   *
+   * Idempotent: removing an unknown id is a no-op.
+   */
   remove(id: ProjectId): void {
     this.#refresh();
     const next = this.#projects.filter((p) => p.id !== id);
@@ -347,7 +378,12 @@ export class ProjectRegistry {
   /** Patch the mutable fields of a registered project. */
   update(
     id: ProjectId,
-    patch: Partial<Pick<Project, 'name' | 'description' | 'delivery' | 'permissionMode' | 'defaultBranch'>>,
+    patch: Partial<
+      Pick<
+        Project,
+        'name' | 'description' | 'delivery' | 'permissionMode' | 'defaultBranch' | 'devBranch'
+      >
+    >,
   ): Project {
     this.#refresh();
     const index = this.#projects.findIndex((p) => p.id === id);
@@ -361,6 +397,9 @@ export class ProjectRegistry {
     if (patch.delivery !== undefined) next.delivery = patch.delivery;
     if (patch.permissionMode !== undefined) next.permissionMode = patch.permissionMode;
     if (patch.defaultBranch !== undefined) next.defaultBranch = patch.defaultBranch;
+    if (patch.devBranch !== undefined && patch.devBranch.trim() !== '') {
+      next.devBranch = patch.devBranch.trim();
+    }
     this.#projects[index] = next;
     this.#persist();
     return { ...next };

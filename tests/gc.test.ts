@@ -18,6 +18,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 
 import { runGc, type GcDeps } from '../src/cli/gc.js';
 import { setColourEnabled } from '../src/cli/format.js';
+import { noTokenUsage } from '../src/types/domain.js';
 import type { Project, Task, TaskState } from '../src/types/domain.js';
 import { WorktreeManager, type Worktree } from '../src/worktree/index.js';
 
@@ -75,7 +76,9 @@ function task(id: string, state: TaskState, worktree: string): Task {
     dependsOn: [],
     createdAt: 1,
     updatedAt: 2,
-    costUsd: 0,
+    tokens: noTokenUsage(),
+    metered: false,
+    listPriceUsd: 0,
     reworkCount: 0,
     worktree,
   };

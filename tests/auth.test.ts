@@ -23,6 +23,7 @@ import {
   CLI_PATH_ENV,
   ClaudeCliUnavailableError,
   assertClaudeCliAvailable,
+  createClaudeCliAdapter,
   resolveAuth,
 } from '../src/adapters/claude-cli.js';
 
@@ -63,6 +64,21 @@ describe('resolveAuth', () => {
 
   it('never throws — reporting the mode is its only job', () => {
     expect(() => resolveAuth(env())).not.toThrow();
+  });
+});
+
+describe('adapter metering', () => {
+  // Whether a run is metered is what decides if a dollar figure may ever be
+  // shown as spend. It is answered by the adapter, from the environment its
+  // WORKERS get — not by whatever shell reads the log afterwards.
+  it('is metered when a key reaches the workers', () => {
+    expect(createClaudeCliAdapter({ env: { ANTHROPIC_API_KEY: 'sk-ant-abc' } }).metered).toBe(true);
+  });
+
+  it('is NOT metered on a subscription login, so its dollars are only an equivalence', () => {
+    // An empty string overrides an ambient key on a developer machine, and
+    // `resolveAuth` reads blank as absent — the same as no key at all.
+    expect(createClaudeCliAdapter({ env: { ANTHROPIC_API_KEY: '' } }).metered).toBe(false);
   });
 });
 

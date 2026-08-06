@@ -6,6 +6,14 @@
  *
  *   **Once the code is merged into its git branch, the worktree can be deleted.**
  *
+ * "Its git branch" is the one the work was actually merged INTO, which since
+ * delivery exists is normally `blue/dev` rather than `main` — a landed task sits
+ * on the integration branch until the captain opens a pull request, and judging
+ * it against `main` would keep every landed worktree forever. The base comes
+ * from the task's own `task.merged` record and from nowhere else; a task with no
+ * such record is judged against the default branch, exactly as before. See
+ * `considerWorktree`.
+ *
  * `WorktreeManager.remove()` already decides that, correctly and fail-closed.
  * What was missing was anything that CALLED it that way: every terminal path in
  * the orchestrator passes `removeWorktree: false`, so the directory count only
@@ -34,8 +42,11 @@ import * as path from 'node:path';
 import { isTerminal, type Task, type TaskId, type TaskState } from '../types/domain.js';
 import {
   DirtyWorktreeError,
+  INTEGRATION_BRANCH,
   UnlandedCommitsError,
   git,
+  localBranchRef,
+  type BranchRef,
   type Worktree,
   type WorktreeManager,
 } from './manager.js';
@@ -63,6 +74,22 @@ export type KeepReason =
    * Crew's commits can sit on no branch at all.
    */
   | { kind: 'not-ours' }
+  /**
+   * A checkout of an INTEGRATION branch, not of a task branch.
+   *
+   * Never removed, at any force level, because `remove()` reaps a branch it has
+   * proven merged — and the integration branch is fully merged into the default
+   * branch for the whole window after the captain's pull request lands. That is
+   * the garbage collector deleting `blue/dev`, on the one day of the cycle when
+   * it looks most reclaimable.
+   *
+   * `WorktreeManager.list()` already drops the `blue/dev` CONSTANT; this covers
+   * what a constant cannot. The reason `Project.devBranch` is recorded per
+   * project at all is that the constant may change — and the day it does, every
+   * project still on the old name has an integration branch this sweep would
+   * otherwise read as a task called `dev`.
+   */
+  | { kind: 'integration'; branch: string }
   /**
    * A directory under the worktree root that git does not know as a worktree at
    * all. Nothing vouches for its contents, so safe mode leaves it alone.
@@ -136,6 +163,15 @@ export interface ReclaimOptions {
    * that has one is the only thing that knows.
    */
   livePaths?: Iterable<string>;
+  /**
+   * Integration branches for this repository, as recorded on its project(s).
+   *
+   * The `blue/dev` constant and every branch the log says a task was merged
+   * INTO are added for free; this is for the case neither can see — a project
+   * whose recorded `devBranch` is a name of its own that has never been landed
+   * into. A worktree on one of these is kept at every force level.
+   */
+  integrationBranches?: Iterable<string>;
 }
 
 // ---------------------------------------------------------------------------
@@ -163,6 +199,7 @@ export async function reclaimWorktrees(
   const byTask = new Map<TaskId, Task>();
   for (const task of tasks) byTask.set(task.id, task);
   const live = livePathSet(byTask.values(), opts.livePaths);
+  const integration = integrationBranchSet(byTask.values(), opts.integrationBranches);
 
   let listed: Worktree[];
   try {
@@ -174,7 +211,7 @@ export async function reclaimWorktrees(
 
   for (const wt of listed) {
     try {
-      await considerWorktree(worktrees, wt, byTask.get(wt.taskId), live, opts, result);
+      await considerWorktree(worktrees, wt, byTask.get(wt.taskId), live, integration, opts, result);
     } catch (err) {
       result.errors.push({ path: wt.path, message: errorText(err) });
     }
@@ -189,11 +226,24 @@ async function considerWorktree(
   wt: Worktree,
   task: Task | undefined,
   live: Set<string>,
+  integration: Set<string>,
   opts: ReclaimOptions,
   result: ReclaimResult,
 ): Promise<void> {
   const bytes = await directorySize(wt.path);
   const base = { path: wt.path, bytes, branch: wt.branch, taskId: wt.taskId };
+
+  // AN INTEGRATION BRANCH IS NOT A TASK BRANCH, and this is checked before
+  // anything else because it is the one refusal that force may not override.
+  // `remove()` deletes a branch once it is proven merged into the base, and an
+  // integration branch is proven merged into the default branch for the entire
+  // window after the captain's pull request — so a leftover checkout of one (a
+  // land killed mid-merge is how you get one) would be swept away together with
+  // the branch every landed task was merged into.
+  if (integration.has(wt.branch)) {
+    result.kept.push({ ...base, reason: { kind: 'integration', branch: wt.branch } });
+    return;
+  }
 
   // A task that has not finished is not a candidate, and neither is a path a
   // caller says it is running a Crew in. Both checks, not either: the log lags
@@ -218,9 +268,24 @@ async function considerWorktree(
     return;
   }
 
-  // What the safe rule would refuse over, measured before anything is removed —
-  // so a dry run, a refusal and a forced removal all report the same facts.
-  const pending = await pendingWork(worktrees, wt);
+  // WHICH BRANCH "MERGED" MEANS FOR THIS WORKTREE.
+  //
+  // Under the delivery policy, work is merged into `blue/dev` and sits there
+  // until the captain opens a pull request — so measuring a landed worktree
+  // against `main` would read as unmerged for as long as the pull request takes,
+  // and every landed worktree would pile up unreclaimed. That is the exact bug
+  // `blue gc` was written to fix, reintroduced by the policy.
+  //
+  // The fix is narrow on purpose: the base is taken from the task's OWN merge
+  // record in the Blackbox (`Task.mergedInto`, written by `task.merged`), not
+  // from a constant and not from whatever branch happens to contain the commits.
+  // A task that was never landed has no record, gets no override, and is
+  // measured against the default branch exactly as before — which is what stops
+  // this from becoming a way to reclaim work that landed nowhere. `remove()`
+  // then re-proves containment in that branch before deleting anything, so a
+  // stale or wrong record cannot destroy work either.
+  const mergeTarget = mergeTargetOf(task);
+  const pending = await pendingWork(worktrees, wt, mergeTarget);
 
   if (pending !== undefined && !opts.force) {
     result.kept.push({ ...base, reason: keepReasonFor(pending) });
@@ -247,7 +312,10 @@ async function considerWorktree(
   try {
     // Without force this re-runs the same checks and fails closed. That is the
     // point: `pendingWork` above is for reporting, `remove()` is the authority.
-    await worktrees.remove(wt, opts.force === true ? { force: true } : undefined);
+    const removeOpts: { force?: boolean; base?: BranchRef } = {};
+    if (opts.force === true) removeOpts.force = true;
+    if (mergeTarget !== undefined) removeOpts.base = mergeTarget;
+    await worktrees.remove(wt, removeOpts);
     result.reclaimed.push(entry);
   } catch (err) {
     // Not failures — the correct answer "not yet", from the one place entitled
@@ -262,7 +330,7 @@ async function considerWorktree(
         ...base,
         reason: {
           kind: 'unlanded',
-          commits: pending?.unlandedCommits ?? (await safeUnlandedCount(worktrees, wt)),
+          commits: pending?.unlandedCommits ?? (await safeUnlandedCount(worktrees, wt, mergeTarget)),
           baseBranch: err.baseBranch,
         },
       });
@@ -278,16 +346,42 @@ interface PendingWork {
   baseBranch: string;
 }
 
-/** What stands between this worktree and the safe rule, or undefined if nothing does. */
+/**
+ * What stands between this worktree and the safe rule, or undefined if nothing
+ * does.
+ *
+ * `base` is the branch the task's work was actually merged into, when the log
+ * records one; without it the question is asked of the default branch, which is
+ * the conservative answer for work nobody has landed.
+ */
 async function pendingWork(
   worktrees: WorktreeManager,
   wt: Worktree,
+  base: BranchRef | undefined,
 ): Promise<PendingWork | undefined> {
-  const baseBranch = await worktrees.defaultBranch();
+  const baseBranch = base?.name ?? (await worktrees.defaultBranch());
   const uncommitted = await worktrees.hasUncommittedChanges(wt);
-  const unlandedCommits = await worktrees.unlandedCommitCount(wt);
+  const unlandedCommits = await worktrees.unlandedCommitCount(
+    wt,
+    base === undefined ? undefined : { base },
+  );
   if (!uncommitted && unlandedCommits === 0) return undefined;
   return { uncommitted, unlandedCommits, baseBranch };
+}
+
+/**
+ * The branch this task was merged into, if any.
+ *
+ * Read straight off the projection, so the only thing that can produce one is a
+ * `task.merged` event — i.e. a merge this system actually performed and
+ * recorded. Undefined for everything else, including a task that is `landed`
+ * (verified) but never landed (merged): those two words mean different things
+ * and this is the line between them.
+ */
+function mergeTargetOf(task: Task | undefined): BranchRef | undefined {
+  const branch = task?.mergedInto;
+  if (branch === undefined || branch.trim() === '') return undefined;
+  return localBranchRef(branch);
 }
 
 /**
@@ -303,9 +397,13 @@ function keepReasonFor(pending: PendingWork): KeepReason {
   };
 }
 
-async function safeUnlandedCount(worktrees: WorktreeManager, wt: Worktree): Promise<number> {
+async function safeUnlandedCount(
+  worktrees: WorktreeManager,
+  wt: Worktree,
+  base: BranchRef | undefined,
+): Promise<number> {
   try {
-    return await worktrees.unlandedCommitCount(wt);
+    return await worktrees.unlandedCommitCount(wt, base === undefined ? undefined : { base });
   } catch {
     return 0;
   }
@@ -437,6 +535,29 @@ export async function directorySize(target: string): Promise<number> {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * Every branch this sweep must treat as an integration branch.
+ *
+ * Three sources, because no one of them is complete: the constant (what a fresh
+ * project uses), every `Task.mergedInto` in the log (what this fleet has
+ * actually merged into, including a project unregistered since), and whatever
+ * the caller read off the registry (a recorded `devBranch` that has never been
+ * landed into yet).
+ */
+function integrationBranchSet(
+  tasks: Iterable<Task>,
+  extra: Iterable<string> | undefined,
+): Set<string> {
+  const branches = new Set<string>([INTEGRATION_BRANCH]);
+  const add = (branch: string | undefined): void => {
+    const name = branch?.trim();
+    if (name !== undefined && name !== '') branches.add(localBranchRef(name).name);
+  };
+  for (const branch of extra ?? []) add(branch);
+  for (const task of tasks) add(task.mergedInto);
+  return branches;
+}
 
 function livePathSet(tasks: Iterable<Task>, extra: Iterable<string> | undefined): Set<string> {
   const live = new Set<string>();

@@ -140,6 +140,12 @@ async function sweep(
     const result = await reclaimWorktrees(manager, tasks, {
       force: opts.force,
       dryRun: opts.dryRun,
+      // The registry is the only place a project's OWN integration branch is
+      // written down. Without it the sweep knows the `blue/dev` constant and
+      // whatever the log has been merged into, and a project carrying a
+      // recorded `devBranch` of any other name would have that branch read as a
+      // task's — and reaped along with its worktree.
+      ...(project.devBranch !== undefined ? { integrationBranches: [project.devBranch] } : {}),
     });
     absorb(merged, result, claimed);
   }
@@ -277,6 +283,14 @@ function describeKept(entry: KeptEntry): string {
       // lands here too, and telling the captain it is not ours invites them to
       // delete by hand the one place a Crew's commits sit on no branch.
       return `${dim('a git worktree this sweep does not manage — left alone')}`;
+
+    case 'integration':
+      // Named rather than explained away: this is where landed work lives until
+      // the captain's pull request, and it is the one thing `--force` will not
+      // take either.
+      return `${branch} ${dim('·')} ${dim(
+        'the integration branch landed work is merged into — never reclaimed',
+      )}`;
 
     case 'debris':
       return `${yellow('git does not know this directory')} ${dim(

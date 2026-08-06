@@ -401,7 +401,7 @@ main { padding: 20px max(16px, env(safe-area-inset-left)) 64px max(16px, env(saf
     <span class="dot"></span><span class="label" id="conn-label">connecting</span>
   </div>
   <div class="stats">
-    <div class="stat" id="stat-spend"><span class="k">Spend</span><span class="v" id="v-spend">$0.00</span></div>
+    <div class="stat" id="stat-spend"><span class="k" id="k-spend">Tokens</span><span class="v" id="v-spend">0</span></div>
     <div class="stat" id="stat-crew"><span class="k">Active crew</span><span class="v" id="v-crew">0</span></div>
     <div class="stat" id="stat-dec"><span class="k">Needs you</span><span class="v" id="v-dec">0</span></div>
   </div>
@@ -451,6 +451,10 @@ const app = {
   view: 'inbox',
   tasks: [], decisions: [], allDecisions: [], projects: [],
   cost: { totalUsd: 0, byTask: {}, byModel: {} },
+  // Tokens are the measured quantity; `metered` says whether `cost` is money
+  // anybody was charged. On a Claude subscription it is not — those tokens draw
+  // down a plan quota. See src/types/domain.ts.
+  usage: { totals: { input: 0, output: 0, cacheRead: 0, cacheCreation: 0 }, total: 0, byModel: {}, byTask: {}, metered: false },
   events: [], seq: 0, now: Date.now(),
   loaded: false,
   conn: 'down',           // live | poll | down
@@ -470,6 +474,31 @@ const attr = (s) => esc(s).replace(/\n/g, '&#10;');
 const sc = (state) => `--sc: var(${STATE_VAR[state] || '--s-queued'})`;
 
 /* ---- formatting ---------------------------------------------------------- */
+function tokens(n) {
+  const v = Number(n) || 0;
+  if (v <= 0) return '0';
+  if (v < 1000) return String(Math.round(v));
+  if (v < 1e6) return trimNum(v / 1e3) + 'k';
+  if (v < 1e9) return trimNum(v / 1e6) + 'M';
+  return trimNum(v / 1e9) + 'B';
+}
+function trimNum(v) {
+  const t = v < 100 ? v.toFixed(1) : v.toFixed(0);
+  return t.endsWith('.0') ? t.slice(0, -2) : t;
+}
+/** Tokens for a task, from the usage projection keyed by task id. */
+function taskTokens(id) {
+  const u = app.usage.byTask && app.usage.byTask[id];
+  if (!u || !u.totals) return 0;
+  const c = u.totals;
+  return (c.input || 0) + (c.output || 0) + (c.cacheRead || 0) + (c.cacheCreation || 0);
+}
+/** How the fleet's dollars may be described — spend, or an equivalence. */
+function usdLabel() {
+  return app.usage.metered
+    ? money(app.cost.totalUsd) + ' spent'
+    : '≈' + money(app.cost.totalUsd) + ' at API list price — not spend; these tokens came out of your Claude subscription quota';
+}
 function money(n) {
   const v = Number(n) || 0;
   if (v === 0) return '$0.00';
@@ -530,6 +559,9 @@ function lastActivity() {
     else if (e.type === 'sentinel.started') line = 'sentinel reviewing the diff';
     else if (e.type === 'sentinel.verdict') line = (e.pass ? 'verdict: pass — ' : 'verdict: fail — ') + truncate(e.reasoning, 70);
     else if (e.type === 'crew.exited') line = 'crew exited' + (e.reason ? ' · ' + truncate(e.reason, 50) : '');
+    // The only event here that records a write to a real repository. Named with
+    // its target, because which branch it went to is the whole point of it.
+    else if (e.type === 'task.merged') line = e.alreadyMerged ? 'already in ' + e.into : 'merged into ' + e.into;
     if (line) out.set(taskId, { line, at: e.at });
   }
   return out;
@@ -551,6 +583,7 @@ async function loadState() {
   app.allDecisions = s.allDecisions || app.decisions;
   app.projects = s.projects || [];
   app.cost = s.cost || app.cost;
+  app.usage = s.usage || app.usage;
   app.now = s.now || Date.now();
   app.loaded = true;
   paint();
@@ -654,7 +687,8 @@ function paint() {
 
 /* ---- header + chrome ------------------------------------------------------ */
 function renderHeader() {
-  el('v-spend').textContent = money(app.cost.totalUsd);
+  el('v-spend').textContent = tokens(app.usage.total);
+  el('stat-spend').title = usdLabel();
   const crew = activeCrewCount();
   el('v-crew').textContent = String(crew);
   el('stat-crew').classList.toggle('live', crew > 0);
@@ -702,12 +736,12 @@ function renderInbox() {
     const queued = app.tasks.filter((t) => t.state === 'queued').length;
     let line = 'The fleet has nothing to ask you. A card lands here the moment a Crew needs a call.';
     if (crew === 0 && app.tasks.length === 0) line = 'No tasks yet. Talk to Helm and the fleet will show up here.';
-    else if (crew === 0 && queued === 0) line = 'Everything is parked. Nothing is burning budget right now.';
+    else if (crew === 0 && queued === 0) line = 'Everything is parked. Nothing is burning tokens right now.';
     return `<div class="empty">
       <div class="ring" aria-hidden="true"></div>
       <h3>Nothing needs you</h3>
       <p>${esc(line)}</p>
-      <p class="hint num">${crew} crew working · ${queued} queued · ${money(app.cost.totalUsd)} spent</p>
+      <p class="hint num">${crew} crew working · ${queued} queued · ${tokens(app.usage.total)} tokens</p>
     </div>`;
   }
 
@@ -805,7 +839,7 @@ function taskCard(t, map, dependents, activity) {
     </div>
     <div class="title">${esc(t.title)}</div>
     <div class="facts">
-      <span title="Accumulated cost for this task">cost <b>${money(t.costUsd)}</b></span>
+      <span title="Tokens this task consumed — what a Crew actually spends. Dollars only exist for a metered (API-key) run.">tokens <b>${tokens(taskTokens(t.id))}</b></span>
       <span title="${TERMINAL.has(t.state) ? 'Total lifetime' : 'Since created'}">${esc(elapsed)}</span>
       ${rework}
     </div>

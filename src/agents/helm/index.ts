@@ -2,8 +2,10 @@
  * Helm — the one agent the captain talks to.
  *
  * This module owns Helm's levers, and nothing else:
- *   tools.ts   — the nine `ToolDef`s Helm uses to drive the fleet, described in
- *                JSON Schema so no harness SDK reaches this far up.
+ *   tools.ts   — the `ToolDef`s Helm uses to drive the fleet, described in JSON
+ *                Schema so no harness SDK reaches this far up. Twelve of them
+ *                only look at state; `land_task` is the one that writes, and it
+ *                writes to exactly one branch — see `src/land/`.
  *
  * Helm's *identity* is not here. It used to be: a `HELM_SYSTEM_PROMPT` constant
  * that `blue`'s REPL handed to `adapter.converse()`. Helm now runs inside the
@@ -18,3 +20,4 @@
  */
 
 export { helmTools } from './tools.js';
+export type { HelmToolDeps } from './tools.js';

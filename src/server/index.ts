@@ -32,6 +32,7 @@ import {
   crewIdOf,
   projectAllDecisions,
   projectCost,
+  projectUsage,
   projectCrewLog,
   taskIdOf,
   type Blackbox,
@@ -413,6 +414,7 @@ export async function startServer(opts: StarmapOptions): Promise<StarmapHandle> 
     decisions: Decision[];
     allDecisions: Decision[];
     cost: ReturnType<typeof projectCost>;
+    usage: ReturnType<typeof projectUsage>;
     projects: Project[];
     seq: number;
     now: number;
@@ -430,17 +432,34 @@ export async function startServer(opts: StarmapOptions): Promise<StarmapHandle> 
     } catch {
       all = [];
     }
+    // Both, and the page decides which to show: `usage` is the measured
+    // quantity (tokens, per model) and carries the `metered` flag that says
+    // whether `cost` is money anyone was charged. See types/domain.ts.
     let cost: ReturnType<typeof projectCost>;
+    let usage: ReturnType<typeof projectUsage>;
     try {
       cost = projectCost(events);
     } catch {
       cost = { totalUsd: 0, byTask: {}, byModel: {} };
+    }
+    try {
+      usage = projectUsage(events);
+    } catch {
+      usage = {
+        totals: { input: 0, output: 0, cacheRead: 0, cacheCreation: 0 },
+        total: 0,
+        byModel: {},
+        byTask: {},
+        metered: false,
+        listPrice: cost,
+      };
     }
     return {
       tasks,
       decisions: openDecisions(),
       allDecisions: all,
       cost,
+      usage,
       projects: projects.list(events),
       seq: mirror.latestSeq(),
       now: Date.now(),

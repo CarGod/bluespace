@@ -9,14 +9,30 @@
  */
 
 export {
+  BRANCH_PREFIX,
+  INTEGRATION_BRANCH,
   WorktreeManager,
   assertIsolated,
+  localBranchRef,
+  taskBranchName,
   NotIsolatedError,
   GitError,
   DirtyWorktreeError,
   UnlandedCommitsError,
 } from './manager.js';
-export type { Worktree } from './manager.js';
+export type { BranchRef, Worktree } from './manager.js';
+
+export {
+  DevBranchConflictError,
+  MergeConflictError,
+  MergeTargetError,
+  assertNoBranchNamespaceConflict,
+  ensureIntegrationBranch,
+  integrationStatus,
+  isMergedInto,
+  mergeTaskBranch,
+} from './dev.js';
+export type { DevBranchSetup, IntegrationStatus, MergeInput, MergeReport } from './dev.js';
 
 export { directorySize, reclaimWorktrees, sweepOrphanDirectories } from './reclaim.js';
 export type {

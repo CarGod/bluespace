@@ -4,7 +4,8 @@
   "description": "A captain and an AI crew. One conversation in, a fleet of agents out.",
   "type": "module",
   "bin": {
-    "blue": "./dist/cli/index.js"
+    "blue": "./dist/cli/index.js",
+    "bluespace": "./dist/cli/bluespace.js"
   },
   "engines": {
     "node": ">=20"
@@ -31,6 +32,9 @@
   "files": [
     "dist",
     "web",
-    "README.md"
+    "README.md",
+    "CLAUDE.md",
+    "skills",
+    "docs"
   ]
 }

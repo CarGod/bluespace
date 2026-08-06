@@ -32,8 +32,64 @@ const execFileAsync = promisify(execFile);
 /** Diffs and status output can be large; 64MiB before we consider it pathological. */
 const GIT_MAX_BUFFER = 64 * 1024 * 1024;
 
-/** Every BlueSpace branch lives under this namespace. list() filters on it. */
-const BRANCH_PREFIX = 'blue/';
+/**
+ * Every BlueSpace branch lives under this namespace. list() filters on it.
+ *
+ * Exported because the integration branch, the task branches and the D/F
+ * conflict check in `dev.ts` all have to agree on it, and three literals that
+ * agree today are a bug scheduled for later.
+ */
+export const BRANCH_PREFIX = 'blue/';
+
+/**
+ * The one branch every landed task is merged into. THE ONLY MERGE TARGET IN
+ * BLUESPACE — nothing here ever writes to `main`.
+ *
+ * Fixed and namespaced rather than configurable or confirmed, and both halves of
+ * that are deliberate:
+ *
+ *  - `blue/dev` sits in the same namespace as the task branches (`blue/<taskId>`),
+ *    so it groups with them in `git branch` and no human creates it by accident.
+ *    A name that essentially cannot collide is a name that needs no confirmation
+ *    dance: if it exists, BlueSpace made it; if it does not, BlueSpace makes it.
+ *  - It deliberately avoids the word "tag". This repository already lost work
+ *    once to a TAG named `main` shadowing the BRANCH named `main` (see
+ *    `defaultBranchRef` below), and a branch whose name contains "tag" invites
+ *    that confusion straight back in.
+ *
+ * The one real edge is that git cannot hold both `refs/heads/blue` and
+ * `refs/heads/blue/dev`. A repository with a bare `blue` branch is already
+ * incompatible with the `blue/<taskId>` scheme, so it is detected and refused at
+ * registration — see `assertNoBranchNamespaceConflict` in `./dev.ts`.
+ *
+ * Read the recorded `Project.devBranch` in preference to this constant wherever
+ * a project is in hand: renaming this must not silently retarget old projects.
+ */
+export const INTEGRATION_BRANCH = `${BRANCH_PREFIX}dev`;
+
+/** The branch a task's Crew works on. One task, one branch, one worktree. */
+export function taskBranchName(taskId: string): string {
+  return `${BRANCH_PREFIX}${taskId}`;
+}
+
+/**
+ * A branch in both the forms every reachability question needs: the short name
+ * a human reads and the fully-qualified ref git may not misinterpret.
+ */
+export interface BranchRef {
+  name: string;
+  ref: string;
+}
+
+/**
+ * Qualify a local branch name. `blue/dev` becomes `refs/heads/blue/dev`, which
+ * is the only form safe to hand to `rev-list` — see `defaultBranchRef()`.
+ */
+export function localBranchRef(branch: string): BranchRef {
+  return branch.startsWith('refs/')
+    ? { name: branch.replace(/^refs\/heads\//, ''), ref: branch }
+    : { name: branch, ref: `refs/heads/${branch}` };
+}
 
 /** The well-known empty tree object, used as a diff base when there is no merge base. */
 const EMPTY_TREE = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
@@ -440,9 +496,22 @@ export class WorktreeManager {
     assertSafeTaskId(taskId);
 
     const repoRoot = await this.repoRoot();
-    const base = await this.defaultBranch();
+    // QUALIFIED, for the same reason every reachability question is. `git
+    // worktree add -b <new> <path> main` in a repository that also has a TAG
+    // called `main` does not pick one and carry on — it exits 128 with
+    // "fatal: ambiguous object name: 'main'", and no Crew can ever be
+    // dispatched against that repository. The ref form has no other reading.
+    const base = await this.defaultBranchRef();
     const root = await this.ensureRoot();
-    const branch = `${BRANCH_PREFIX}${taskId}`;
+    const branch = taskBranchName(taskId);
+    // A task called `dev` would cut its worktree on the integration branch
+    // itself, and every merge into it afterwards would be a merge into a
+    // directory a Crew is editing. Ids are UUIDs, so this is the second belt.
+    if (branch === INTEGRATION_BRANCH) {
+      throw new Error(
+        `taskId ${JSON.stringify(taskId)} would collide with the integration branch ${INTEGRATION_BRANCH}`,
+      );
+    }
     const target = path.join(root, `${path.basename(repoRoot)}-${taskId}`);
 
     // Clear stale registrations (directories deleted out from under git) so a
@@ -464,7 +533,17 @@ export class WorktreeManager {
     return fs.realpath(this.rootInput);
   }
 
-  /** Every `blue/*` worktree registered against this repository. */
+  /**
+   * Every `blue/<taskId>` worktree registered against this repository.
+   *
+   * The integration branch is excluded, and that exclusion is load-bearing
+   * rather than tidy. A checkout of `blue/dev` matches the `blue/` prefix, so
+   * without this it would be listed as a worktree whose "task id" is `dev` —
+   * and the sweep in `reclaim.ts` would then consider it, find no task for it,
+   * and (whenever `blue/dev` happened to be fully merged into main) hand it to
+   * `remove()`, which reaps a branch it has proven merged. That is the
+   * integration branch deleted by the garbage collector.
+   */
   async list(): Promise<Worktree[]> {
     const repoRoot = await this.repoRoot();
     const res = await git(['worktree', 'list', '--porcelain'], repoRoot);
@@ -476,6 +555,7 @@ export class WorktreeManager {
         ? record.branch.slice('refs/heads/'.length)
         : record.branch;
       if (!branch.startsWith(BRANCH_PREFIX)) continue;
+      if (branch === INTEGRATION_BRANCH) continue;
       const taskId = branch.slice(BRANCH_PREFIX.length);
       if (!taskId) continue;
       out.push({
@@ -549,11 +629,14 @@ export class WorktreeManager {
 
   /**
    * Commits that exist on this worktree's branch (or its detached HEAD) but are
-   * not reachable from the default branch — i.e. work that would be destroyed by
-   * deleting the branch. Fail closed: true if EITHER ref has unlanded commits.
+   * not reachable from `base` — i.e. work that would be destroyed by deleting
+   * the branch. Fail closed: true if EITHER ref has unlanded commits.
+   *
+   * `base` defaults to the default branch. Pass the integration branch when the
+   * log says this task's work was merged there — see `unlandedCommitCount`.
    */
-  async hasUnlandedCommits(wt: Worktree): Promise<boolean> {
-    return (await this.unlandedCommitCount(wt)) > 0;
+  async hasUnlandedCommits(wt: Worktree, opts?: { base?: BranchRef }): Promise<boolean> {
+    return (await this.unlandedCommitCount(wt, opts)) > 0;
   }
 
   /**
@@ -563,10 +646,18 @@ export class WorktreeManager {
    * sweep that refuses to reclaim a worktree has to be able to tell the captain
    * "3 commits not in main", not merely "not yet". Fail closed: the larger of
    * the branch's count and the detached HEAD's, since either can hold work.
+   *
+   * `base` OVERRIDES the branch the question is asked about, and the caller owes
+   * a reason for overriding it. Under the delivery policy work is merged into
+   * `blue/dev` and sits there until a pull request, so a landed worktree
+   * measured against `main` reads as unmerged forever and is never reclaimed.
+   * `reclaim.ts` passes the branch the Blackbox says this task was merged into,
+   * and passes nothing at all for a task that was never merged — which is what
+   * keeps this from becoming a way to reclaim work that landed nowhere.
    */
-  async unlandedCommitCount(wt: Worktree): Promise<number> {
+  async unlandedCommitCount(wt: Worktree, opts?: { base?: BranchRef }): Promise<number> {
     const repoRoot = await this.repoRoot();
-    const base = await this.defaultBranchRef();
+    const base = opts?.base?.ref ?? (await this.defaultBranchRef());
 
     let count = await this.countUnlanded(repoRoot, base, `refs/heads/${wt.branch}`);
 
@@ -612,19 +703,24 @@ export class WorktreeManager {
   /**
    * Tear down a worktree. FAILS CLOSED: refuses while there is uncommitted work
    * or unlanded commits unless `force` is set. The branch is deleted only once
-   * proven fully merged into the default branch, so forcing away a directory
-   * never silently destroys the commits — they stay reachable via the branch.
+   * proven fully merged into `base`, so forcing away a directory never silently
+   * destroys the commits — they stay reachable via the branch.
+   *
+   * `base` defaults to the default branch and is the authority on both
+   * questions; a caller that passes the integration branch is saying "this work
+   * was merged there", and this method re-proves it rather than believing it.
    */
-  async remove(wt: Worktree, opts?: { force?: boolean }): Promise<void> {
+  async remove(wt: Worktree, opts?: { force?: boolean; base?: BranchRef }): Promise<void> {
     const force = opts?.force === true;
     const repoRoot = await this.repoRoot();
     // Two forms of the same branch: the qualified ref decides, the short name
     // is what the refusal tells the captain.
-    const { name: base, ref: baseRef } = await this.resolveDefaultBranch();
+    const { name: base, ref: baseRef } = opts?.base ?? (await this.resolveDefaultBranch());
+    const against = { base: { name: base, ref: baseRef } };
 
     if (!force) {
       if (await this.hasUncommittedChanges(wt)) throw new DirtyWorktreeError(wt);
-      if (await this.hasUnlandedCommits(wt)) throw new UnlandedCommitsError(wt, base);
+      if (await this.hasUnlandedCommits(wt, against)) throw new UnlandedCommitsError(wt, base);
     }
 
     if (await pathExists(wt.path)) {

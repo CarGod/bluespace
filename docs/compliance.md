@@ -205,3 +205,70 @@ that needs it.
 architectural grounds that predate this document; see `src/adapters/types.ts`.
 It also happens to be the fragile choice here, since the transcript is
 structured and the screen is not.
+
+**A user-scoped MCP install (`claude mcp add -s user bluespace -- blue mcp`).**
+Was the documented setup. Removed, not softened. It registered the fleet tools
+into every Claude Code session on the machine, permanently, for a tool the
+captain was still evaluating — and it did not produce Helm anyway. An MCP server
+supplies tools; Helm's operating contract is `CLAUDE.md`, which Claude Code loads
+only when the working directory is the BlueSpace repo. In the captain's own
+project it therefore delivered the levers and no rules: a session that can
+`create_task` without knowing the task is only queued, that reports `landed` as
+merged, and that has never been told not to spawn its own subagents for fleet
+work. Half of Helm is worse than neither half, because it is confidently wrong
+about a fleet somebody is relying on. `bluespace` (`src/cli/bluespace.ts`)
+supplies both halves per invocation and registers nothing.
+
+## The `bluespace` launcher
+
+Verified against **Claude Code 2.1.223**, macOS, **2026-08-05**. Same standing
+warning as everything above: none of this is a documented API.
+
+**`--mcp-config` accepts inline JSON, and the config key names the tool prefix.**
+Measured with a stub stdio server: the session reported
+`mcp_servers: [{"name":"stub","status":"connected"}]` and exposed
+`mcp__stub__stub_probe`. So `mcpServers.bluespace` is what makes Helm's levers
+`mcp__bluespace__*`, and renaming the key silently renames every tool the persona
+refers to.
+
+**`--strict-mcp-config` really does drop the captain's own servers.** On a
+machine with five user-scoped servers, measured both ways in the same directory:
+
+| launch | servers the session reported |
+| --- | --- |
+| `--mcp-config <stub>` | the captain's five, **plus** the stub |
+| `--mcp-config <stub> --strict-mcp-config` | the stub, and nothing else |
+
+**BlueSpace does not pass it by default, and that is a choice.** Isolation would
+take away something BlueSpace never gave and does not own. Helm does intake and
+judgement — it reads links the captain pastes and looks things up before writing
+a brief — and deleting their web search to keep our window tidy is a worse tool,
+not a safer one. Nothing in the argument on this page needs isolation either:
+what matters is that the session is interactive and runs on the captain's own
+login, not that it is minimal. `BLUESPACE_STRICT_MCP=1` opts in, and the real
+case for it is a slow or broken server of theirs delaying every Helm launch.
+
+**Variadic flags eat the positional prompt.** `--mcp-config <configs...>` and
+`--add-dir <directories...>` both swallow every following token that does not
+start with `-`. Measured:
+
+```
+claude -p --add-dir /some/dir "reply OK"
+  -> Error: Input must be provided either through stdin or as a prompt argument
+claude -p --mcp-config '{"mcpServers":{}}' "reply OK"
+  -> Error: MCP config file not found: <cwd>/reply OK
+```
+
+So the last flag the launcher injects must take exactly one value.
+`--append-system-prompt` does, and `buildHelmArgv` keeps it last on purpose —
+everything the captain typed sits safely after it. Verified in the same run that
+the appended prompt still applies: `--mcp-config … --add-dir … --append-system-prompt
+"reply with exactly BANANA" -p "say ok"` printed `BANANA`.
+
+**The opening turn is a turn, not a banner.** Claude Code owns its first screen
+and there is no flag that writes into it, so BlueSpace does not try: a bare
+`bluespace` passes a positional prompt asking Helm for the wake sweep, which
+submits itself (see above). The first thing the captain reads is therefore a real
+answer about their fleet, produced by a session that reached the tools — which is
+also the only honest proof the wiring worked. Any argument at all suppresses it,
+as does `BLUESPACE_NO_WAKE=1`.

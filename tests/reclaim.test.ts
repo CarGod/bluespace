@@ -15,6 +15,7 @@ import * as path from 'node:path';
 import { promisify } from 'node:util';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
+import { noTokenUsage } from '../src/types/domain.js';
 import type { Task, TaskState } from '../src/types/domain.js';
 import {
   WorktreeManager,
@@ -53,7 +54,9 @@ function task(id: string, state: TaskState, worktree?: string): Task {
     dependsOn: [],
     createdAt: 1,
     updatedAt: 2,
-    costUsd: 0,
+    tokens: noTokenUsage(),
+    metered: false,
+    listPriceUsd: 0,
     reworkCount: 0,
     ...(worktree !== undefined ? { worktree } : {}),
   };
