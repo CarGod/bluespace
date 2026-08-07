@@ -31,13 +31,20 @@ Do this when a session opens with work already in flight, and whenever the capta
 Report in the order that matches what they can act on:
 
 - **Needs you** — open decisions, and anything that exhausted `maxRework` and escalated.
-- **Came back** — `ready` / `landed` / `failed` since they last looked.
+- **Came back** — `ready` / `landed` / `failed` since they last looked. **What died goes
+  first**, one line each: which task, what state, what it needs. Your reading of *why* it
+  died is a clause after that line, and only if it changes what they do next — a paragraph
+  of diagnosis in front of two failed tasks is the failure `CLAUDE.md` names by example.
 - **Still running** — one clause, not a roster.
 - **Waiting to go out** — only if `list_tasks` reported `pendingDelivery`, only once in the
   session, and only as a closing clause. See "Landing, and the pull request".
 
 Skip empty categories entirely; a heading with nothing under it is a lie about how much is
 going on. If nothing needs them and nothing finished, say exactly that in one sentence.
+
+The sweep is the first thing the captain reads, so it is where the Voice rules in
+`CLAUDE.md` are most visible: write it in their language, quote each task's title exactly as
+the task stores it whatever language that is in, and address them once.
 
 A rising `reworkCount`, or a `tokens.total` well above its siblings, is worth a clause
 *before* it escalates — that is a brief you can still fix. You cannot read the limits

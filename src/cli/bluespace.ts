@@ -26,7 +26,10 @@
  *                                 `~/.claude.json`; delete this binary and every
  *                                 trace is gone.
  *   `--append-system-prompt`      `CLAUDE.md`, verbatim, so the contract arrives
- *                                 wherever the captain happens to be standing.
+ *                                 wherever the captain happens to be standing —
+ *                                 plus the things only the launcher knows: which
+ *                                 tools this window was denied, and which
+ *                                 language this captain reads.
  *   `--add-dir <install root>`    so the session can read the skill, the
  *                                 compliance doc, and its own source.
  *   `--disallowedTools <list>`    the boundary, enforced rather than requested —
@@ -91,6 +94,14 @@ import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { ClaudeCliUnavailableError, resolveClaudeBinary } from '../adapters/claude-cli.js';
+import {
+  LOCALE_ENV_VARS,
+  MIRROR_VOICE,
+  loadConfig,
+  localeVarInEffect,
+  resolveCaptainVoice,
+} from '../config/index.js';
+import type { CaptainVoice } from '../config/index.js';
 import { MCP_SERVER_NAME } from '../mcp/server.js';
 
 // ---------------------------------------------------------------------------
@@ -142,6 +153,87 @@ export function helmMcpConfig(entry: string, nodePath: string = process.execPath
   });
 }
 
+/**
+ * What the window is told about who it is talking to.
+ *
+ * `CLAUDE.md` carries the RULE — write to the captain in their language, address
+ * them by rank, follow them if they switch. It cannot carry the VALUE: the file
+ * is the same on every machine, and which language this captain reads is a fact
+ * about the shell the launcher was run from and the config file next to it. So
+ * this section says one thing the contract cannot: which language, what to call
+ * them, and — the part that changes behaviour — whether that is the captain's
+ * own standing instruction or this launcher's guess at it.
+ *
+ * WHY THE GUESS IS NEVER PERSISTED FOR THEM. Three ways to handle a detected
+ * language that turns out to be wrong, and only one of them is not a nuisance:
+ *
+ *   - Write it silently the first time the captain types in another language.
+ *     A tool that edits the captain's config because of something they said in
+ *     passing is a surprise, and the surprise arrives later, on the day the
+ *     setting does something they did not ask for. Helm also has no tool that
+ *     writes config and is denied Bash, so this would mean inventing an
+ *     authority — mutating the captain's settings — for a cosmetic key.
+ *   - Ask every session. That is a question in front of the answer to "what
+ *     needs me", every single morning, about something already working.
+ *   - Say the command exists, once, in a clause, and only when the guess was
+ *     actually wrong. Nothing is written, nothing is asked, and the captain
+ *     keeps the pin — which is the same shape `CLAUDE.md` already uses for
+ *     `pendingDelivery`: raise it once, as an offer, never as the lead.
+ *
+ * The third is what the text below instructs, and it is deliberately silent when
+ * detection was right: a captain writing Chinese to a Helm already answering in
+ * Chinese has nothing to fix and should never hear about the setting at all.
+ */
+function languageSection(voice: CaptainVoice, env: NodeJS.ProcessEnv): string {
+  const heading = '## The captain’s language';
+
+  if (voice.language === undefined) {
+    const vars = LOCALE_ENV_VARS.join(', ');
+    return `${heading}
+
+Nothing here says which language the captain reads: no \`language\` is pinned in BlueSpace's
+config, and ${vars} are unset or name no language (\`C\`, \`POSIX\`). Read that as
+**unknown, not as English**. Open in English because that is what this contract is written
+in, then take their first message as the answer and write in that language for the rest of
+the session. Address them as **Captain**, or the natural equivalent in whatever language you
+end up writing. Whichever it is, it covers **every line that reaches their screen** —
+including anything you type on the way to a tool call, which is the first thing in the
+window and reads to them as the answer.
+
+If they would rather not rely on that, \`blue config set language <lang>\` pins it — mention
+it at most once, in a clause, and never as a question.`;
+  }
+
+  const provenance = voice.pinned
+    ? `The captain pinned this themselves (\`blue config set language ${voice.language}\`), so it is a
+standing instruction rather than a guess. Answer a message in another language in that
+language if that is plainly what they want, then come back to ${voice.language}.`
+    : `That was read off this shell's locale (${localeVarInEffect(env) ?? 'the environment'}), not from
+anything the captain said — it is a starting guess. **If they write to you in another
+language, that is the answer**: switch to it from that message on, without announcing the
+switch or asking permission. Once the guess has actually proved wrong you may add one
+clause, once in the session, saying \`blue config set language <lang>\` pins it. Never as the
+lead, never twice, never as a question, and never instead of what they asked. BlueSpace will
+not write it for them and neither will you — you have no tool that edits their config.`;
+
+  return `${heading}
+
+Write to the captain in **${voice.language}**, and address them as **${voice.address}**.
+
+${provenance}
+
+If **${voice.address}** is not the natural word in the language you are actually writing,
+use the one that is. The captain is addressed by rank, not by a string this launcher
+happened to pass in.
+
+This covers **every line that reaches their screen**, not just the report — including
+anything you type on the way to a tool call. Measured: a session correctly answering in
+${voice.language} still opened with an English sentence about fetching its tools, because a
+line written before the work started did not feel like the answer yet. To the captain it is
+the first thing in the window and it is in the wrong language. Reach for tools silently; the
+first words they read are already the answer.`;
+}
+
 /** `CLAUDE.md` is missing from the install — refuse rather than open a half-Helm. */
 export class MissingPersonaError extends Error {
   constructor(readonly attempted: string) {
@@ -177,7 +269,12 @@ export class MissingPersonaError extends Error {
  * Bash missing with no explanation reports a broken tool to the captain and asks
  * them to fix it. Both are avoided by saying what actually happened at launch.
  */
-export function helmSystemPrompt(root: string, denied: readonly string[] = HELM_DENIED_TOOLS): string {
+export function helmSystemPrompt(
+  root: string,
+  denied: readonly string[] = HELM_DENIED_TOOLS,
+  voice: CaptainVoice = MIRROR_VOICE,
+  env: NodeJS.ProcessEnv = process.env,
+): string {
   const personaPath = path.join(root, 'CLAUDE.md');
   let persona: string;
   try {
@@ -221,11 +318,21 @@ that can only be answered by digging through their code is a task, not a turn.
 
 ${boundary}
 
+${languageSection(voice, env)}
+
 Your levers come from a \`bluespace\` MCP server started for this window alone. It is not
 installed in the captain's configuration and it is gone when this window closes — a plain
-\`claude\` window has none of it, by design. If the \`mcp__bluespace__*\` tools are not
-present, say so in one line and stop. You are not Helm without them, and answering from
-memory about a fleet you cannot see is the one failure the captain cannot detect.
+\`claude\` window has none of it, by design. You are not Helm without them, and answering
+from memory about a fleet you cannot see is the one failure the captain cannot detect — so
+if they really are unreachable, say so in one line and stop.
+
+**Not being in your opening tool list is not that.** On a machine with several MCP servers
+this build hands tools out on demand, and \`mcp__bluespace__*\` routinely arrives that way.
+Go and get them, silently — no line to the captain about loading them, searching for them,
+needing them, or what you are about to go and do. Measured: a window announced that it could
+not see the fleet, then found and used three of these tools on its very next step, having
+already told the captain their fleet was broken. An absence is worth reporting only after a
+search has actually come back empty.
 
 The **bluespace** skill named above is a file, not an installed skill. Read it with the
 Read tool from:
@@ -380,8 +487,34 @@ export function deniedTools(env: NodeJS.ProcessEnv = process.env): readonly stri
 export const WAKE_PROMPT =
   'Session start: run the wake sweep before anything else. Read open decisions and fleet ' +
   'state from the tools, then open with what needs me, what came back, and what is still ' +
-  'running — leave out any category that is empty. If nothing is in flight, say so in one ' +
-  'line and ask what I want built. Do not describe your tools or narrate how you work.';
+  'running — leave out any category that is empty. Lead with anything that died — failed, ' +
+  'escalated, cancelled — before any account of why it died. If nothing is in flight, say ' +
+  'so in one line and ask what I want built. Do not describe your tools or narrate how you ' +
+  'work.';
+
+/**
+ * The opening turn, told which language its ANSWER is written in.
+ *
+ * This prompt is an instruction to the model, not copy the captain reads, so it
+ * stays English however they are addressed — translating it would mean a second
+ * copy to keep in step and would make the launcher a place language lives. What
+ * it must not do is stay silent about the reply: the wake sweep is the first
+ * thing the captain ever sees, and it is produced before they have typed a word
+ * for Helm to mirror. The clause below is the only thing standing between a
+ * Chinese-speaking captain and an English greeting quoting their Chinese task
+ * titles.
+ *
+ * Nothing is appended when the language is unknown — `CLAUDE.md` and the "This
+ * window" section already say what to do with an unknown captain, and a clause
+ * inventing an answer here would contradict them.
+ */
+export function wakePrompt(voice: CaptainVoice): string {
+  if (voice.language === undefined) return WAKE_PROMPT;
+  return (
+    `${WAKE_PROMPT} Write the reply in ${voice.language} and address me as ${voice.address}; ` +
+    'task titles, ids, branch names and quoted errors stay exactly as they are stored.'
+  );
+}
 
 // ---------------------------------------------------------------------------
 // The launch argv
@@ -573,10 +706,23 @@ export async function launchWindow(
  */
 export async function runLauncher(
   captainArgs: readonly string[],
-  options: { root?: string; entry?: string; env?: NodeJS.ProcessEnv; stdio?: 'inherit' | 'ignore' } = {},
+  options: {
+    root?: string;
+    entry?: string;
+    env?: NodeJS.ProcessEnv;
+    stdio?: 'inherit' | 'ignore';
+    /** The captain's pinned language. Read from config when not supplied. */
+    voice?: CaptainVoice;
+  } = {},
 ): Promise<number> {
   const env = options.env ?? process.env;
   const root = options.root ?? installRoot();
+
+  // The pin wins, the shell's locale is the fallback, and neither is a language
+  // this file chose. `loadConfig` never throws — a broken config file yields
+  // defaults, which here means an undetected language, which means Helm mirrors
+  // the captain: the same benign end state as an empty `LANG`.
+  const voice = options.voice ?? resolveCaptainVoice(loadConfig().language, env);
 
   let claudePath: string;
   let systemPromptAppend: string;
@@ -584,7 +730,7 @@ export async function runLauncher(
     claudePath = resolveClaudeBinary(env);
     // The same list the argv will carry, so the window is never told about a
     // clamp it does not have — or left to discover one nobody mentioned.
-    systemPromptAppend = helmSystemPrompt(root, deniedTools(env));
+    systemPromptAppend = helmSystemPrompt(root, deniedTools(env), voice, env);
   } catch (e: unknown) {
     errLine(e instanceof Error ? e.message : String(e));
     return 1;
@@ -594,7 +740,7 @@ export async function runLauncher(
   // argv is whether it is empty, and that settles one thing: whether the opening
   // turn is ours to choose or theirs.
   const wake =
-    captainArgs.length === 0 && !envFlag(env, 'BLUESPACE_NO_WAKE') ? WAKE_PROMPT : undefined;
+    captainArgs.length === 0 && !envFlag(env, 'BLUESPACE_NO_WAKE') ? wakePrompt(voice) : undefined;
 
   const argv = buildHelmArgv({
     claudePath,

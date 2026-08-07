@@ -333,3 +333,11 @@ submits itself (see above). The first thing the captain reads is therefore a rea
 answer about their fleet, produced by a session that reached the tools — which is
 also the only honest proof the wiring worked. Any argument at all suppresses it,
 as does `BLUESPACE_NO_WAKE=1`.
+
+That turn is produced before the captain has typed anything, so it is the one
+reply Helm cannot write in "whatever language they used". The prompt therefore
+names the language it wants the answer in — resolved from `language` in the
+config, else from `LC_ALL` / `LC_MESSAGES` / `LANG`, and omitted entirely when
+neither names a language. The instruction itself stays English: it is addressed
+to the model, not to the captain, and a translated copy of it would be a second
+thing to keep in step.

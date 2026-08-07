@@ -6,16 +6,25 @@
  * captain's repos are without ever moving them.
  */
 
-export type { BlueConfig } from './config.js';
+export type { BlueConfig, CaptainVoice, ConfigPatch } from './config.js';
 export {
+  DEFAULT_ADDRESS,
   DEFAULT_MAX_TOKENS_PER_TASK,
   EFFORT_LEVELS,
+  LOCALE_ENV_VARS,
+  MIRROR_VOICE,
   PERMISSION_MODES,
+  addressTerm,
+  canonicalLanguageTag,
   configPath,
   dataDir,
   defaultConfig,
+  detectLanguage,
   ensureDataDir,
   loadConfig,
+  localeVarInEffect,
+  normalizeLanguage,
+  resolveCaptainVoice,
   saveConfig,
 } from './config.js';
 

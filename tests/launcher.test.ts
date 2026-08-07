@@ -21,7 +21,7 @@
 import { promises as fs } from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 
 import {
   HELM_DENIED_TOOLS,
@@ -34,7 +34,9 @@ import {
   runLauncher,
   strictMcpRequested,
   unclampedRequested,
+  wakePrompt,
 } from '../src/cli/bluespace.js';
+import { MIRROR_VOICE, resolveCaptainVoice } from '../src/config/index.js';
 
 // ---------------------------------------------------------------------------
 // A `claude` that costs nothing
@@ -57,6 +59,32 @@ const tmpDirs: string[] = [];
 afterAll(async () => {
   for (const d of tmpDirs) await fs.rm(d, { recursive: true, force: true });
 });
+
+/**
+ * `runLauncher` reads the captain's config to find a pinned language, and
+ * `loadConfig` takes its data directory from the process environment. Without
+ * this, a developer who has pinned `language` in their own `~/.bluespace` gets
+ * different results from CI — the same hazard `tests/setup.ts` clears
+ * `CLAUDE_CLI_PATH` and `ANTHROPIC_API_KEY` for.
+ */
+const originalHome = process.env['BLUESPACE_HOME'];
+let sandboxHome: string;
+
+beforeEach(async () => {
+  sandboxHome = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'bluespace-home-')));
+  tmpDirs.push(sandboxHome);
+  process.env['BLUESPACE_HOME'] = sandboxHome;
+});
+
+afterAll(() => {
+  if (originalHome === undefined) delete process.env['BLUESPACE_HOME'];
+  else process.env['BLUESPACE_HOME'] = originalHome;
+});
+
+/** Pin a language in the sandbox config, the way `blue config set` would. */
+async function pinLanguage(language: string): Promise<void> {
+  await fs.writeFile(path.join(sandboxHome, 'config.json'), JSON.stringify({ language }), 'utf8');
+}
 
 interface Harness {
   root: string;
@@ -393,6 +421,92 @@ describe('helmSystemPrompt', () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// The captain's language
+// ---------------------------------------------------------------------------
+
+describe('wakePrompt', () => {
+  it('says which language the REPLY is in, while staying an English instruction', () => {
+    // The prompt is an instruction to the model, not copy the captain reads — so
+    // it is not translated. What it must not do is stay silent about the answer:
+    // the wake sweep is produced before the captain has typed anything for Helm
+    // to mirror, and it is the exact turn that came back as English prose
+    // wrapped around Chinese task titles.
+    const zh = wakePrompt(resolveCaptainVoice('zh-CN', {}));
+
+    expect(zh.startsWith(WAKE_PROMPT)).toBe(true);
+    expect(zh).toContain('Write the reply in zh-CN');
+    expect(zh).toContain('舰长');
+    // …and the one thing that must NOT be translated with it.
+    expect(zh).toMatch(/titles.*stay exactly as they are stored/i);
+  });
+
+  it('adds nothing when no language is known, rather than inventing English', () => {
+    expect(wakePrompt(MIRROR_VOICE)).toBe(WAKE_PROMPT);
+    expect(wakePrompt(resolveCaptainVoice(undefined, { LANG: 'C' }))).toBe(WAKE_PROMPT);
+  });
+
+  it('leads on what died, because that is what the sweep buried', () => {
+    // Observed: the sweep opened with a paragraph about brief length and put two
+    // dead tasks inside it. The rule lives in CLAUDE.md; this is the nudge in
+    // the one turn BlueSpace itself writes.
+    expect(WAKE_PROMPT).toMatch(/died|failed/i);
+    expect(WAKE_PROMPT).toMatch(/before any account of why/i);
+  });
+});
+
+describe('helmSystemPrompt: the captain’s language', () => {
+  it('carries a pinned language as a standing instruction', async () => {
+    const h = await harness({ persona: '# Helm' });
+    const prompt = helmSystemPrompt(h.root, HELM_DENIED_TOOLS, resolveCaptainVoice('zh-CN', {}));
+
+    expect(prompt).toContain('**zh-CN**');
+    expect(prompt).toContain('**舰长**');
+    expect(prompt).toContain('blue config set language zh-CN');
+    expect(prompt).toMatch(/standing instruction rather than a guess/i);
+  });
+
+  it('marks a detected language as a guess, and says who wins when they disagree', async () => {
+    const h = await harness({ persona: '# Helm' });
+    const env = { LANG: 'zh_CN.UTF-8' };
+    const prompt = helmSystemPrompt(h.root, HELM_DENIED_TOOLS, resolveCaptainVoice(undefined, env), env);
+
+    // Where the guess came from, so the model treats it as the weak evidence it is.
+    expect(prompt).toContain('LANG');
+    expect(prompt).toMatch(/starting guess/i);
+    // The captain's own writing outranks it, with no ceremony.
+    expect(prompt).toMatch(/if they write to you in another\s+language, that is the answer/i);
+    expect(prompt).toMatch(/without announcing the\s+switch/i);
+    // The persistence decision: offered once, in a clause, never written for them.
+    expect(prompt).toMatch(/once in the session/i);
+    expect(prompt).toMatch(/not write it for them/i);
+  });
+
+  it('treats an undetectable locale as unknown, not as English', async () => {
+    const h = await harness({ persona: '# Helm' });
+    const prompt = helmSystemPrompt(h.root, HELM_DENIED_TOOLS, MIRROR_VOICE, { LANG: 'C' });
+
+    expect(prompt).toMatch(/unknown, not as English/i);
+    // It still has to open in something, and says which — an opening turn has
+    // nothing to mirror yet.
+    expect(prompt).toMatch(/Open in English/);
+    expect(prompt).toMatch(/take their first message as the answer/i);
+    expect(prompt).toContain('Captain');
+    // No language was resolved, so none may be asserted.
+    expect(prompt).not.toContain('Write to the captain in **');
+  });
+
+  it('lets the model overrule an address term it has no word for', async () => {
+    const h = await harness({ persona: '# Helm' });
+    const prompt = helmSystemPrompt(h.root, HELM_DENIED_TOOLS, resolveCaptainVoice('de-DE', {}));
+
+    // The table holds one term because one term is what the captain gave us;
+    // everything else is a translation the model does better than a lookup.
+    expect(prompt).toContain('**Captain**');
+    expect(prompt).toMatch(/addressed by rank, not by a string/i);
+  });
+});
+
 describe('strictMcpRequested', () => {
   it('is off unless the captain turns it on', () => {
     // Default off is a decision, not an oversight: isolating the window removes
@@ -473,6 +587,46 @@ describe('runLauncher', () => {
     // Their prompt is the opening turn; ours would be a second positional and
     // would land inside `--model`'s neighbours besides.
     expect(argv).not.toContain(WAKE_PROMPT);
+  });
+
+  it('opens in the language the captain pinned, not the one the shell reports', async () => {
+    // The pin is the captain's explicit word and outranks a locale that some
+    // wrapper script set.
+    const h = await harness({ persona: '# Helm', env: { LANG: 'en_US.UTF-8' } });
+    await pinLanguage('zh-CN');
+
+    await runLauncher([], { root: h.root, entry: h.entry, env: h.env, stdio: 'ignore' });
+
+    const argv = await h.argv();
+    expect(argv[argv.length - 1]).toContain('Write the reply in zh-CN');
+    const prompt = valueOf(argv, '--append-system-prompt');
+    expect(prompt).toContain('**zh-CN**');
+    expect(prompt).toContain('**舰长**');
+    // Both halves are read by the same model; a disagreement is the model's to
+    // resolve, which is exactly what we do not want it spending a turn on.
+    expect(prompt).not.toContain('**en-US**');
+  });
+
+  it('opens in the language the shell reports when nothing is pinned', async () => {
+    const h = await harness({ persona: '# Helm', env: { LANG: 'zh_CN.UTF-8' } });
+
+    await runLauncher([], { root: h.root, entry: h.entry, env: h.env, stdio: 'ignore' });
+
+    const argv = await h.argv();
+    expect(argv[argv.length - 1]).toContain('Write the reply in zh-CN');
+    expect(valueOf(argv, '--append-system-prompt')).toMatch(/starting guess/i);
+  });
+
+  it('claims no language at all when the locale names none', async () => {
+    // `LC_ALL=C` is not a request for English. The window opens with the plain
+    // wake sweep and mirrors the captain from their first message.
+    const h = await harness({ persona: '# Helm', env: { LC_ALL: 'C', LANG: 'zh_CN.UTF-8' } });
+
+    await runLauncher([], { root: h.root, entry: h.entry, env: h.env, stdio: 'ignore' });
+
+    const argv = await h.argv();
+    expect(argv[argv.length - 1]).toBe(WAKE_PROMPT);
+    expect(valueOf(argv, '--append-system-prompt')).toMatch(/unknown, not as English/i);
   });
 
   it('opens silently when asked', async () => {

@@ -12,13 +12,20 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
+  DEFAULT_ADDRESS,
   DEFAULT_MAX_TOKENS_PER_TASK,
+  MIRROR_VOICE,
   ProjectRegistry,
   ProjectRegistryError,
+  addressTerm,
   configPath,
   dataDir,
   defaultConfig,
+  detectLanguage,
   loadConfig,
+  localeVarInEffect,
+  normalizeLanguage,
+  resolveCaptainVoice,
   saveConfig,
   slugify,
 } from '../src/config/index.js';
@@ -161,9 +168,150 @@ describe('saveConfig / loadConfig roundtrip', () => {
 
   it('clears an optional field when the patch sets it to null', () => {
     saveConfig({ model: 'claude-x' });
-    const cleared = saveConfig({ model: null } as unknown as { model?: string });
+    const cleared = saveConfig({ model: null });
     expect(cleared.model).toBeUndefined();
     expect(loadConfig().model).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The captain's language
+// ---------------------------------------------------------------------------
+
+describe('detectLanguage', () => {
+  it('reads the locale variables in POSIX precedence order', () => {
+    expect(detectLanguage({ LC_ALL: 'zh_CN.UTF-8', LC_MESSAGES: 'ja_JP', LANG: 'en_US' })).toBe('zh-CN');
+    expect(detectLanguage({ LC_MESSAGES: 'ja_JP.UTF-8', LANG: 'en_US.UTF-8' })).toBe('ja-JP');
+    expect(detectLanguage({ LANG: 'en_US.UTF-8' })).toBe('en-US');
+    expect(localeVarInEffect({ LC_MESSAGES: 'ja_JP', LANG: 'en_US' })).toBe('LC_MESSAGES');
+    expect(localeVarInEffect({})).toBeUndefined();
+  });
+
+  it('skips an unset or empty variable and asks the next one', () => {
+    // An empty LC_ALL is an absence, not an answer — it is what a shell leaves
+    // behind after `LC_ALL= some-command`.
+    expect(detectLanguage({ LC_ALL: '', LANG: 'zh_CN.UTF-8' })).toBe('zh-CN');
+    expect(detectLanguage({ LC_ALL: '   ', LC_MESSAGES: '', LANG: 'zh_TW' })).toBe('zh-TW');
+  });
+
+  it('resolves C and POSIX to NOTHING rather than to English', () => {
+    // The whole point. `C` is the locale that means "no localisation", and every
+    // build box, cron job and `LC_ALL=C` wrapper sets one. Reading it as a vote
+    // for English would answer a Chinese captain in English because of a
+    // variable nobody set on purpose; resolving to nothing means Helm mirrors
+    // whatever they write, which is the better failure of the two.
+    for (const value of ['C', 'POSIX', 'c', 'C.UTF-8', 'posix']) {
+      expect(detectLanguage({ LANG: value }), value).toBeUndefined();
+    }
+    expect(detectLanguage({})).toBeUndefined();
+    // And a set LC_ALL decides even when it names no language: POSIX gives it
+    // precedence outright, so we do not reach past it for LANG.
+    expect(detectLanguage({ LC_ALL: 'C', LANG: 'zh_CN.UTF-8' })).toBeUndefined();
+  });
+
+  it('drops encodings, modifiers and garbage', () => {
+    expect(detectLanguage({ LANG: 'zh_CN.UTF-8@pinyin' })).toBe('zh-CN');
+    expect(detectLanguage({ LANG: 'zh_Hans_CN' })).toBe('zh-Hans-CN');
+    expect(detectLanguage({ LANG: 'en' })).toBe('en');
+    expect(detectLanguage({ LANG: '@@@' })).toBeUndefined();
+    expect(detectLanguage({ LANG: '42' })).toBeUndefined();
+  });
+});
+
+describe('language as a config key', () => {
+  it('persists a pin and reloads it', () => {
+    expect(saveConfig({ language: 'zh-CN' }).language).toBe('zh-CN');
+    expect(loadConfig().language).toBe('zh-CN');
+    const onDisk = JSON.parse(fs.readFileSync(configPath(), 'utf8')) as Record<string, unknown>;
+    expect(onDisk.language).toBe('zh-CN');
+  });
+
+  it('is absent from a config that never set one, rather than written as English', () => {
+    expect(defaultConfig().language).toBeUndefined();
+    saveConfig({ maxRework: 1 });
+    const onDisk = JSON.parse(fs.readFileSync(configPath(), 'utf8')) as Record<string, unknown>;
+    expect(onDisk).not.toHaveProperty('language');
+  });
+
+  it('canonicalises a locale the captain pasted out of their environment', () => {
+    expect(saveConfig({ language: 'zh_CN.UTF-8' }).language).toBe('zh-CN');
+    expect(warnSpy).not.toHaveBeenCalled();
+  });
+
+  it('keeps a language named in words verbatim', () => {
+    // The value is read by a model, not by a locale library: "中文" and
+    // "Simplified Chinese" are exactly as clear to it as "zh-CN".
+    expect(saveConfig({ language: '中文' }).language).toBe('中文');
+    expect(saveConfig({ language: 'Simplified Chinese' }).language).toBe('Simplified Chinese');
+    expect(warnSpy).not.toHaveBeenCalled();
+  });
+
+  it('refuses a value that names no language, and keeps its siblings', () => {
+    writeConfig(JSON.stringify({ language: 'C', maxRework: 3 }));
+    const cfg = loadConfig();
+    expect(cfg.language).toBeUndefined();
+    expect(cfg.maxRework).toBe(3);
+    expect(String(warnSpy.mock.calls[0]?.[0])).toContain('name no language');
+
+    // `null` is absent on purpose — it is the documented way to CLEAR the key,
+    // not a bad value. The case above it covers that.
+    for (const bad of ['POSIX', '', '   ', 'x'.repeat(41), 7]) {
+      warnSpy.mockClear();
+      writeConfig(JSON.stringify({ language: bad }));
+      expect(loadConfig().language, JSON.stringify(bad)).toBeUndefined();
+    }
+  });
+
+  it('clears the pin on null, which means "follow whatever I write"', () => {
+    saveConfig({ language: 'zh-CN' });
+    expect(saveConfig({ language: null }).language).toBeUndefined();
+    expect(loadConfig().language).toBeUndefined();
+    const onDisk = JSON.parse(fs.readFileSync(configPath(), 'utf8')) as Record<string, unknown>;
+    expect(onDisk).not.toHaveProperty('language');
+  });
+
+  it('normalizeLanguage answers the same questions the loader asks', () => {
+    expect(normalizeLanguage('zh_CN.UTF-8')).toBe('zh-CN');
+    expect(normalizeLanguage('  en  ')).toBe('en');
+    expect(normalizeLanguage('C')).toBeUndefined();
+    expect(normalizeLanguage('POSIX')).toBeUndefined();
+    expect(normalizeLanguage('')).toBeUndefined();
+  });
+});
+
+describe('addressTerm', () => {
+  it('calls a Chinese-speaking captain 舰长, however the language is spelled', () => {
+    for (const tag of ['zh', 'zh-CN', 'zh-Hans-CN', 'ZH-cn', '中文', 'Chinese']) {
+      expect(addressTerm(tag), tag).toBe('舰长');
+    }
+  });
+
+  it('falls back to Captain for English, for the unknown, and for what it has no word for', () => {
+    // The table is short on purpose: it holds the one term the captain actually
+    // gave us. Everything else is the model's to translate — see the launcher's
+    // system prompt, which tells it to.
+    expect(addressTerm(undefined)).toBe(DEFAULT_ADDRESS);
+    expect(addressTerm('en-GB')).toBe('Captain');
+    expect(addressTerm('de-DE')).toBe('Captain');
+  });
+});
+
+describe('resolveCaptainVoice', () => {
+  it('lets the captain’s pin beat the environment', () => {
+    const voice = resolveCaptainVoice('zh-CN', { LANG: 'en_US.UTF-8' });
+    expect(voice).toEqual({ language: 'zh-CN', address: '舰长', pinned: true });
+  });
+
+  it('detects when there is no pin, and says it is a guess', () => {
+    const voice = resolveCaptainVoice(undefined, { LANG: 'zh_CN.UTF-8' });
+    expect(voice).toEqual({ language: 'zh-CN', address: '舰长', pinned: false });
+  });
+
+  it('resolves to "mirror whatever they write" when nothing knows', () => {
+    expect(resolveCaptainVoice(undefined, { LANG: 'C' })).toEqual(MIRROR_VOICE);
+    expect(resolveCaptainVoice(undefined, {})).toEqual({ address: 'Captain', pinned: false });
+    // Undefined, not "en": nothing here is entitled to claim they read English.
+    expect(resolveCaptainVoice(undefined, {}).language).toBeUndefined();
   });
 });
 

@@ -83,6 +83,178 @@ export const EFFORT_LEVELS: readonly Effort[] = [
 ] as const;
 
 // ---------------------------------------------------------------------------
+// The captain's language
+// ---------------------------------------------------------------------------
+
+/**
+ * The locale variables, in POSIX precedence order.
+ *
+ * `LC_ALL` overrides everything, `LC_MESSAGES` is the category that governs the
+ * language a program *talks* in (as opposed to how it sorts or formats money),
+ * and `LANG` is the fallback for every unset category. Anything further down —
+ * `LC_CTYPE`, `LANGUAGE` — is either about encoding or is a GNU extension
+ * carrying a colon-separated preference list, and neither is worth guessing a
+ * captain's language from.
+ */
+export const LOCALE_ENV_VARS = ['LC_ALL', 'LC_MESSAGES', 'LANG'] as const;
+
+/** How Helm addresses the captain when nothing better is known. */
+export const DEFAULT_ADDRESS = 'Captain';
+
+/**
+ * The address term, by language. Deliberately short.
+ *
+ * There is exactly one non-English entry because there is exactly one term we
+ * were actually given: the captain asked to be called 舰长. Filling this table
+ * out with Kapitän, Capitaine, Капитан and the rest would be inventing content
+ * nobody has checked, in a place where being wrong is invisible until it reaches
+ * the person being addressed. The launcher's system prompt instead tells the
+ * model to use the natural equivalent of "Captain" when the language it is
+ * writing in is not in here — a translation the model is better at than this
+ * table will ever be. Add a row when a captain tells you the word they want.
+ *
+ * Keys are matched against the whole tag first, then its primary subtag, both
+ * lowercased — so `zh`, `zh-CN`, `zh-Hans-CN` and a hand-typed `中文` all land
+ * on the same term.
+ */
+const ADDRESS_TERMS: Readonly<Record<string, string>> = {
+  zh: '舰长',
+  中文: '舰长',
+  chinese: '舰长',
+};
+
+/**
+ * Longest value accepted for `language`.
+ *
+ * The value is pasted into a system prompt, so it is an input to the model, not
+ * just a setting. "Simplified Chinese" fits; a pasted paragraph is not a
+ * language and must not become one line of Helm's instructions.
+ */
+const MAX_LANGUAGE_LENGTH = 40;
+
+/** Locale-shaped: `zh`, `zh_CN`, `zh-Hans-CN`, `en_US.UTF-8`, `zh_CN@pinyin`, `C`. */
+const LOCALE_SHAPE = /^[A-Za-z]{1,8}([_-][A-Za-z0-9]{1,8})*(\.[^\s@]+)?(@[^\s]+)?$/;
+
+/**
+ * A POSIX locale or BCP-47 tag, canonicalised — or undefined when it names no
+ * language at all.
+ *
+ * `C` and `POSIX` are the important undefined case, and they are NOT English.
+ * They are the locale that means "no localisation": every build server, cron
+ * job and `LC_ALL=C` script sets one, and reading it as a request for English
+ * would tell Helm to answer a Chinese captain in English on the strength of a
+ * variable nobody set on purpose. Undetectable resolves to nothing, and nothing
+ * means "mirror whatever the captain writes" — the better failure of the two.
+ */
+export function canonicalLanguageTag(raw: string): string | undefined {
+  const base = (raw.split('@')[0] ?? '').split('.')[0] ?? '';
+  const parts = base.split(/[_-]/).filter((p) => p !== '');
+  const primary = (parts[0] ?? '').toLowerCase();
+  // `C` fails the length test; `POSIX` has to be named.
+  if (!/^[a-z]{2,8}$/.test(primary) || primary === 'c' || primary === 'posix') return undefined;
+  const rest = parts.slice(1);
+  if (rest.some((s) => !/^[A-Za-z0-9]{1,8}$/.test(s))) return undefined;
+  return [
+    primary,
+    // BCP-47 casing: region UPPER, script Titlecase, everything else lower. It
+    // is cosmetic — nothing here parses the tag again — but a config file the
+    // captain opens should not show them `zh_cn.utf-8`.
+    ...rest.map((s) =>
+      s.length === 2
+        ? s.toUpperCase()
+        : s.length === 4
+          ? s.charAt(0).toUpperCase() + s.slice(1).toLowerCase()
+          : s.toLowerCase(),
+    ),
+  ].join('-');
+}
+
+/**
+ * What the captain may type into `blue config set language <v>`: a locale tag,
+ * canonicalised — or a language named in words, kept verbatim.
+ *
+ * Free-form is allowed on purpose. This value is read by a model, not by a
+ * locale library, and "Simplified Chinese", "中文" and "zh-CN" are all perfectly
+ * clear to it. Being stricter would reject the spelling a captain reaches for
+ * first while gaining nothing.
+ */
+export function normalizeLanguage(raw: string): string | undefined {
+  const trimmed = raw.trim();
+  if (trimmed === '' || trimmed.length > MAX_LANGUAGE_LENGTH) return undefined;
+  if (LOCALE_SHAPE.test(trimmed)) return canonicalLanguageTag(trimmed);
+  return trimmed;
+}
+
+/** The locale variable that decides, and its value — POSIX order, first one set wins. */
+function decidingLocale(env: NodeJS.ProcessEnv): { name: string; value: string } | undefined {
+  for (const name of LOCALE_ENV_VARS) {
+    const value = env[name];
+    if (value !== undefined && value.trim() !== '') return { name, value };
+  }
+  return undefined;
+}
+
+/** Which locale variable this environment is answering from, if any. */
+export function localeVarInEffect(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  return decidingLocale(env)?.name;
+}
+
+/**
+ * The captain's language as this shell reports it, or undefined.
+ *
+ * Unset and empty variables are skipped — an empty `LC_ALL` is not an answer, it
+ * is an absence. A variable that IS set decides, even if what it names is `C`:
+ * POSIX gives `LC_ALL` precedence outright, and a captain (or a wrapper script)
+ * who set it to `C` asked for no localisation, which is a thing we can honour by
+ * returning nothing rather than reaching past them for `LANG`.
+ */
+export function detectLanguage(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  const found = decidingLocale(env);
+  return found === undefined ? undefined : canonicalLanguageTag(found.value);
+}
+
+/** The term Helm addresses the captain with, for a language. */
+export function addressTerm(language: string | undefined): string {
+  if (language === undefined) return DEFAULT_ADDRESS;
+  const lower = language.toLowerCase();
+  const primary = lower.split('-')[0] ?? lower;
+  return ADDRESS_TERMS[lower] ?? ADDRESS_TERMS[primary] ?? DEFAULT_ADDRESS;
+}
+
+/**
+ * Everything a window needs to know about who it is talking to: which language
+ * to write in, what to call them, and whether that language is the captain's own
+ * standing instruction or this process's guess at it.
+ */
+export interface CaptainVoice {
+  /** The language to write in. Undefined means "mirror whatever they write". */
+  language?: string;
+  /** 舰长, Captain, … — always populated; `DEFAULT_ADDRESS` when unknown. */
+  address: string;
+  /** True when the captain pinned it in config; false when it was detected. */
+  pinned: boolean;
+}
+
+/** What a window knows about its captain when nothing at all resolved. */
+export const MIRROR_VOICE: CaptainVoice = { address: DEFAULT_ADDRESS, pinned: false };
+
+/**
+ * The pin wins; failing that, the environment; failing that, nothing.
+ *
+ * `pinned` is not decoration — it is the difference between a standing
+ * instruction and a guess, and the two behave differently when the captain then
+ * writes in a third language. See the launcher's system prompt section.
+ */
+export function resolveCaptainVoice(
+  pinned: string | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): CaptainVoice {
+  const language = pinned ?? detectLanguage(env);
+  if (language === undefined) return MIRROR_VOICE;
+  return { language, address: addressTerm(language), pinned: pinned !== undefined };
+}
+
+// ---------------------------------------------------------------------------
 // Shape
 // ---------------------------------------------------------------------------
 
@@ -126,9 +298,34 @@ export interface BlueConfig {
   maxConcurrentCrew: number;
   /** How many times a failed verdict may send a task back to its Crew. */
   maxRework: number;
+  /**
+   * The language Helm writes to the captain in — the captain's explicit pin,
+   * and it always wins.
+   *
+   * Undefined is a real answer, not a missing one: it means nothing here claims
+   * to know, so Helm opens in English and follows the captain from their first
+   * message. The launcher fills the gap by DETECTING a language from the shell's
+   * locale (`detectLanguage`); this key exists for when that guess is wrong, or
+   * when there is no locale to guess from.
+   *
+   * BlueSpace is not a Chinese tool. It is a tool one captain uses in Chinese,
+   * and this is the one line that says so — nothing downstream hardcodes a
+   * language, and the address term travels with this value (`addressTerm`).
+   */
+  language?: string;
   /** Derived from BLUESPACE_HOME / ~/.bluespace. Not settable from the file. */
   dataDir: string;
 }
+
+/**
+ * A patch for `saveConfig`. `null` clears an optional field; leaving a key out
+ * leaves it alone.
+ *
+ * Spelled as its own type because `Partial<BlueConfig>` cannot express the
+ * clear: a caller that wrote `{ model: undefined }` meaning "clear it" got a
+ * key that `mergeConfig` correctly ignores, and their model stayed put.
+ */
+export type ConfigPatch = { [K in keyof BlueConfig]?: BlueConfig[K] | null };
 
 // ---------------------------------------------------------------------------
 // Paths
@@ -351,6 +548,26 @@ export function mergeConfig(base: BlueConfig, patch: Record<string, unknown>): B
     }
   }
 
+  if ('language' in patch) {
+    if (patch.language === null) {
+      out.language = undefined;
+    } else if (patch.language !== undefined) {
+      const normalized = typeof patch.language === 'string' ? normalizeLanguage(patch.language) : undefined;
+      if (normalized === undefined) {
+        // Named separately from "expected a non-empty string" because `C` and
+        // `POSIX` ARE non-empty strings, and a captain who copied one out of
+        // their environment deserves to know why it was refused.
+        warn(
+          `ignoring invalid language ${JSON.stringify(patch.language)} — expected a language ` +
+            'like "zh-CN", "en" or "Simplified Chinese". "C" and "POSIX" name no language; ' +
+            'leave it unset for "follow whatever I write".',
+        );
+      } else {
+        out.language = normalized;
+      }
+    }
+  }
+
   if (patch.maxTokensPerTask !== undefined) {
     const got = pickNumber(patch.maxTokensPerTask, 'maxTokensPerTask', { min: 0, integer: true });
     if (got.ok) out.maxTokensPerTask = got.value;
@@ -418,7 +635,7 @@ export function loadConfig(): BlueConfig {
 }
 
 /** Merge `patch` over the current config, persist atomically, return the result. */
-export function saveConfig(patch: Partial<BlueConfig>): BlueConfig {
+export function saveConfig(patch: ConfigPatch): BlueConfig {
   const merged = mergeConfig(loadConfig(), patch as Record<string, unknown>);
   writeJsonAtomic(configPath(), serialize(merged));
   return merged;
@@ -430,6 +647,7 @@ function serialize(cfg: BlueConfig): Record<string, unknown> {
     permissionMode: cfg.permissionMode,
     ...(cfg.model !== undefined ? { model: cfg.model } : {}),
     ...(cfg.effort !== undefined ? { effort: cfg.effort } : {}),
+    ...(cfg.language !== undefined ? { language: cfg.language } : {}),
     maxTokensPerTask: cfg.maxTokensPerTask,
     maxBudgetUsdPerTask: cfg.maxBudgetUsdPerTask,
     maxConcurrentCrew: cfg.maxConcurrentCrew,

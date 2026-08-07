@@ -368,7 +368,30 @@ directory (config, Blackbox, worktrees) — useful for keeping work projects sep
 | `maxBudgetUsdPerTask` | `5` | USD ceiling for one task — **enforced only on a metered run** (`ANTHROPIC_API_KEY` set). See below. |
 | `maxConcurrentCrew` | `4` | How many Crew may be in flight at once. |
 | `maxRework` | `2` | How many times a failing verdict may send a task back before it escalates to you. |
+| `language` | *(unset)* | The language Helm writes to you in. Unset means "work it out". See below. |
 | `dataDir` | `~/.bluespace` | Derived from `BLUESPACE_HOME`. Read-only; not settable. |
+
+### The language Helm talks to you in
+
+```bash
+blue config set language zh-CN     # a tag, or a name: "中文", "Simplified Chinese"
+blue config set language -         # unset it again
+```
+
+Leaving it unset is a real setting, not a missing one. `bluespace` reads `LC_ALL`, then
+`LC_MESSAGES`, then `LANG`, and opens the window in whatever they name — so a captain
+whose shell is `zh_CN.UTF-8` gets a Chinese wake sweep without configuring anything. A
+locale that names no language (`C`, `POSIX`, or nothing at all) resolves to **unknown, not
+to English**: Helm opens in English, then follows whatever language you write to it in and
+stays there. Set the key when the guess is wrong or when there is nothing to guess from.
+
+Whatever the language, **you are the captain and Helm addresses you as one** — 舰长 in
+Chinese, Captain in English. That is where the immersion stops by design: the fleet's own
+vocabulary for what is happening to your work, and no roleplay around it.
+
+Helm never writes this setting for you. If it worked out your language from something you
+typed, it may mention the command once, in a clause — it has no tool that edits your config,
+and it will not ask you the same question every morning.
 
 ### What a task costs, and which ceiling stops it
 

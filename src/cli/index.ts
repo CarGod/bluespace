@@ -37,11 +37,15 @@ import { Blackbox, projectCrewLog } from '../blackbox/index.js';
 import {
   PERMISSION_MODES,
   ProjectRegistry,
+  addressTerm,
   configPath,
+  detectLanguage,
   loadConfig,
+  localeVarInEffect,
+  normalizeLanguage,
   saveConfig,
 } from '../config/index.js';
-import type { BlueConfig } from '../config/index.js';
+import type { BlueConfig, ConfigPatch } from '../config/index.js';
 import { landTask, pendingDelivery, LandRefusedError } from '../land/index.js';
 import { Orchestrator } from '../orchestrator/index.js';
 import {
@@ -261,6 +265,12 @@ function usage(): string {
   // two lines when PermissionMode was rewritten to mirror the harness.
   L.push(`  ${dim('permissionMode')} ${PERMISSION_MODES.join('|')}`);
   L.push(`  ${dim('effort')} ${EFFORTS.join('|')}   ${dim('model')} <string>`);
+  // Spelled out because "language" reads like a display setting and is not one:
+  // it is the language Helm writes to the captain in, and leaving it unset is a
+  // real answer rather than a missing one.
+  L.push(
+    `  ${dim('language')} <zh-CN|en|…>       ${dim('what Helm writes to you in; unset = follow what you write')}`,
+  );
   L.push(
     `  ${dim('maxConcurrentCrew')} <int>   ${dim('maxRework')} <int>   ${dim('maxTokensPerTask')} <int>   ${dim('maxBudgetUsdPerTask')} <number>`,
   );
@@ -950,6 +960,29 @@ async function cmdProjects(b: Boot, rest: string[], flags: Flags): Promise<numbe
 // `blue config set` accepting a mode the loader then rejects.
 const EFFORTS: readonly Effort[] = ['low', 'medium', 'high', 'xhigh', 'max'];
 
+/**
+ * What `blue config` says about the language — including, when it is unset, what
+ * Helm would work out for itself.
+ *
+ * A row that just said "(unset)" would leave the captain unable to answer the
+ * only question they have when Helm greets them in the wrong language: where did
+ * it get that idea. So the fallback is shown with the variable it came from, and
+ * an environment that names no language is shown as what it is — not a silent
+ * vote for English.
+ */
+function languageRow(config: BlueConfig): string {
+  if (config.language !== undefined) {
+    return `${config.language} ${dim(`(Helm writes to you in this, and calls you ${addressTerm(config.language)})`)}`;
+  }
+  const detected = detectLanguage();
+  if (detected === undefined) {
+    return dim('(unset) no language in this shell — Helm follows whatever you write to it');
+  }
+  return dim(
+    `(unset) ${detected}, detected from ${localeVarInEffect() ?? 'the environment'} — Helm follows what you write`,
+  );
+}
+
 function printConfig(config: BlueConfig): void {
   // Read here rather than stored: this line describes what WOULD happen to a
   // task dispatched from this shell, which is a property of the environment,
@@ -976,6 +1009,7 @@ function printConfig(config: BlueConfig): void {
     ],
     ['maxConcurrentCrew', String(config.maxConcurrentCrew)],
     ['maxRework', String(config.maxRework)],
+    ['language', languageRow(config)],
     ['dataDir', dim(config.dataDir)],
   ];
   const w = Math.max(...rows.map(([k]) => k.length));
@@ -1006,13 +1040,17 @@ function cmdConfig(b: Boot, rest: string[]): number {
     errOut(red('blue config set needs a key and a value.'));
     errOut(
       dim(
-        'Keys: permissionMode, model, effort, maxConcurrentCrew, maxRework, maxTokensPerTask, maxBudgetUsdPerTask',
+        'Keys: permissionMode, model, effort, language, maxConcurrentCrew, maxRework, maxTokensPerTask, maxBudgetUsdPerTask',
       ),
     );
     return 1;
   }
 
-  const patch: Partial<BlueConfig> = {};
+  // `null` is how `mergeConfig` is told to CLEAR an optional field. `undefined`
+  // means "leave it alone", so the three `-` branches below must send null —
+  // written the other way, `blue config set model -` set a key mergeConfig then
+  // correctly ignored, and the model stayed exactly where it was.
+  const patch: ConfigPatch = {};
 
   switch (key) {
     case 'permissionMode': {
@@ -1024,12 +1062,33 @@ function cmdConfig(b: Boot, rest: string[]): number {
       break;
     }
     case 'model': {
-      patch.model = value === '-' || value === 'default' ? undefined : value;
+      patch.model = value === '-' || value === 'default' ? null : value;
+      break;
+    }
+    case 'language': {
+      if (value === '-' || value === 'default') {
+        // Clearing is a real setting, not an absence of one: it means "follow
+        // whatever I write", which is also what an undetectable locale means.
+        patch.language = null;
+        break;
+      }
+      const language = normalizeLanguage(value);
+      if (language === undefined) {
+        errOut(red(`language must name a language, got "${value}".`));
+        errOut(
+          dim(
+            'Try a tag (zh-CN, en, ja) or a name (「Simplified Chinese」). "C" and "POSIX" name no ' +
+              'language. Use "-" to clear it and let Helm follow whatever you write.',
+          ),
+        );
+        return 1;
+      }
+      patch.language = language;
       break;
     }
     case 'effort': {
       if (value === '-' || value === 'default') {
-        patch.effort = undefined;
+        patch.effort = null;
         break;
       }
       if (!EFFORTS.includes(value as Effort)) {
@@ -1095,7 +1154,7 @@ function cmdConfig(b: Boot, rest: string[]): number {
       errOut(red(`Unknown config key "${key}".`));
       errOut(
         dim(
-          'Keys: permissionMode, model, effort, maxConcurrentCrew, maxRework, maxTokensPerTask, maxBudgetUsdPerTask',
+          'Keys: permissionMode, model, effort, language, maxConcurrentCrew, maxRework, maxTokensPerTask, maxBudgetUsdPerTask',
         ),
       );
       return 1;
@@ -1104,7 +1163,11 @@ function cmdConfig(b: Boot, rest: string[]): number {
 
   try {
     const next = saveConfig(patch);
-    out(`${green('✓')} ${key} = ${bold(String(value))}`);
+    // `-` now genuinely clears (it used to send an `undefined` mergeConfig
+    // ignores), so the confirmation has to say what happened rather than echo a
+    // dash back at the captain as if it were the new value.
+    const cleared = patch[key as keyof ConfigPatch] === null;
+    out(cleared ? `${green('✓')} ${key} cleared` : `${green('✓')} ${key} = ${bold(String(value))}`);
     printConfig(next);
     return 0;
   } catch (e) {
