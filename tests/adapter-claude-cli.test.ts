@@ -29,14 +29,19 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import {
   ClaudeCliAdapter,
+  LaunchTooLargeError,
   SessionNotReadyError,
+  assertLaunchFits,
   buildLaunchArgv,
   buildRunSettings,
+  launchArgvBytes,
+  promptPointer,
   structuredOutputInstruction,
   validateAgainstSchema,
+  SUBMIT_SETTLE_MS,
 } from '../src/adapters/claude-cli.js';
 import { UnsupportedCapabilityError, type AdapterEvent } from '../src/adapters/types.js';
-import { TmuxBackend } from '../src/session/tmux.js';
+import { TMUX_COMMAND_BUDGET_BYTES, TmuxBackend, TmuxError } from '../src/session/tmux.js';
 import { VERDICT_SCHEMA, type DispatchProfile } from '../src/types/domain.js';
 
 const execFileAsync = promisify(execFile);
@@ -53,8 +58,13 @@ const SLOW = 60_000;
  *
  * It emulates exactly the four behaviours the adapter depends on, and no others:
  * the positional prompt lands in argv, a submit is a line on stdin, the hooks in
- * `--settings` are commands run through a shell, and the session survives its own
- * Stop hook so a follow-up turn is possible.
+ * the `--settings` FILE are commands run through a shell, and the session
+ * survives its own Stop hook so a follow-up turn is possible.
+ *
+ * It reads `--settings` and `--append-system-prompt-file` from disk because that
+ * is what the real CLI does with them, and because the whole point of passing
+ * them as paths is that they are too big for a command line. A fake that still
+ * accepted them inline would keep passing after a regression put them back.
  *
  * ONE DELIBERATE DIVERGENCE FROM THE REAL CLI: the fake starts turn one on the
  * Enter rather than on the positional prompt, which 2.1.222 submits by itself
@@ -75,7 +85,7 @@ const SLOW = 60_000;
  *   BLUE_SUBAGENTS       delegate on every turn, into the sibling subagents dir
  */
 const FAKE_CLAUDE = `#!/usr/bin/env node
-import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { execFile } from 'node:child_process';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
@@ -88,7 +98,12 @@ const log = (record) => appendFileSync(env.BLUE_INPUT_OUT, JSON.stringify({ t: D
 writeFileSync(env.BLUE_ARGV_OUT, JSON.stringify(argv));
 log({ event: 'start' });
 
-const settings = JSON.parse(flag('--settings') ?? '{}');
+// Both of these are PATHS now, and the real CLI reads them off disk. Reading
+// them the same way is what keeps this fake honest about the change.
+const readMaybe = (p) => { try { return readFileSync(p, 'utf8'); } catch { return ''; } };
+const settings = JSON.parse(readMaybe(flag('--settings')) || '{}');
+const appended = readMaybe(flag('--append-system-prompt-file'));
+
 const runHook = (kind, payload) => {
   const command = settings?.hooks?.[kind]?.[0]?.hooks?.[0]?.command;
   if (typeof command !== 'string') return;
@@ -102,7 +117,9 @@ if (env.BLUE_NO_READY !== '1') {
 }
 
 const sessionId = flag('--session-id');
-const outputPath = (String(flag('--append-system-prompt') ?? '').match(/\\/\\S+\\.json/) ?? [])[0];
+// Specifically the verdict file: the appended prompt can now name a prompt file
+// too, and a looser pattern would pick whichever came first.
+const outputPath = (appended.match(/\\/\\S+output\\.json/) ?? [])[0];
 
 function transcript(turn) {
   if (turn > 1) {
@@ -181,12 +198,28 @@ setInterval(() => {}, 1 << 30);
 // Harness
 // ---------------------------------------------------------------------------
 
-const sessions: string[] = [];
+/**
+ * Sockets, not sessions. The backend puts the fleet on its own tmux server
+ * (`tmux -L <name>`, see src/session/tmux.ts), so a `kill-session` on the shared
+ * socket reaps nothing and every test here would leak a live worker onto the
+ * REAL `bluespace` socket. Each test gets its own socket and afterEach takes the
+ * whole server, which is only safe because the socket is this suite's own — the
+ * same argument the backend itself makes.
+ */
+const sockets: string[] = [];
 const tmpDirs: string[] = [];
 
 afterEach(async () => {
-  for (const s of sessions.splice(0)) {
-    await execFileAsync('tmux', ['kill-session', '-t', `=${s}`]).catch(() => undefined);
+  for (const s of sockets.splice(0)) {
+    // Asked while a server is still there to answer; tmux's own default when
+    // the test already took it down. kill-server does not unlink the socket.
+    const shown = await execFileAsync('tmux', ['-L', s, 'display-message', '-p', '#{socket_path}'])
+      .then((r) => r.stdout.trim())
+      .catch(() => '');
+    await execFileAsync('tmux', ['-L', s, 'kill-server']).catch(() => undefined);
+    const socketPath =
+      shown !== '' ? shown : path.join(process.env['TMUX_TMPDIR'] ?? '/tmp', `tmux-${process.getuid?.() ?? 0}`, s);
+    await fs.rm(socketPath, { force: true });
   }
   for (const d of tmpDirs.splice(0)) await fs.rm(d, { recursive: true, force: true });
 });
@@ -205,6 +238,10 @@ interface Harness {
   argv(): Promise<string[]>;
   /** Run directories the adapter has created and not yet cleaned up. */
   runDirs(): Promise<string[]>;
+  /** The value of a flag in the launch argv, asserted present exactly once. */
+  flag(name: string): Promise<string>;
+  /** Contents of the file a path-valued flag points at. */
+  fileArg(name: string): Promise<string>;
 }
 
 async function setup(opts: {
@@ -233,8 +270,9 @@ async function setup(opts: {
   await fs.writeFile(inputOut, '');
 
   const session = `bluetest-cli-${process.pid}-${randomUUID().slice(0, 8)}`;
-  sessions.push(session);
-  const backend = new TmuxBackend({ session });
+  const socket = `bluetest-cli-${process.pid}-${randomUUID().slice(0, 8)}`;
+  sockets.push(socket);
+  const backend = new TmuxBackend({ session, socket });
 
   const adapter = new ClaudeCliAdapter({
     backend,
@@ -281,6 +319,21 @@ async function setup(opts: {
     async runDirs() {
       return (await fs.readdir(markerDir).catch(() => [])).filter((n) => n.startsWith('blue-run-'));
     },
+    async flag(name: string) {
+      const argv = JSON.parse(await fs.readFile(argvOut, 'utf8')) as string[];
+      const at = argv.indexOf(name);
+      expect(at, `${name} missing from ${JSON.stringify(argv)}`).toBeGreaterThanOrEqual(0);
+      expect(argv.lastIndexOf(name), `${name} appears twice`).toBe(at);
+      const value = argv[at + 1];
+      expect(value, `${name} has no value`).toBeDefined();
+      return value as string;
+    },
+    async fileArg(name: string) {
+      const argv = JSON.parse(await fs.readFile(argvOut, 'utf8')) as string[];
+      const at = argv.indexOf(name);
+      expect(at, `${name} missing from ${JSON.stringify(argv)}`).toBeGreaterThanOrEqual(0);
+      return fs.readFile(argv[at + 1] as string, 'utf8');
+    },
   };
 }
 
@@ -321,8 +374,8 @@ describe('buildLaunchArgv', () => {
         sessionId: '11111111-2222-3333-4444-555555555555',
         profile: { permissionMode: 'auto', effort: 'high', model: 'claude-opus-5' },
         settingScopes: ['project', 'local'],
-        systemPromptAppend: 'SYS',
-        settingsJson: '{"hooks":{}}',
+        systemPromptFile: '/run/system-prompt.md',
+        settingsFile: '/run/settings.json',
         prompt: 'do the thing',
       }),
     ).toEqual([
@@ -333,16 +386,38 @@ describe('buildLaunchArgv', () => {
       'auto',
       '--setting-sources',
       'project,local',
-      '--append-system-prompt',
-      'SYS',
+      // PATHS, not text. Both of these are unbounded inputs and the command line
+      // is 16,364 bytes; see TMUX_MAX_COMMAND_BYTES.
+      '--append-system-prompt-file',
+      '/run/system-prompt.md',
       '--effort',
       'high',
       '--model',
       'claude-opus-5',
       '--settings',
-      '{"hooks":{}}',
+      '/run/settings.json',
       'do the thing',
     ]);
+  });
+
+  it('never puts an unbounded input on the line, however big the inputs get', () => {
+    // The regression, stated as a property rather than as a golden argv: the
+    // system prompt and the settings are the two inputs that grow with a task
+    // (a JSON Schema lives in the first, hooks in the second), and neither may
+    // appear as text. A 112,680-byte prompt on this line is what killed a task.
+    const argv = buildLaunchArgv({
+      claudePath: 'claude',
+      sessionId: 'id',
+      profile: { permissionMode: 'auto' },
+      settingScopes: [],
+      systemPromptFile: '/run/system-prompt.md',
+      settingsFile: '/run/settings.json',
+      prompt: 'p',
+    });
+    expect(argv, 'the system prompt must travel as a file').not.toContain('--append-system-prompt');
+    expect(argv).toContain('--append-system-prompt-file');
+    // `--settings` takes "a file or a JSON string"; only the file form is bounded.
+    expect(argv[argv.indexOf('--settings') + 1]).toBe('/run/settings.json');
   });
 
   it('passes --setting-sources with an EMPTY value for an empty scope list', () => {
@@ -351,8 +426,8 @@ describe('buildLaunchArgv', () => {
       sessionId: 'id',
       profile: { permissionMode: 'auto' },
       settingScopes: [],
-      systemPromptAppend: 'SYS',
-      settingsJson: '{}',
+      systemPromptFile: '/run/system-prompt.md',
+      settingsFile: '/run/settings.json',
       prompt: 'p',
     });
 
@@ -372,13 +447,57 @@ describe('buildLaunchArgv', () => {
       sessionId: 'id',
       profile: { permissionMode: 'plan' },
       settingScopes: ['user'],
-      systemPromptAppend: 'SYS',
-      settingsJson: '{}',
+      systemPromptFile: '/run/system-prompt.md',
+      settingsFile: '/run/settings.json',
       prompt: 'p',
     });
     expect(argv).not.toContain('--effort');
     expect(argv).not.toContain('--model');
     expect(argv.at(-1)).toBe('p');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The line budget — BlueSpace's own diagnosis, in place of tmux's
+// ---------------------------------------------------------------------------
+
+describe('the launch line budget', () => {
+  it('sizes an argv in BYTES, counting each element’s terminator', () => {
+    // tmux packs argv NUL-terminated, so the unit is bytes and every element
+    // costs one more than its own length. Measuring in `String.length` would
+    // under-count a Chinese brief by a factor of three and pass a command tmux
+    // then refuses.
+    expect(launchArgvBytes(['ab', 'c'])).toBe(3 + 2);
+    expect(launchArgvBytes(['舰长'])).toBe(6 + 1);
+    expect(launchArgvBytes([])).toBe(0);
+  });
+
+  it('names WHICH input is oversized and how big it is, which tmux never does', () => {
+    // The whole point. tmux answers `command too long` — no argument, no size,
+    // nothing to act on — and a captain reading that learns only that BlueSpace
+    // is broken.
+    const err = (() => {
+      try {
+        assertLaunchFits(['claude', 'x'.repeat(50_000)], 15_340, [
+          { label: 'the opening prompt', bytes: 50_000 },
+          { label: 'the working directory', bytes: 40 },
+        ]);
+        return undefined;
+      } catch (e) {
+        return e as Error;
+      }
+    })();
+
+    expect(err, 'an oversized launch must be refused').toBeInstanceOf(LaunchTooLargeError);
+    expect(err?.message).toContain('the opening prompt');
+    expect(err?.message).toContain('50,000');
+    expect(err?.message).toContain('15,340');
+    // And it must not repeat the diagnosis that sent the last fix the wrong way.
+    expect(err?.message).toMatch(/NOT the kernel's ARG_MAX/);
+  });
+
+  it('says nothing at all when the line fits', () => {
+    expect(() => assertLaunchFits(['claude', 'small'], 15_340, [])).not.toThrow();
   });
 });
 
@@ -485,6 +604,10 @@ describe('spawn', () => {
       });
 
       const argv = await h.argv();
+      const runDirs = await h.runDirs();
+      expect(runDirs).toHaveLength(1);
+      const runDir = path.join(h.markerDir, runDirs[0] as string);
+
       expect(argv.slice(0, 8)).toEqual([
         '--session-id',
         session.id,
@@ -492,21 +615,25 @@ describe('spawn', () => {
         'auto',
         '--setting-sources',
         '',
-        '--append-system-prompt',
-        'SYS',
+        '--append-system-prompt-file',
+        path.join(runDir, 'system-prompt.md'),
       ]);
       expect(argv.slice(8, 12)).toEqual(['--effort', 'low', '--model', 'claude-sonnet-5']);
       expect(argv[12]).toBe('--settings');
-      // THE COMPOSER: the brief travels as the last positional and nothing else.
+      expect(argv[13]).toBe(path.join(runDir, 'settings.json'));
+      // THE COMPOSER: a brief this size still travels as the last positional and
+      // nothing else. The file indirection is for prompts that do not fit, and
+      // this one does — see the >100KB test below for the other half.
       expect(argv.at(-1)).toBe('fix the parser');
+      // The appended system prompt is a file the CLI reads, and it holds what
+      // used to sit on the line.
+      expect(await h.fileArg('--append-system-prompt-file')).toBe('SYS');
 
-      const settings = JSON.parse(argv[13] as string) as {
+      const settings = JSON.parse(await h.fileArg('--settings')) as {
         hooks: Record<string, Array<{ hooks: Array<{ command: string }> }>>;
       };
-      const runDirs = await h.runDirs();
-      expect(runDirs).toHaveLength(1);
       expect(settings.hooks['SessionStart']?.[0]?.hooks[0]?.command).toContain(
-        path.join(h.markerDir, runDirs[0] as string, 'ready'),
+        path.join(runDir, 'ready'),
       );
       expect(settings.hooks['Stop']?.[0]?.hooks[0]?.command).toContain('stop');
 
@@ -555,6 +682,105 @@ describe('spawn', () => {
       expect(await fs.stat(canary).catch(() => undefined), 'a shell ran the brief').toBeUndefined();
 
       await session.close();
+    },
+    SLOW,
+  );
+
+  it(
+    'launches a SENTINEL-SIZED prompt — the exact case that used to lose the task',
+    async () => {
+      // THE REGRESSION. A Sentinel's prompt is a brief plus an entire diff; the
+      // one that died measured 112,680 bytes, against a tmux command ceiling of
+      // 16,364. It failed with tmux's `command too long`, the rework respawn hit
+      // the same wall, and 2.4M tokens produced nothing verified.
+      const h = await setup();
+      const diff = Array.from(
+        { length: 2_000 },
+        (_, i) => `+  const line${i} = doSomething(${i}); // 舰长 padding to make this a real size`,
+      ).join('\n');
+      const prompt = `Verify the work below.\n\n--- BEGIN DIFF ---\n${diff}\n--- END DIFF ---`;
+      expect(Buffer.byteLength(prompt, 'utf8')).toBeGreaterThan(100_000);
+
+      const session = await h.adapter.spawn({
+        cwd: h.root,
+        prompt,
+        profile: PROFILE,
+        settingScopes: [],
+        systemPromptAppend: 'SYS',
+      });
+
+      // 1. It launched, and it ran a real turn. Building the argv is not the
+      //    claim; reaching Stop through tmux is.
+      const exit = exitOf(await collect(session.events()));
+      expect(exit).toMatchObject({ ok: true });
+
+      // 2. The line stayed small. This is the property, not the byte count: no
+      //    element of it grows with the prompt.
+      const argv = await h.argv();
+      const runDir = path.join(h.markerDir, (await h.runDirs())[0] as string);
+      expect(launchArgvBytes(argv)).toBeLessThan(TMUX_COMMAND_BUDGET_BYTES);
+
+      // 3. The prompt is intact on disk — truncating it silently would be worse
+      //    than the failure this replaces.
+      const promptFile = path.join(runDir, 'prompt.md');
+      expect(await fs.readFile(promptFile, 'utf8')).toBe(prompt);
+
+      // 4. The positional points at it and carries no task of its own, so there
+      //    is nothing for a worker to act on INSTEAD of reading the file.
+      expect(argv.at(-1)).toBe(promptPointer(promptFile));
+      expect(argv.at(-1)).toContain(promptFile);
+      expect(argv.at(-1)).not.toContain('BEGIN DIFF');
+
+      // 5. The SECOND CHANNEL. The system prompt is loaded by the CLI itself, so
+      //    a worker that ignores the composer has still been told where its
+      //    instructions are. This is what makes the file survivable.
+      const appended = await h.fileArg('--append-system-prompt-file');
+      expect(appended.startsWith('SYS')).toBe(true);
+      expect(appended, 'a worker ignoring the positional must still be told').toContain(promptFile);
+
+      // 6. And it can actually read it: the file is outside the worktree.
+      expect(argv[argv.indexOf('--add-dir') + 1]).toBe(runDir);
+
+      await session.close();
+    },
+    SLOW,
+  );
+
+  it(
+    'refuses an oversized launch with ITS OWN diagnosis, never tmux’s',
+    async () => {
+      // `command too long` names no input, no size and no next move. The whole
+      // value of budgeting before launch is the sentence that replaces it.
+      const h = await setup();
+      // The prompt can no longer overflow (it becomes a file), so this is the
+      // other way the line grows: everything else on it at once.
+      const absurdCwd = path.join(h.root, 'x'.repeat(TMUX_COMMAND_BUDGET_BYTES));
+
+      const err = await h.adapter
+        .spawn({
+          cwd: absurdCwd,
+          prompt: 'fix the parser',
+          profile: PROFILE,
+          settingScopes: [],
+          systemPromptAppend: 'SYS',
+        })
+        .then(
+          () => undefined,
+          (e: unknown) => e as Error,
+        );
+
+      expect(err, 'an unlaunchable command must be refused').toBeInstanceOf(LaunchTooLargeError);
+      // BlueSpace's words, naming a BlueSpace input and its size.
+      expect(err?.message).toContain('the working directory');
+      expect(err?.message).toMatch(/\d{2},\d{3} bytes/);
+      // Not tmux's. If this ever reads `command too long`, the check has moved
+      // back behind the launch and the diagnosis is gone again.
+      expect(err?.message).not.toMatch(/command too long/i);
+      expect(err).not.toBeInstanceOf(TmuxError);
+
+      // And nothing was left behind: no window for the reaper, no run directory.
+      expect(await h.backend.list()).toEqual([]);
+      expect(await h.runDirs()).toEqual([]);
     },
     SLOW,
   );
@@ -614,8 +840,10 @@ describe('events', () => {
         systemPromptAppend: 'SYS',
       });
 
+      // `-L <socket>` and all: the fleet is on its own tmux server, so a paste
+      // without the flag goes to the shared one and reports a live worker gone.
       expect(session.attachCommand, 'blue ps has nothing to print without this').toMatch(
-        /^tmux attach -t bluetest-cli-.*:=blue-/,
+        /^tmux -L bluetest-cli-\S+ attach -t bluetest-cli-.*:=blue-/,
       );
 
       const events = await collect(session.events());
@@ -893,6 +1121,39 @@ describe('events', () => {
     },
     SLOW,
   );
+
+  it(
+    'waits for the composer to settle before pressing Enter on a follow-up turn',
+    async () => {
+      // The regression: `sendText` + `sendKey('Enter')` back to back. A message
+      // of any size arrives at the TUI as a paste, and an Enter inside the paste
+      // window is swallowed as one more character of it — so the rework sat in
+      // the composer unsent, the task stayed `working`, and the only thing that
+      // ever moved it was a human pressing Enter by hand. Measured on 2.1.224:
+      // no gap did not submit; 150ms and up did.
+      const h = await setup({});
+      const session = await h.adapter.spawn({
+        cwd: h.root,
+        prompt: 'first turn',
+        profile: PROFILE,
+        settingScopes: [],
+        systemPromptAppend: 'SYS',
+      });
+      await collect(session.events());
+
+      const started = Date.now();
+      await session.send('a follow-up turn');
+      const elapsed = Date.now() - started;
+
+      expect(elapsed).toBeGreaterThanOrEqual(SUBMIT_SETTLE_MS);
+      // It still submits: one line reached the stand-in for each turn.
+      const submits = (await h.log()).filter((r) => r['event'] === 'submit');
+      expect(submits).toHaveLength(2);
+
+      await session.close();
+    },
+    SLOW,
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -916,7 +1177,7 @@ describe('structured output', () => {
       });
 
       const argv = await h.argv();
-      const appended = argv[argv.indexOf('--append-system-prompt') + 1] as string;
+      const appended = await h.fileArg('--append-system-prompt-file');
       expect(appended.startsWith('SYS')).toBe(true);
       expect(appended).toContain('output.json');
       expect(appended).toContain('"pass"');

@@ -66,8 +66,71 @@ export interface LaunchRequest {
 /** Keys a backend can press. Deliberately tiny — this is not a keyboard API. */
 export type SessionKey = 'Enter' | 'Escape';
 
+/**
+ * How an endpoint ended, when it ended — the detail `alive(): boolean` throws
+ * away.
+ *
+ * Still process state, never content: this reports what happened to the *place*
+ * the worker was running, and says nothing about whether its turn finished.
+ * "The turn never finished" is the caller's own signal (no Stop marker within
+ * the timeout) and belongs to the caller; what a backend can add is whether the
+ * place is still there, and if not, how much went with it.
+ *
+ *   - `running`      a live process. Nothing to explain.
+ *   - `exited`       the endpoint is still there and the process in it is not.
+ *   - `window-gone`  this one endpoint was closed; its neighbours are fine.
+ *   - `session-gone` the group holding every endpoint went at once.
+ *   - `server-gone`  the whole backend instance is down. Everything went.
+ *   - `unavailable`  the backend did not answer. Evidence about the BACKEND,
+ *                    not about the worker — a caller must not report it as a
+ *                    death.
+ *
+ * The three "gone" states exist because they need different words to a human:
+ * one worker closed, one fleet closed, one machine's worth of tmux closed. A
+ * single "died" reads identically for all three and sends the captain looking in
+ * the wrong place.
+ */
+export type EndpointState =
+  | 'running'
+  | 'exited'
+  | 'window-gone'
+  | 'session-gone'
+  | 'server-gone'
+  | 'unavailable';
+
+export interface EndpointStatus {
+  readonly state: EndpointState;
+  /**
+   * One sentence, for a human, naming what is gone and where to look. Safe to
+   * put in an event reason or print in `blue ps`; contains no worker output.
+   */
+  readonly reason: string;
+}
+
 export interface SessionBackend {
   readonly name: string;
+
+  /**
+   * Largest `launch()` argv this backend can actually carry, in BYTES.
+   *
+   * Declared rather than assumed, for the same reason `AdapterCapabilities` is:
+   * a caller that guesses wrong finds out from the backend's own error message,
+   * which describes the backend's internals and not the caller's input. tmux
+   * refuses a command over 16 KiB with `command too long` — a sentence that tells
+   * a captain nothing about which of BlueSpace's inputs was oversized, and the
+   * exact failure that lost a task with a 112,680-byte Sentinel prompt on it.
+   *
+   * Counted the way a backend counts it, which for tmux is every argv element
+   * plus its NUL terminator — so callers must measure UTF-8 bytes, never
+   * `String.length`. A brief written in Chinese hits a byte ceiling at a third of
+   * the characters an English one does.
+   *
+   * Undefined means "no limit worth budgeting against" (a backend that spawns
+   * directly is bounded only by the kernel's ARG_MAX, which is 1 MiB and has
+   * never been the binding constraint here). Callers must treat it as advisory
+   * and still handle a launch failure.
+   */
+  readonly maxCommandBytes?: number;
 
   /**
    * Is this backend usable on this machine right now? Checked before dispatch,
@@ -88,6 +151,11 @@ export interface SessionBackend {
    * text forever. Submission is always a separate, explicit keypress, and
    * keeping the two apart means the same pair also covers steering a live
    * worker and answering it mid-run.
+   *
+   * TEXT OF ANY LENGTH MUST ARRIVE. `maxCommandBytes` bounds one command, not
+   * one message: a backend whose transport is smaller than the text splits it
+   * and delivers the pieces in order. Callers do not chunk, because a caller
+   * that chunked would have to know where the composer's submit key lives.
    */
   sendText(target: string, text: string): Promise<void>;
 
@@ -96,6 +164,23 @@ export interface SessionBackend {
 
   /** Process liveness only. Says nothing about whether a turn has finished. */
   alive(target: string): Promise<boolean>;
+
+  /**
+   * The same observation as `alive()`, with the reason kept. Optional: a backend
+   * that cannot tell its failures apart should not pretend to.
+   *
+   * Callers that only branch on liveness should keep using `alive()`. Callers
+   * that REPORT A DEATH TO THE CAPTAIN should prefer this, because `alive()`
+   * false is the same value for "the process exited", "somebody closed this
+   * window" and "somebody stopped the whole multiplexer", and the captain's next
+   * move differs in all three. The failure that motivated it: a fleet killed by a
+   * stray `tmux kill-server` was reported as `session ended before the Stop hook
+   * fired` — indistinguishable from a worker that crashed on its own, so the
+   * cause went unfound.
+   *
+   * `state: 'unavailable'` is not a death and must never be reported as one.
+   */
+  describeEndpoint?(target: string): Promise<EndpointStatus>;
 
   /** Terminate the endpoint. Idempotent: killing a dead endpoint is not an error. */
   kill(target: string): Promise<void>;

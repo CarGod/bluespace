@@ -38,12 +38,57 @@ import {
 // ---------------------------------------------------------------------------
 
 /**
- * Upper bound on the diff we paste into the prompt. A diff larger than this is
- * almost always a lockfile, a vendored dependency, or a generated bundle — but
- * we never silently drop the rest: the prompt says exactly how much was cut and
- * tells the Sentinel to treat unseen changes as unverified.
+ * Upper bound on the diff we paste into the prompt.
+ *
+ * WHAT THIS BOUND IS ABOUT HAS CHANGED, and the distinction matters to anyone
+ * thinking of raising it. It used to share the job of keeping the prompt small
+ * enough to travel; it no longer does, because a prompt this size now goes to
+ * the worker as a file (`src/adapters/claude-cli.ts`, header 6) and the command
+ * line is not a constraint on it at all. What remains is the only real one: THE
+ * MODEL'S CONTEXT WINDOW. A diff can be megabytes — a lockfile, a vendored
+ * dependency, a generated bundle — and no transport trick makes a megabyte of
+ * diff fit in a context alongside a brief and a system prompt.
+ *
+ * So a limit is unavoidable, and the only question is what happens at it. Three
+ * options, and two of them are unacceptable:
+ *
+ *   Silently dropping the rest is the worst outcome available. The Sentinel
+ *   would grade a partial diff believing it was whole, find no evidence for a
+ *   requirement met in the omitted half, and fail work that was correct — or
+ *   worse, see nothing objectionable in what it was shown and PASS a diff whose
+ *   unseen part was the problem. That is a verifier laundering uncertainty into
+ *   confidence, which is the one thing this file exists to prevent.
+ *
+ *   Failing the task outright produces no verdict at all: the captain gets a
+ *   dead task and a diff nobody looked at, which is the failure that motivated
+ *   this whole area of the code.
+ *
+ *   Truncating and SAYING SO is defensible, and it is what happens. The cut is
+ *   announced twice — in band, at the exact point the evidence stops, and again
+ *   after the diff — and the Sentinel is told to treat anything it cannot see as
+ *   unverified rather than as absent. A requirement that lived in the omitted
+ *   portion therefore comes back as `unmet`, which is a real verdict, correctly
+ *   signed, that a captain can act on. It fails closed, like every other path
+ *   here.
  */
 export const MAX_DIFF_CHARS = 200_000;
+
+/**
+ * Upper bound on the brief.
+ *
+ * Separate from the diff's, and far smaller, because the two are not the same
+ * kind of input: a diff is generated and can be any size, a brief is written by
+ * a human and one this long is already pathological. It is bounded anyway, so
+ * that the assembled prompt has a stated maximum instead of an assumed one — a
+ * brief and a diff that are each bounded make a prompt that is bounded, and that
+ * is the property worth being able to state.
+ *
+ * Cutting requirements is strictly worse than cutting evidence, so this cut is
+ * announced in the strongest terms the prompt has: requirements the Sentinel
+ * cannot read are ones it cannot confirm, which under the rules it is given is a
+ * fail rather than a pass.
+ */
+export const MAX_BRIEF_CHARS = 50_000;
 
 /** Verification is a single read-and-judge pass; it does not need a long leash. */
 export const SENTINEL_MAX_TURNS = 24;
@@ -97,6 +142,11 @@ export const SENTINEL_SYSTEM_PROMPT = [
   '  You are checking whether the brief was satisfied, not reviewing taste.',
   '- If you cannot tell whether a requirement is met, that is not a pass. Say what you',
   '  could not confirm and list it as unmet.',
+  '- The brief or the diff may arrive marked TRUNCATED, because a diff can be larger than',
+  '  any context window. Judge what you were shown and list what you could not confirm as',
+  '  unmet. ALWAYS RETURN A VERDICT: incomplete evidence is a reason for a failing verdict,',
+  '  never a reason to return none. A task that ends with no verdict helps nobody — the',
+  '  captain gets a dead task and a diff that nothing ever looked at.',
   '',
   'Each entry in `unmet` names one specific requirement from the brief that the diff does',
   'not satisfy, in the captain\'s language, concrete enough to act on. `unmet` is empty if',
@@ -300,17 +350,38 @@ export interface SentinelPromptInput {
   diff: string;
   /** Override the truncation bound. Defaults to MAX_DIFF_CHARS. */
   maxDiffChars?: number;
+  /** Override the brief bound. Defaults to MAX_BRIEF_CHARS. */
+  maxBriefChars?: number;
 }
 
 /**
  * Build the Sentinel's user prompt: the brief and the diff, clearly delimited,
  * and nothing that leaks the Crew's reasoning.
+ *
+ * The result is BOUNDED BY CONSTRUCTION — see MAX_DIFF_CHARS and
+ * MAX_BRIEF_CHARS — so however large a diff gets, this returns a prompt that
+ * fits a context window rather than one that discovers it does not.
  */
 export function buildSentinelPrompt(input: SentinelPromptInput): string {
   const { task, diff } = input;
-  const limit = input.maxDiffChars ?? MAX_DIFF_CHARS;
-  const { text, truncated, omittedChars } = truncateDiff(diff, limit);
+  const diffLimit = input.maxDiffChars ?? MAX_DIFF_CHARS;
+  const briefLimit = input.maxBriefChars ?? MAX_BRIEF_CHARS;
+
+  const cutDiff = truncateAtLine(diff, diffLimit);
+  const cutBrief = truncateAtLine(task.brief.trim(), briefLimit);
   const isRecon = task.kind === 'recon';
+
+  // The in-band marker, and the reason there are two notices rather than one:
+  // this one sits at the exact character where the evidence stops, so a reader
+  // working through the diff cannot reach the end of it and believe they have
+  // seen the whole thing. The note after the block is for a reader who skims.
+  const briefBlock = cutBrief.truncated
+    ? `${cutBrief.text}\n\n[!!! BRIEF TRUNCATED HERE — ${cutBrief.omittedChars.toLocaleString('en-US')} characters of REQUIREMENTS were omitted and you cannot see them !!!]`
+    : cutBrief.text;
+
+  const diffBlock = cutDiff.truncated
+    ? `${cutDiff.text}\n\n[!!! DIFF TRUNCATED HERE — ${cutDiff.omittedChars.toLocaleString('en-US')} characters of changes follow that you cannot see !!!]`
+    : cutDiff.text;
 
   const parts: string[] = [
     'Verify the work below.',
@@ -325,21 +396,37 @@ export function buildSentinelPrompt(input: SentinelPromptInput): string {
       : 'This was a MISSION task: the deliverable is committed code that satisfies the brief.',
     '',
     '--- BEGIN BRIEF (the requirements; this is what the worker was asked to do) ---',
-    task.brief.trim(),
+    briefBlock,
     '--- END BRIEF ---',
     '',
     diff.trim().length === 0
       ? '--- BEGIN DIFF ---\n(The diff is EMPTY. The worker produced no committed changes at all.)\n--- END DIFF ---'
-      : `--- BEGIN DIFF (the complete deliverable; the only evidence you have) ---\n${text}\n--- END DIFF ---`,
+      : `--- BEGIN DIFF (the complete deliverable; the only evidence you have) ---\n${diffBlock}\n--- END DIFF ---`,
     '',
   ];
 
-  if (truncated) {
+  if (cutBrief.truncated) {
+    parts.push(
+      `NOTE: the brief was too large to show in full and was TRUNCATED. You are seeing the first ` +
+        `${cutBrief.text.length.toLocaleString('en-US')} characters; ` +
+        `${cutBrief.omittedChars.toLocaleString('en-US')} characters were omitted. ` +
+        'Those omitted characters may contain requirements. You cannot confirm a requirement you have ' +
+        'not read, so this alone means the work is not fully verified: return `pass: false` and list ' +
+        '"the brief was truncated, so some requirements could not be checked" among the unmet items, ' +
+        'in addition to anything else you find.',
+      '',
+    );
+  }
+
+  if (cutDiff.truncated) {
     parts.push(
       `NOTE: the diff was too large to show in full and was TRUNCATED. You are seeing the first ` +
-        `${text.length.toLocaleString('en-US')} characters; ${omittedChars.toLocaleString('en-US')} characters were omitted. ` +
+        `${cutDiff.text.length.toLocaleString('en-US')} characters; ${cutDiff.omittedChars.toLocaleString('en-US')} characters were omitted. ` +
         'Judge only what you can see, and treat anything you cannot see as unverified: if a requirement ' +
-        'depends on the omitted portion, list it as unmet and say why rather than assuming it was handled.',
+        'depends on the omitted portion, list it as unmet and say why rather than assuming it was handled. ' +
+        'Do NOT refuse to answer because the evidence is incomplete — a verdict that says which ' +
+        'requirements could not be confirmed is exactly what is wanted here, and no verdict at all is ' +
+        'the one outcome that helps nobody.',
       '',
     );
   }
@@ -399,17 +486,20 @@ function sentinelProfile(profile: DispatchProfile): DispatchProfile {
 }
 
 /** Truncate at a line boundary so the last hunk shown is not cut mid-line. */
-function truncateDiff(
-  diff: string,
+function truncateAtLine(
+  text: string,
   limit: number,
 ): { text: string; truncated: boolean; omittedChars: number } {
-  if (diff.length <= limit) {
-    return { text: diff, truncated: false, omittedChars: 0 };
+  if (text.length <= limit) {
+    return { text, truncated: false, omittedChars: 0 };
   }
-  const head = diff.slice(0, limit);
+  const head = text.slice(0, limit);
   const lastNewline = head.lastIndexOf('\n');
-  const text = lastNewline > limit / 2 ? head.slice(0, lastNewline) : head;
-  return { text, truncated: true, omittedChars: diff.length - text.length };
+  // Only honour the line boundary if it does not throw away most of the budget:
+  // a single enormous line (a minified bundle) has no newline to cut at, and
+  // showing half of what was asked for would be worse than a mid-line cut.
+  const kept = lastNewline > limit / 2 ? head.slice(0, lastNewline) : head;
+  return { text: kept, truncated: true, omittedChars: text.length - kept.length };
 }
 
 function describeError(err: unknown): string {

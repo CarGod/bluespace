@@ -15,6 +15,7 @@
  * at two dead tasks he could not get rid of: *"这任务怎么结束啊"*.
  */
 
+import type { HelmWindowRef } from '../blackbox/index.js';
 import { isTerminal, type Task } from '../types/domain.js';
 
 /**
@@ -54,4 +55,39 @@ export function psView(
   const cutoff = (opts.now ?? Date.now()) - PS_HORIZON_MS;
   const shown = tasks.filter((t) => !isTerminal(t.state) || t.updatedAt >= cutoff);
   return { shown, elided: tasks.length - shown.length };
+}
+
+/**
+ * How many Helm windows `blue ps` will open transcripts for.
+ *
+ * A CEILING ON WORK, NOT ON TRUTH. Reading a window costs a directory search
+ * across every Claude Code project on the machine plus one pass over each
+ * transcript it finds, and the log never forgets a window — a captain a year in
+ * has hundreds of rows and only ever wants the last few. Six is more than the
+ * number of Helm windows anyone has open at once and small enough that `blue ps`
+ * stays a command you run without thinking.
+ */
+export const PS_HELM_WINDOW_LIMIT = 6;
+
+/**
+ * Which Helm windows are worth reading from disk, newest first.
+ *
+ * The same horizon the task table uses, applied to when the window opened. It is
+ * a coarser question than the one asked of a task — there is no state here to
+ * call terminal, because nothing observes a Helm window closing — so a window
+ * the captain opened this morning and closed at lunch is in view all day. That
+ * is the right error: the tokens it spent are still tokens they spent today.
+ *
+ * `--all` lifts the horizon and keeps the count ceiling, which is the one place
+ * these two differ. `--all` exists so a captain can see history the default
+ * hides; it does not exist to make `blue ps` walk three hundred transcripts.
+ */
+export function helmWindowsInView(
+  windows: readonly HelmWindowRef[],
+  opts: { all?: boolean; now?: number; limit?: number } = {},
+): HelmWindowRef[] {
+  const limit = opts.limit ?? PS_HELM_WINDOW_LIMIT;
+  const cutoff = (opts.now ?? Date.now()) - PS_HORIZON_MS;
+  const kept = opts.all === true ? [...windows] : windows.filter((w) => w.openedAt >= cutoff);
+  return kept.sort((a, b) => b.openedAt - a.openedAt).slice(0, limit);
 }

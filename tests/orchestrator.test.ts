@@ -39,6 +39,7 @@ import {
   assertTransition,
   canTransition,
   pathTo,
+  reworkMessage,
   type SentinelRunner,
 } from '../src/orchestrator/index.js';
 import { addTokenUsage, noTokenUsage, totalTokens } from '../src/types/domain.js';
@@ -802,6 +803,60 @@ describe('rework', () => {
     expect(crew.sent[0]).toContain('REWORK REQUIRED');
     expect(h.orch.task(task.id)!.reworkCount).toBe(1);
     expect(h.sentinelRuns).toHaveLength(2);
+  });
+
+  it('bounds a rework message, because a verdict is model output', async () => {
+    // `reasoning` and every `unmet` entry are written by the Sentinel and nothing
+    // constrains their length. This message is typed into a live session, so an
+    // unbounded verdict is an unbounded thing to type — and a Sentinel that
+    // pasted the diff into its own reasoning would hand the Crew a second copy
+    // of the transcript to read instead of a list of things to fix.
+    const verdict: Verdict = {
+      id: 'v-1',
+      taskId: 'task-1',
+      pass: false,
+      reasoning: 'R'.repeat(200_000),
+      unmet: Array.from({ length: 500 }, (_, i) => `requirement ${i} ${'U'.repeat(5_000)}`),
+      createdAt: 0,
+      tokens: noTokenUsage(),
+      listPriceUsd: 0,
+    };
+
+    const message = reworkMessage(verdict);
+
+    expect(message.length).toBeLessThan(100_000);
+    // The cut is VISIBLE. A Crew silently handed two thirds of a requirement
+    // fixes two thirds of it and cannot tell that is what happened.
+    expect(message).toMatch(/\(\+\d+ chars\)/);
+    expect(message).toMatch(/and \d+ more not shown/);
+    // …and the instruction that keeps a truncated list from reading as the
+    // complete one.
+    expect(message).toMatch(/re-read the brief as a checklist/);
+    // The first requirements still arrive intact enough to act on.
+    expect(message).toContain('requirement 0');
+  });
+
+  it('leaves an ordinary verdict completely untouched', async () => {
+    // The bound must never be reachable by a real verdict — one paragraph and a
+    // list of specifics — or it would be editing the Sentinel's words.
+    const verdict: Verdict = {
+      id: 'v-2',
+      taskId: 'task-1',
+      pass: false,
+      reasoning: 'The retry helper is present but nothing calls it from the upload path.',
+      unmet: ['No test covers the failure path', 'Backoff is fixed at 1s, not exponential'],
+      createdAt: 0,
+      tokens: noTokenUsage(),
+      listPriceUsd: 0,
+    };
+
+    const message = reworkMessage(verdict);
+
+    expect(message).toContain('The retry helper is present but nothing calls it from the upload path.');
+    expect(message).toContain('- No test covers the failure path');
+    expect(message).toContain('- Backoff is fixed at 1s, not exponential');
+    expect(message).not.toMatch(/chars\)/);
+    expect(message).not.toMatch(/more not shown/);
   });
 
   it('cold-starts a replacement Crew when the session is gone', async () => {

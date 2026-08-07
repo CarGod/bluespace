@@ -241,6 +241,31 @@ main { padding: 20px max(16px, env(safe-area-inset-left)) 64px max(16px, env(saf
 .empty h3 { margin: 0; font-size: 17px; font-weight: 600; letter-spacing: -.01em; }
 .empty p { margin: 0; color: var(--text-2); max-width: 40ch; font-size: 13.5px; }
 
+/* ---- Helm's own window ----------------------------------------------------
+   Deliberately quieter than a task card. This is an account of what already
+   happened, not something the captain can act on, and it must never read as a
+   row of the fleet — the whole bug was those two being indistinguishable. */
+.helm {
+  max-width: 860px; margin: 8px auto 0; padding: 14px 16px;
+  border: 1px dashed var(--border); border-radius: 10px; text-align: left;
+  display: grid; gap: 10px;
+}
+.helm h4 { margin: 0; font-size: 13px; font-weight: 600; color: var(--text-2); }
+.helm h4 .hint { font-weight: 400; }
+.helm-win { display: grid; gap: 6px; }
+.helm-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; font-size: 13px; }
+.helm-cwd { color: var(--text-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.helm-head .num { color: var(--text-2); font-variant-numeric: tabular-nums; }
+.helm-agents { list-style: none; margin: 0; padding: 0 0 0 12px; display: grid; gap: 4px; }
+.helm-agent {
+  display: grid; grid-template-columns: minmax(0, 7rem) minmax(0, 1fr) auto;
+  gap: 10px; align-items: baseline; font-size: 12.5px; color: var(--text-3);
+}
+.helm-kind { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.helm-what { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-2); }
+.helm-agent .num { font-variant-numeric: tabular-nums; }
+.helm > .hint { margin: 0; max-width: none; }
+
 /* ---- inbox ---------------------------------------------------------------- */
 .inbox { display: grid; gap: 14px; max-width: 860px; }
 .decision { padding: 18px 18px 16px; border-left: 3px solid var(--s-awaiting); }
@@ -465,6 +490,11 @@ const app = {
   drafts: new Map(),      // free-text answers / steer messages
   busy: new Set(),        // in-flight ids (decision or task)
   expandedContext: new Set(),
+  // Helm's own window, read off its transcript by the server. NOT part of
+  // `state`: it is a snapshot of files another process is writing, so it has
+  // its own endpoint, its own slow timer, and its own "as of" label. See
+  // /api/helm in src/server/index.ts.
+  helm: { windows: [], observedAt: 0 },
 };
 
 const MAX_EVENTS = 40000;
@@ -587,6 +617,28 @@ async function loadState() {
   app.now = s.now || Date.now();
   app.loaded = true;
   paint();
+}
+
+/**
+ * Helm's own fan-out — the one spender this map used to be blind to.
+ *
+ * Observed: the captain asked for a template upgrade, Helm launched two
+ * sub-agents that burned 153.4k and 128.5k tokens in two minutes, and this page
+ * said "Nothing needs you · 0 crew working" the whole time. Their question was
+ * *"map 里面为啥看不到当前执行的任务"*.
+ *
+ * On a SLOW timer and never on the stream: this costs the server a directory
+ * search and a pass over each transcript, and the numbers are after-the-fact
+ * whatever the interval — a fast poll would only make a snapshot look live.
+ * Failure is silent by design; a dashboard that cannot read someone else's
+ * files still has a fleet to draw.
+ */
+async function loadHelm() {
+  try {
+    const r = await api('/api/helm');
+    app.helm = { windows: r.windows || [], observedAt: r.now || Date.now() };
+    paint();
+  } catch { /* the fleet view is unaffected */ }
 }
 
 /**
@@ -727,6 +779,49 @@ function restoreDrafts() {
   }
 }
 
+/* ---- Helm's own window ----------------------------------------------------
+ * The map used to answer "what is running" with the fleet alone, and Helm is
+ * not in the fleet — it runs in the captain's terminal, under no orchestrator,
+ * and it can fan out. This block is that spend, and every word of it is hedged
+ * on purpose: it is read from files, after the fact, by a server that is not
+ * watching anything.
+ */
+function totalTokensOf(t) {
+  const c = (t && t.totals) || {};
+  return (c.input || 0) + (c.output || 0) + (c.cacheRead || 0) + (c.cacheCreation || 0);
+}
+
+function helmAgentRows(w) {
+  return (w.subagents || []).map((a) => `
+    <li class="helm-agent">
+      <span class="helm-kind">${esc(a.agentType || 'sub-agent')}</span>
+      <span class="helm-what">${esc(a.description || 'no description recorded')}</span>
+      <span class="num">${esc(tokens(totalTokensOf(a.tokens)))}</span>
+    </li>`).join('');
+}
+
+function renderHelm() {
+  const ws = app.helm.windows || [];
+  if (!ws.length) return '';
+  const fanned = ws.reduce((n, w) => n + ((w.subagents || []).length), 0);
+  const all = ws.reduce((n, w) => n + totalTokensOf(w.total), 0);
+  const rows = ws.map((w) => `
+    <div class="helm-win">
+      <div class="helm-head">
+        <span class="helm-cwd">${esc(w.cwd || '')}</span>
+        <span class="num">${esc(tokens(totalTokensOf(w.total)))} tokens</span>
+      </div>
+      ${((w.subagents || []).length) ? `<ul class="helm-agents">${helmAgentRows(w)}</ul>` : ''}
+    </div>`).join('');
+  return `<section class="helm">
+    <h4>Helm&rsquo;s own window <span class="hint">&middot; ${esc(tokens(all))} tokens${fanned ? ' &middot; ' + fanned + ' sub-agent' + (fanned === 1 ? '' : 's') : ''}</span></h4>
+    ${rows}
+    <p class="hint">Read from the transcript on disk, not watched live &mdash; work that started in the last few
+    seconds may not be here yet. These are Helm&rsquo;s own sub-agents, not the fleet&rsquo;s: no worktree,
+    no Sentinel, no ceiling, and nothing above.</p>
+  </section>`;
+}
+
 /* ---- 1. inbox ------------------------------------------------------------- */
 function renderInbox() {
   const open = app.decisions.slice().sort((a, b) => (a.openedAt || 0) - (b.openedAt || 0));
@@ -737,12 +832,18 @@ function renderInbox() {
     let line = 'The fleet has nothing to ask you. A card lands here the moment a Crew needs a call.';
     if (crew === 0 && app.tasks.length === 0) line = 'No tasks yet. Talk to Helm and the fleet will show up here.';
     else if (crew === 0 && queued === 0) line = 'Everything is parked. Nothing is burning tokens right now.';
+    // THE SCREEN THE CAPTAIN WAS LOOKING AT. "Nothing needs you · 0 crew
+    // working" was true about the fleet and false about the machine: two of
+    // Helm's sub-agents were running at the time. The fleet counts stay exactly
+    // as they were — they are correct — and Helm's own spend is named
+    // separately, because they are different things and conflating them is what
+    // made the original screen a lie.
     return `<div class="empty">
       <div class="ring" aria-hidden="true"></div>
       <h3>Nothing needs you</h3>
       <p>${esc(line)}</p>
       <p class="hint num">${crew} crew working · ${queued} queued · ${tokens(app.usage.total)} tokens</p>
-    </div>`;
+    </div>` + renderHelm();
   }
 
   const map = taskById();
@@ -787,8 +888,10 @@ function renderInbox() {
 function renderFleet() {
   if (!app.loaded) return '<div class="skeleton">Loading…</div>';
   if (app.tasks.length === 0) {
+    // Same correction as the inbox: an empty fleet is not an idle machine.
     return `<div class="empty"><div class="ring" aria-hidden="true"></div><h3>No tasks yet</h3>
-      <p>Helm creates tasks; the orchestrator dispatches them. Everything the fleet does will appear here.</p></div>`;
+      <p>Helm creates tasks; the orchestrator dispatches them. Everything the fleet does will appear here.</p></div>`
+      + renderHelm();
   }
   const map = taskById();
   const activity = lastActivity();
@@ -1254,14 +1357,19 @@ setInterval(() => {
 }, 1000);
 
 document.addEventListener('visibilitychange', () => {
-  if (!document.hidden) { loadState().catch(() => {}); }
+  if (!document.hidden) { loadState().catch(() => {}); loadHelm(); }
 });
+
+/* Helm's window is read from disk, so it is refreshed on its own slow timer —
+   fast enough that a captain watching a fan-out sees it appear, slow enough
+   that the server is not searching the transcript tree on every fleet poll. */
+setInterval(() => { if (!document.hidden) loadHelm(); }, 15000);
 
 /* ---- boot ----------------------------------------------------------------- */
 applyHash();
 loadState()
   .then(loadEvents)
-  .then(() => { connect(); paint(); })
+  .then(() => { connect(); paint(); loadHelm(); })
   .catch((err) => {
     setConn('down');
     el('view-inbox').innerHTML = `<div class="empty"><h3>Cannot reach the Starmap server</h3>

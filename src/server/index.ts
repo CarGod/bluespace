@@ -34,10 +34,13 @@ import {
   projectCost,
   projectUsage,
   projectCrewLog,
+  projectHelmWindows,
   taskIdOf,
   type Blackbox,
 } from '../blackbox/index.js';
 import { dataDir, ProjectRegistry } from '../config/index.js';
+import { readHelmWindows } from '../helm/index.js';
+import { helmWindowsInView } from '../cli/ps.js';
 import type { Orchestrator } from '../orchestrator/index.js';
 import type { Decision, Project, Task, TaskId } from '../types/domain.js';
 import type { BlueEvent } from '../types/events.js';
@@ -312,6 +315,36 @@ export async function startServer(opts: StarmapOptions): Promise<StarmapHandle> 
 
     if (method === 'GET' && a === 'stream' && segs.length === 2) {
       openStream(req, res, url);
+      return;
+    }
+
+    /**
+     * Helm's own window, and what it fanned out to.
+     *
+     * ITS OWN ENDPOINT, NOT PART OF `/api/state`, and that is the whole design.
+     * `state` is folded from an in-memory mirror and is served on every poll and
+     * every stream tick; this reads files another process is writing, so folding
+     * it in would put disk I/O on the hot path and — worse — would dress an
+     * after-the-fact snapshot up as part of the live projection. The page asks
+     * for it separately, on a slow timer, and labels it separately.
+     *
+     * The captain's question was *"map 里面为啥看不到当前执行的任务"*, asked while
+     * two of Helm's sub-agents spent 282k tokens against a map reading "0 crew
+     * working". This is the answer to it, with the honesty the answer needs:
+     * `observedAt` is when the files were read, and the page shows it.
+     */
+    if (method === 'GET' && a === 'helm' && segs.length === 2) {
+      mirror.refresh();
+      let windows: Awaited<ReturnType<typeof readHelmWindows>> = [];
+      try {
+        windows = await readHelmWindows(
+          helmWindowsInView(projectHelmWindows(mirror.all() as BlueEvent[])),
+        );
+      } catch {
+        // A transcript we cannot read costs its numbers, never the dashboard.
+        windows = [];
+      }
+      sendJson(res, 200, { windows, now: Date.now() });
       return;
     }
 

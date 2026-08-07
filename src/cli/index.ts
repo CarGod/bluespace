@@ -33,7 +33,7 @@ import {
   resolveAuth,
 } from '../adapters/claude-cli.js';
 import type { HarnessAdapter } from '../adapters/types.js';
-import { Blackbox, projectCrewLog } from '../blackbox/index.js';
+import { Blackbox, projectCrewLog, projectHelmWindows } from '../blackbox/index.js';
 import {
   PERMISSION_MODES,
   ProjectRegistry,
@@ -45,6 +45,7 @@ import {
   localeVarInEffect,
   normalizeLanguage,
   registerProjects,
+  resolveHelmPosture,
   saveConfig,
 } from '../config/index.js';
 import type { BlueConfig, ConfigPatch } from '../config/index.js';
@@ -71,7 +72,7 @@ import type { BlueEvent } from '../types/events.js';
 import { cancelOutcome } from './cancel.js';
 import { runGc } from './gc.js';
 import { decisionNudge, runInbox } from './inbox.js';
-import { psView } from './ps.js';
+import { helmWindowsInView, psView } from './ps.js';
 import {
   bold,
   clockTime,
@@ -509,11 +510,99 @@ async function printPendingDelivery(b: Boot): Promise<void> {
   out(dim('  BlueSpace never opens one — ask Helm for the `gh pr create` command.'));
 }
 
+/**
+ * What Helm's own window has been spending, read off disk.
+ *
+ * WHY THIS SECTION EXISTS, AND WHY IT IS PHRASED THE WAY IT IS. The captain
+ * asked for a template upgrade; Helm launched two sub-agents that spent 153.4k
+ * and 128.5k tokens in two minutes; `blue ps` printed nothing and the Starmap
+ * said "Nothing needs you · 0 crew working" the whole time. Their question was
+ * *"map 里面为啥看不到当前执行的任务"*, and the honest answer was that BlueSpace
+ * had built a whole token-accounting layer and then left its own front door
+ * outside it.
+ *
+ * IT IS NOT LIVE AND THE HEADING SAYS SO, IN EVERY LANGUAGE THIS PRINTS IN.
+ * There is no process here watching that window — `blue ps` is reading files
+ * another process wrote — so a sub-agent that started a moment ago has written
+ * nothing yet and is genuinely absent from this list. Calling this a live view
+ * would reproduce the original bug with better numbers on it: the captain would
+ * read an empty section as an idle Helm, which is exactly what they did before.
+ * "as of <time>" is the whole fix and it is not decoration.
+ *
+ * TOKENS, NOT DOLLARS, for the same reason the table above uses them: a Helm
+ * window is the captain's own login on their own subscription.
+ */
+async function printHelmFanout(b: Boot, flags: Flags): Promise<void> {
+  const refs = helmWindowsInView(projectHelmWindows(b.blackbox.read()), {
+    all: flagBool(flags, 'all', 'a'),
+  });
+  if (refs.length === 0) return;
+
+  const { readHelmWindows } = await import('../helm/index.js');
+  let windows;
+  try {
+    windows = await readHelmWindows(refs);
+  } catch {
+    // Reading someone else's files is best-effort by construction. A `blue ps`
+    // that failed because a transcript was mid-write would be a worse tool than
+    // one that quietly omits a section.
+    return;
+  }
+  if (windows.length === 0) return;
+
+  out('');
+  const observedAt = windows[0]?.observedAt ?? Date.now();
+  out(
+    `${bold('Helm')} ${dim(`· your own window · read from its transcript, as of ${clockTime(observedAt)} — not live`)}`,
+  );
+
+  for (const w of windows) {
+    const own = totalTokens(w.own.totals);
+    const all = totalTokens(w.total.totals);
+    out(
+      `  ${cyan(truncate(tildePath(w.cwd), 44))}  ${dim(shortId(w.sessionId))}  ` +
+        `${bold(formatTokens(all))} ${dim('tokens')}${dim(` · ${formatTokens(own)} in the window itself`)}`,
+    );
+    for (const agent of w.subagents) {
+      // The description is what makes a row actionable: it is the thing the
+      // captain reads to decide whether that fan-out should have been a task.
+      const label = agent.description ?? dim('(no description recorded)');
+      out(
+        `    ${dim('↳')} ${padEnd(truncate(agent.agentType ?? 'sub-agent', 16), 16)} ` +
+          `${padEnd(truncate(label, 42), 42)} ${formatTokens(totalTokens(agent.tokens.totals))}`,
+      );
+    }
+  }
+
+  const fannedOut = windows.reduce((n, w) => n + w.subagents.length, 0);
+  if (fannedOut > 0) {
+    // Said once, under the numbers, because the numbers are what make it land:
+    // a sub-agent is genuinely cheaper than a task and genuinely accountable to
+    // nothing, and the captain is entitled to know which they just paid for.
+    out(
+      dim(
+        `  ${plural(fannedOut, 'sub-agent')} — Helm's own, not the fleet's: no worktree, no Sentinel, no ceiling, and nothing above.`,
+      ),
+    );
+  }
+}
+
+/** `~/aulp` rather than `/Users/liufei/aulp` — the captain's own word for it. */
+function tildePath(p: string): string {
+  const home = os.homedir();
+  return p === home ? '~' : p.startsWith(`${home}/`) ? `~${p.slice(home.length)}` : p;
+}
+
 async function cmdPs(b: Boot, flags: Flags): Promise<number> {
   const tasks = b.orch.tasks();
   if (tasks.length === 0) {
     out('');
     out(dim('No tasks yet. Ask Helm for something — run `bluespace` and say what you want built.'));
+    // NOT AN EARLY RETURN ANY MORE, and that is the whole point of this change:
+    // "no tasks" was precisely the screen the captain was looking at while two
+    // of Helm's sub-agents burned 282k tokens. An empty fleet and an idle Helm
+    // are different states and this command now distinguishes them.
+    await printHelmFanout(b, flags);
     out('');
     return 0;
   }
@@ -639,6 +728,10 @@ async function cmdPs(b: Boot, flags: Flags): Promise<number> {
     out(dim('watch a crew — a live session you can read and type into:'));
     for (const [id, command] of watchable) out(`  ${dim(id)}  ${cyan(command)}`);
   }
+
+  // After the fleet, because the fleet is the answer to "what is running" and
+  // this is the answer to "what else is spending".
+  await printHelmFanout(b, flags);
 
   await printPendingDelivery(b);
 
@@ -1050,12 +1143,18 @@ function languageRow(config: BlueConfig): string {
   );
 }
 
+/** An unset Helm pin resolves to a default and says which it is doing. */
+function helmPostureRow(pinned: unknown, resolved: string): string {
+  return pinned === undefined ? `${resolved} ${dim('(default — not pinned)')}` : resolved;
+}
+
 function printConfig(config: BlueConfig): void {
   // Read here rather than stored: this line describes what WOULD happen to a
   // task dispatched from this shell, which is a property of the environment,
   // not of the config file. What a past task actually cost is recorded on the
   // task itself (`Task.metered`).
   const metered = resolveAuth().kind === 'api-key';
+  const posture = resolveHelmPosture(config);
   const rows: Array<[string, string]> = [
     ['permissionMode', config.permissionMode],
     ['model', config.model ?? dim('(harness default)')],
@@ -1077,6 +1176,11 @@ function printConfig(config: BlueConfig): void {
     ['maxConcurrentCrew', String(config.maxConcurrentCrew)],
     ['maxRework', String(config.maxRework)],
     ['language', languageRow(config)],
+    // The Helm window, not a Crew. Printed with the resolved value AND the
+    // provenance, because unset and off look identical on a screen that shows
+    // only the value — and only one of them tracks the default if it changes.
+    ['helmUltracode', helmPostureRow(config.helmUltracode, String(posture.ultracode))],
+    ['helmPermissionMode', helmPostureRow(config.helmPermissionMode, posture.permissionMode)],
     ['dataDir', dim(config.dataDir)],
   ];
   const w = Math.max(...rows.map(([k]) => k.length));
@@ -1107,7 +1211,8 @@ function cmdConfig(b: Boot, rest: string[]): number {
     errOut(red('blue config set needs a key and a value.'));
     errOut(
       dim(
-        'Keys: permissionMode, model, effort, language, maxConcurrentCrew, maxRework, maxTokensPerTask, maxBudgetUsdPerTask',
+        'Keys: permissionMode, model, effort, language, maxConcurrentCrew, maxRework, maxTokensPerTask, maxBudgetUsdPerTask,\n' +
+          '      helmUltracode, helmPermissionMode  (the `bluespace` window, not a crew)',
       ),
     );
     return 1;
@@ -1126,6 +1231,47 @@ function cmdConfig(b: Boot, rest: string[]): number {
         return 1;
       }
       patch.permissionMode = value as PermissionMode;
+      break;
+    }
+    case 'helmUltracode': {
+      if (value === '-' || value === 'default') {
+        patch.helmUltracode = null;
+        break;
+      }
+      // The three spellings a captain reaches for, and nothing looser: an
+      // unrecognised value here must not quietly read as false and turn off the
+      // thing they were trying to turn on.
+      if (['true', 'on', '1', 'yes'].includes(value)) patch.helmUltracode = true;
+      else if (['false', 'off', '0', 'no'].includes(value)) patch.helmUltracode = false;
+      else {
+        errOut(red(`helmUltracode must be true or false (or "-" for the default), got "${value}".`));
+        return 1;
+      }
+      break;
+    }
+    case 'helmPermissionMode': {
+      if (value === '-' || value === 'default') {
+        patch.helmPermissionMode = null;
+        break;
+      }
+      if (!PERMISSION_MODES.includes(value as PermissionMode)) {
+        errOut(red(`helmPermissionMode must be one of: ${PERMISSION_MODES.join(', ')}`));
+        return 1;
+      }
+      if (value === 'bypassPermissions') {
+        // Measured, and worth a line before they hit it rather than after: the
+        // window opens on a consent modal defaulting to "No, exit", and
+        // accepting writes a permanent machine-wide flag into ~/.claude.json.
+        // The Helm window has no Bash, Edit or Write for it to unlock either.
+        errOut(
+          yellow(
+            'Note: bypassPermissions opens the window on a modal only you can dismiss, and dismissing it ' +
+              'writes bypassPermissionsModeAccepted into your global config for every Claude Code session ' +
+              'on this machine. It unlocks nothing here — Helm has no Bash, Edit or Write to unlock.',
+          ),
+        );
+      }
+      patch.helmPermissionMode = value as PermissionMode;
       break;
     }
     case 'model': {

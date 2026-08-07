@@ -266,6 +266,7 @@ blue mcp                      serve Helm's tools over stdio — `bluespace` star
 blue inbox                    read the decisions waiting on you  ← start here
       --list                  render only, do not prompt
 blue ps                       what is in flight, plus what finished in the last day
+                              — and what Helm's own window spent, read from disk
       -a, --all               every task ever — the log keeps them all
 blue log <taskId>             replay one task's events from the Blackbox
       -f, --follow            keep streaming new events
@@ -400,7 +401,41 @@ directory (config, Blackbox, worktrees) — useful for keeping work projects sep
 | `maxConcurrentCrew` | `4` | How many Crew may be in flight at once. |
 | `maxRework` | `2` | How many times a failing verdict may send a task back before it escalates to you. |
 | `language` | *(unset)* | The language Helm writes to you in. Unset means "work it out". See below. |
+| `helmUltracode` | `true` | Open the `bluespace` window at **ultracode** — xhigh effort plus standing dynamic-workflow orchestration. See below. |
+| `helmPermissionMode` | `auto` | Permission posture for the `bluespace` window. Not the same key as `permissionMode`, which is for Crews. |
 | `dataDir` | `~/.bluespace` | Derived from `BLUESPACE_HOME`. Read-only; not settable. |
+
+### How the `bluespace` window opens
+
+```bash
+blue config set helmUltracode false        # open at your normal effort instead
+blue config set helmPermissionMode manual  # ask me before every tool
+blue config set helmUltracode -            # back to the default
+```
+
+`bluespace` opens at **ultracode** in a posture that does not interrupt you. Both
+are defaults, both are one command to change, and neither is written anywhere
+outside the invocation.
+
+`ultracode` is not an effort *level* — `--effort` only accepts `low` … `max`. It
+is a per-session setting, passed as `--settings '{"ultracode":true}'`, which is
+the same tier `/effort ultracode` writes from inside a window. It merges over
+your own `~/.claude/settings.json` rather than replacing it, so your model, hooks
+and permissions are untouched.
+
+It can be defeated by your shell without saying so. If `CLAUDE_CODE_EFFORT_LEVEL`
+or `CLAUDE_CODE_DISABLE_WORKFLOWS` is set, `bluespace` prints one line naming it
+and pointing at `/effort ultracode`, then opens anyway. An organization effort
+ceiling or a model that cannot do xhigh will also defeat it, and nothing outside
+the window can see that — run `/effort` inside to see where it actually landed.
+
+**A permissive posture is not a wider clamp.** The window still has no `Bash`,
+`Edit`, `Write` or `NotebookEdit`, at any posture — a deny rule beats a
+permission mode, and `HELM_DENIED_TOOLS` is untouched by this setting. It means
+Helm is not stopped to ask about the tools it *does* have. `bypassPermissions` is
+accepted here but argued against: it opens on a modal only you can dismiss, and
+dismissing it writes a permanent machine-wide flag into your global Claude Code
+config — for nothing, since there is no dangerous tool in this window to unlock.
 
 ### The language Helm talks to you in
 
@@ -467,6 +502,36 @@ shows your real tasks using, not from intuition about how many words that is.
 `maxConcurrentCrew` is not a performance knob. "Advertised usage limits assume ordinary,
 individual usage" is a real constraint and raising this is a decision about it; the
 default is low on purpose. See `docs/compliance.md`.
+
+### Helm spends your quota too, and now you can see it
+
+Every ceiling above bounds a **Crew**. Helm is not a Crew: it runs in your own terminal,
+under no orchestrator, and it can fan out to sub-agents. So it was the one consumer of your
+plan that nothing here measured. Observed, before this existed — you asked for a template
+upgrade, Helm launched two sub-agents that spent 153.4k and 128.5k tokens in two minutes,
+and `blue ps` showed nothing while the Starmap said *"Nothing needs you · 0 crew working"*.
+
+`blue ps` and the Starmap now show that window: its own tokens, and one row per sub-agent
+with **what Helm asked it to do**, because "Survey the template repos · 153.4k" is the line
+that tells you it should have been a recon task.
+
+```
+Helm · your own window · read from its transcript, as of 01:11:18 — not live
+  ~/aulp  329a83e3  282k tokens · 0.3k in the window itself
+    ↳ Explore          Survey the template repos                153.4k
+    ↳ Explore          Map the SDK surface                      128.5k
+  2 sub-agents — Helm's own, not the fleet's: no worktree, no Sentinel, no ceiling, and nothing above.
+```
+
+**It is after the fact, and it says so.** Nothing watches that window — this is read from
+the transcript Claude Code writes to disk, at the moment you ask. A sub-agent that started
+a second ago has not written anything yet and will not be there. There is no ceiling on it
+either: `maxTokensPerTask` stops a Crew, and Helm is not one. What this buys you is the
+ability to *see* the bill, which is what you need to tell Helm to stop doing that.
+
+It works because `blue mcp` — the server `bluespace` starts for that window — is handed the
+window's session id by Claude Code, and records it. Nothing else is written, and closing the
+window leaves nothing running.
 
 ### Permission modes
 

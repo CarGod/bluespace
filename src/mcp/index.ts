@@ -21,5 +21,5 @@ export {
 } from './server.js';
 export type { McpDispatcherOptions, McpServeOptions, McpServerHandle } from './server.js';
 
-export { runMcp } from './run.js';
+export { registerHelmWindow, runMcp } from './run.js';
 export type { RunMcpOptions } from './run.js';

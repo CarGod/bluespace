@@ -1151,7 +1151,7 @@ export class Orchestrator {
    * is crossed BEFORE it is noticed. A task can overshoot by roughly one message
    * — and, for a Crew that delegates, by whatever its subagents spent during the
    * turn, since those land at the end of the turn (see
-   * `src/adapters/claude-cli.ts`, header 6). It is a ceiling with overshoot, not
+   * `src/adapters/claude-cli.ts`, header 7). It is a ceiling with overshoot, not
    * a hard stop, and calling it anything else would be a lie the captain pays
    * for.
    *
@@ -1460,17 +1460,43 @@ function byCreation(a: Task, b: Task): number {
   return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
 }
 
+/**
+ * Bounds on the parts of a verdict quoted back into a rework message.
+ *
+ * The verdict is MODEL OUTPUT — `reasoning` and every `unmet` entry are written
+ * by the Sentinel and nothing constrains their length. This message is typed
+ * into a live session, so an unbounded verdict becomes an unbounded thing to
+ * type; the backend now splits a long message across several commands rather
+ * than failing on one (`TmuxBackend.sendText`), which means the failure mode is
+ * no longer an error but a Crew reading a wall of restated diff.
+ *
+ * Generous enough that a real verdict — one paragraph and a list of specifics —
+ * is never touched, and small enough that a Sentinel which dumped the diff into
+ * its own reasoning cannot turn a rework into a second full transcript. The cut
+ * is visible in the text, because a Crew silently handed two thirds of a
+ * requirement would fix two thirds of it.
+ */
+const REWORK_REASONING_CHARS = 4_000;
+const REWORK_UNMET_CHARS = 1_000;
+const REWORK_UNMET_ITEMS = 40;
+
 /** The message that sends a Crew back into a diff the Sentinel rejected. */
 export function reworkMessage(verdict: Verdict): string {
+  const shown = verdict.unmet.slice(0, REWORK_UNMET_ITEMS);
+  const hidden = verdict.unmet.length - shown.length;
+
   return [
     'REWORK REQUIRED — an independent verifier reviewed your diff against the brief and rejected it.',
     '',
-    `Verdict: ${verdict.reasoning}`,
+    `Verdict: ${truncate(verdict.reasoning, REWORK_REASONING_CHARS)}`,
     '',
     'Unmet requirements:',
-    ...(verdict.unmet.length > 0
-      ? verdict.unmet.map((u) => `- ${u}`)
+    ...(shown.length > 0
+      ? shown.map((u) => `- ${truncate(u, REWORK_UNMET_CHARS)}`)
       : ['- (none listed; re-read the brief and close the gap the verdict describes)']),
+    ...(hidden > 0
+      ? [`- (and ${hidden} more not shown; re-read the brief as a checklist rather than fixing only this list)`]
+      : []),
     '',
     'The verifier never saw your reasoning — only the brief and the diff. If you believe a',
     'requirement is already met, it is not visible in the diff, which is the same thing.',

@@ -37,6 +37,9 @@
  *   `--allowedTools <list>`       the tools this launcher just installed, marked
  *                                 as approved, so the opening turn is not a
  *                                 permission dialog — see `HELM_ALLOWED_TOOLS`.
+ *   `--settings <inline JSON>`    `{"ultracode":true}` — see `helmSettingsJson`.
+ *   `--permission-mode <mode>`    the posture, `auto` by default — see
+ *                                 `HELM_PERMISSION_MODE_ARGUMENT`.
  *
  * and a plain `claude` keeps none of it. That is the whole product decision:
  * `bluespace` is Helm, `claude` is Claude Code, and neither leaks into the other.
@@ -68,27 +71,42 @@
  * argv, and nothing here prints over Claude Code's own screen.
  *
  * WHAT IS DELIBERATELY NOT PASSED, since a reader who knows `buildLaunchArgv`
- * will look for it: `--setting-sources`, `--permission-mode`, `--model`,
- * `--settings`. Those are how BlueSpace constrains a CREW — a process it starts,
- * owns, and grades. This window is the captain's own session, in their own
- * terminal, with their own settings, hooks, model and permission posture, and
- * the launcher does not swap those out for narrower ones of its choosing.
+ * will look for it: `--setting-sources`, `--model`, `--effort`. Those are how
+ * BlueSpace constrains a CREW — a process it starts, owns, and grades — and
+ * this window is the captain's own session, in their own terminal, with their
+ * own hooks and their own model. `--effort` is additionally a trap here: it
+ * installs a LAUNCH-EFFORT PIN that silently defeats ultracode. Measured on
+ * 2.1.224 — `--effort high --settings '{"ultracode":true}'` opened a window
+ * whose own footer read `● high`, with no ultracode badge and no complaint.
  *
- * The two exceptions are both about BlueSpace's OWN tool surface, which is why
- * they are exceptions and `--permission-mode` is not. `--disallowedTools` says
- * which agent the window is: a Helm that can edit the captain's code is not a
- * stricter or looser Helm, it is the thing BlueSpace was built to replace
- * wearing Helm's name (`BLUESPACE_UNCLAMPED=1` gives it back, with both eyes
- * open). `--allowedTools` says that the tools this command just installed are
- * approved — see `HELM_ALLOWED_TOOLS`. Neither touches the captain's posture
- * over a single tool that was in the window before `bluespace` ran.
+ * The flags that ARE passed each answer for themselves:
  *
- * `--strict-mcp-config` is the one flag in that family with a real argument for
- * it, and it is opt-in for the same reason — see `strictMcpRequested`.
+ *   `--disallowedTools` says which agent the window is: a Helm that can edit the
+ *     captain's code is not a stricter or looser Helm, it is the thing BlueSpace
+ *     was built to replace wearing Helm's name (`BLUESPACE_UNCLAMPED=1` gives it
+ *     back, with both eyes open).
+ *   `--allowedTools` says that the tools this command just installed are
+ *     approved — see `HELM_ALLOWED_TOOLS`.
+ *   `--settings` and `--permission-mode` are the captain's own ask, not this
+ *     launcher's taste: open at ultracode, in a posture that does not ask. Both
+ *     are config keys (`helmUltracode`, `helmPermissionMode`) so the default is
+ *     a default and not a decision taken away from them. Read
+ *     `HELM_PERMISSION_MODE_ARGUMENT` before touching either.
+ *
+ * `--settings` is ADDITIVE, which is the only reason it may be passed at all.
+ * Measured: a window launched with `--settings '{"ultracode":true}'` still had
+ * the captain's `~/.claude/settings.json` model (`opus[1m]`, on its own model
+ * line) and still applied their twenty permission allow-rules — the flag lands
+ * in its own `flagSettings` tier and merges over the rest rather than replacing
+ * them. And it comes BEFORE the captain's argv, so a `bluespace --settings …` of
+ * their own is the later flag and wins outright.
+ *
+ * `--strict-mcp-config` is opt-in — see `strictMcpRequested`.
  *
  * ARGV ORDER IS LOAD-BEARING — see `buildHelmArgv`.
  *
- * Verified against Claude Code 2.1.223 on 2026-08-05; the measurements are in
+ * Verified against Claude Code 2.1.223 on 2026-08-05, and the ultracode and
+ * posture measurements against 2.1.224 on 2026-08-07; the measurements are in
  * `docs/compliance.md` under "The `bluespace` launcher".
  */
 
@@ -106,8 +124,9 @@ import {
   loadConfig,
   localeVarInEffect,
   resolveCaptainVoice,
+  resolveHelmPosture,
 } from '../config/index.js';
-import type { CaptainVoice } from '../config/index.js';
+import type { BlueConfig, CaptainVoice } from '../config/index.js';
 import { MCP_SERVER_NAME } from '../mcp/server.js';
 
 // ---------------------------------------------------------------------------
@@ -305,6 +324,11 @@ a Sentinel, a ceiling and a record.
 
 You keep everything intake and judgement need: Read, Glob and Grep over the captain's code,
 the web tools, every \`mcp__*\` tool including your own, and sub-agents.
+
+This window also opens in a permissive posture, and the two are not related. Not being
+asked for permission is not being given a tool: the deny list above beats any permission
+mode, so nothing on it is reachable at any posture. Never tell the captain that a mode
+change would give you Bash or Edit — it would not.
 
 **That list above propagates to every sub-agent you spawn** — measured, not assumed. A
 sub-agent of yours has no Bash, no Edit, no Write. It cannot produce a diff and it cannot
@@ -550,6 +574,169 @@ export const HELM_ALLOWED_TOOLS: readonly string[] = HELM_TOOL_NAMES.map(
   (name) => `mcp__${MCP_SERVER_NAME}__${name}`,
 );
 
+// ---------------------------------------------------------------------------
+// Ultracode, and the posture
+// ---------------------------------------------------------------------------
+
+/**
+ * The settings key that opens the window at ultracode.
+ *
+ * ULTRACODE IS NOT AN EFFORT VALUE. `--effort` accepts exactly `low, medium,
+ * high, xhigh, max` — read off `claude --help` on 2.1.224 — and passing
+ * `--effort ultracode` is an argument error. The binary's own help for the
+ * in-session command spells out what it actually is: *"ultracode: xhigh +
+ * dynamic workflow orchestration (this session only)"*, and its settings schema
+ * says where it comes from — *"Set per session via the `ultracode` settings key
+ * (--settings or apply_flag_settings)"*. `/effort ultracode` inside a window
+ * calls `apply_flag_settings`; `--settings` writes the same tier at launch. They
+ * are one mechanism with two doors, which is why this is not faking it.
+ *
+ * MEASURED, ON THIS MACHINE, AGAINST 2.1.224 — and read back off the harness's
+ * own chrome rather than asked of the model, because a model reporting its own
+ * effort level is the one witness that cannot be trusted about it:
+ *
+ *   claude --settings '{"ultracode":true}'
+ *     -> header line:  ✦ ultracode · xhigh effort + dynamic workflows …
+ *     -> footer badge: ultracode
+ *     -> /effort opens its picker with the marker already on `ultracode`
+ *   claude                                    (control, same machine, same dir)
+ *     -> footer badge: ◉ xhigh · /effort      (from the captain's own settings)
+ *
+ * Three ways it silently does nothing, all measured the same way, all reading
+ * as an ordinary window with no complaint anywhere:
+ *
+ *   CLAUDE_CODE_DISABLE_WORKFLOWS=1  -> no badge. Ultracode's own precondition
+ *                                      ("Ultracode needs dynamic workflows
+ *                                      enabled") fails with no message at all
+ *                                      when it is set at launch rather than
+ *                                      typed at `/effort`.
+ *   CLAUDE_CODE_EFFORT_LEVEL=medium  -> no badge; the env var takes the session.
+ *   --effort <anything>              -> that level's badge; the launch pin wins.
+ *
+ * The third is ours to simply not do, and this launcher does not pass `--effort`.
+ * The first two are the captain's environment, so they are detected and named —
+ * see `ultracodeBlockedBy`. A fourth is not detectable from here at all: an
+ * org policy or a model that is not xhigh-capable. That one is why the notice
+ * this file prints says what to run rather than claiming success.
+ */
+export const ULTRACODE_SETTINGS_KEY = 'ultracode';
+
+/** The command that turns ultracode on from inside a window that opened without it. */
+export const ULTRACODE_COMMAND = '/effort ultracode';
+
+/**
+ * The `--settings` payload, or undefined when there is nothing to say.
+ *
+ * ONLY EVER OUR OWN KEYS. This flag merges a whole settings object into the
+ * window, so it is the one place in this launcher that could quietly restyle the
+ * captain's session — a stray `model`, `env` or `permissions` here would
+ * override what they chose for themselves everywhere else. One key goes in, and
+ * a reader adding a second should have to argue for it here.
+ */
+export function helmSettingsJson(ultracode: boolean): string | undefined {
+  if (!ultracode) return undefined;
+  return JSON.stringify({ [ULTRACODE_SETTINGS_KEY]: true });
+}
+
+/**
+ * What in this environment will silently swallow ultracode, named in the
+ * captain's own words for it: the variable, and what it is set to.
+ *
+ * Empty means nothing local is in the way — which is NOT the same as "it
+ * worked", and the notice built from this is worded accordingly. The two
+ * variables here are the whole of what a process outside the window can check;
+ * an organization's effort ceiling and a model that cannot do xhigh are decided
+ * inside it, after this launcher is already gone.
+ */
+export function ultracodeBlockedBy(env: NodeJS.ProcessEnv = process.env): string[] {
+  const blockers: string[] = [];
+  const workflows = env['CLAUDE_CODE_DISABLE_WORKFLOWS']?.trim();
+  // Any non-empty value: the harness reads this as a switch, and a captain who
+  // exported it to `0` meaning "off" is a case for measuring, not for guessing.
+  if (workflows !== undefined && workflows !== '') {
+    blockers.push(`CLAUDE_CODE_DISABLE_WORKFLOWS=${workflows} (ultracode needs dynamic workflows)`);
+  }
+  const effort = env['CLAUDE_CODE_EFFORT_LEVEL']?.trim();
+  if (effort !== undefined && effort !== '') {
+    blockers.push(`CLAUDE_CODE_EFFORT_LEVEL=${effort} (takes the session's effort outright)`);
+  }
+  return blockers;
+}
+
+/**
+ * One line, on stderr, when the window is about to open at less than it was
+ * asked for — and silence otherwise.
+ *
+ * WHY IT SAYS "may not" AND NOT "did not". This runs before the child exists, so
+ * it is a reading of the environment, not of the window. Claiming the stronger
+ * thing would be the same failure in the opposite direction from the one this
+ * whole section exists to avoid: asserting a state nobody read. What it can say
+ * without hedging is the variable that is set and the command that fixes the
+ * result, which is everything the captain needs to act.
+ *
+ * stderr, not stdout, and one line: Claude Code owns the screen a beat later,
+ * and a paragraph here scrolls off above a UI this process does not control.
+ */
+export function ultracodeNotice(blockers: readonly string[]): string | undefined {
+  if (blockers.length === 0) return undefined;
+  return (
+    `bluespace: ultracode may not take in this shell — ${blockers.join('; ')}. ` +
+    `Run \`${ULTRACODE_COMMAND}\` in the window to see where it actually landed.`
+  );
+}
+
+/**
+ * THE POSTURE, AND WHY IT IS `auto` RATHER THAN THE LOUDER OPTION.
+ *
+ * The captain asked for 超级权限的模式. The three candidates, measured on 2.1.224
+ * in a real interactive window rather than reasoned about:
+ *
+ *   --permission-mode auto
+ *       Opens straight into the session. Footer: `⏵⏵ auto mode on (shift+tab to
+ *       cycle)`. No modal, nothing written to `~/.claude.json`.
+ *   --permission-mode bypassPermissions
+ *       Opens on a full-screen consent modal — *"WARNING: Claude Code running in
+ *       Bypass Permissions mode"* — whose default option is `1. No, exit`. Only
+ *       a human can clear it, and clearing it is what writes
+ *       `bypassPermissionsModeAccepted` into the captain's global config: a
+ *       permanent, machine-wide loosening set by a launcher they ran to get a
+ *       fleet. Checked before writing this: that key is not in their
+ *       `~/.claude.json` today, so this would be the thing that put it there.
+ *       The binary is stricter still — *"Cannot set permission mode to
+ *       bypassPermissions because the session was not launched with
+ *       --dangerously-skip-permissions"* — so the flag alone does not even
+ *       reliably reach the mode it is asking for.
+ *   --allowedTools (what this launcher already does)
+ *       Deterministic and narrow, and it is KEPT — see `HELM_ALLOWED_TOOLS`. It
+ *       just does not answer the ask on its own: it names BlueSpace's own
+ *       thirteen tools, so the captain's own MCP servers and the web tools can
+ *       still stop a turn to ask.
+ *
+ * `auto` wins on the only axis that separates them: it is the one that costs the
+ * captain nothing outside this invocation. The objection recorded against it in
+ * `HELM_ALLOWED_TOOLS` — that it is BlueSpace choosing a posture over tools it
+ * did not install — is answered by the captain having asked for exactly that,
+ * and by it being a config key they can dial back in one command.
+ *
+ * THE CLAMP DOES NOT WIDEN, AND THESE ARE NOT THE SAME THING. `HELM_DENIED_TOOLS`
+ * is untouched by every word above. Permissiveness here means the window stops
+ * ASKING about the tools it has; it never means the window is ALLOWED MORE. A
+ * deny rule beats an allow rule and beats a permission mode, so Bash, Edit,
+ * Write, NotebookEdit, Monitor, Workflow, RemoteTrigger and EnterWorktree are as
+ * absent at `auto` as at `manual` — measured, not assumed:
+ *
+ *   claude --permission-mode auto --disallowedTools Bash,Edit,Write \
+ *     -p 'Attempt to run the shell command: echo CLAMP_OPEN. If the Bash tool is
+ *         unavailable to you, reply with exactly CLAMP_HELD and nothing else.'
+ *   -> CLAMP_HELD
+ *
+ * The next reader will conflate the two anyway, so: a permissive Helm is a Helm
+ * that is not interrupted, not a Helm that can touch the captain's repository.
+ * The only thing that hands those tools back is `BLUESPACE_UNCLAMPED=1`, which
+ * is a different switch with a different argument and a much louder one.
+ */
+export const HELM_PERMISSION_MODE_ARGUMENT = 'auto';
+
 /**
  * Hand the window back unclamped, for a captain who means it.
  *
@@ -650,6 +837,10 @@ export interface HelmLaunchInput {
   deniedTools: readonly string[];
   /** Tools pre-approved for this window: BlueSpace's own, and nothing else. */
   allowedTools: readonly string[];
+  /** Inline `--settings` JSON — BlueSpace's own keys only, or nothing. */
+  settingsJson?: string | undefined;
+  /** `--permission-mode`, or nothing to leave the captain's own posture alone. */
+  permissionMode?: string | undefined;
   /** The opening turn, or undefined for a window that waits. */
   openingPrompt?: string | undefined;
 }
@@ -711,6 +902,15 @@ export function buildHelmArgv(input: HelmLaunchInput): string[] {
   // disjoint by construction: one is built-ins, the other is `mcp__bluespace__*`.
   if (input.allowedTools.length > 0) argv.push('--allowedTools', input.allowedTools.join(','));
 
+  // Both take exactly one value, so neither can swallow what follows and the
+  // ordering rule above does not constrain where they sit. They go BEFORE the
+  // captain's argv on purpose: `--settings` and `--permission-mode` are
+  // single-value options, so a later one of the captain's own replaces ours
+  // outright — which is the precedence we want, and the reason these are
+  // defaults rather than impositions.
+  if (input.settingsJson !== undefined) argv.push('--settings', input.settingsJson);
+  if (input.permissionMode !== undefined) argv.push('--permission-mode', input.permissionMode);
+
   argv.push('--append-system-prompt', input.systemPromptAppend); // must stay last
 
   argv.push(...input.captainArgs);
@@ -747,6 +947,71 @@ function envFlag(env: NodeJS.ProcessEnv, name: string): boolean {
  */
 export function strictMcpRequested(env: NodeJS.ProcessEnv = process.env): boolean {
   return envFlag(env, 'BLUESPACE_STRICT_MCP');
+}
+
+// ---------------------------------------------------------------------------
+// Workspace trust
+// ---------------------------------------------------------------------------
+
+/**
+ * Has Claude Code been told it trusts this directory?
+ *
+ * `undefined` means "cannot tell" — no global config yet, or one this cannot
+ * parse — and is deliberately not the same as `false`. A guess in that direction
+ * would put a warning about a modal in front of every captain whose config lives
+ * somewhere unusual, which is worse than the modal.
+ *
+ * Trust is INHERITED from a trusted ancestor (measured on 2.1.222, and the whole
+ * reason `docs/compliance.md` tells you to trust the worktree root once), so an
+ * ancestor entry counts. The check is a plain path-prefix walk rather than a
+ * lookup, because that is what inheritance actually is.
+ */
+export function workspaceTrusted(cwd: string, home: string | undefined): boolean | undefined {
+  if (home === undefined || home === '') return undefined;
+  let projects: unknown;
+  try {
+    const raw = fs.readFileSync(path.join(home, '.claude.json'), 'utf8');
+    const parsed: unknown = JSON.parse(raw);
+    if (typeof parsed !== 'object' || parsed === null) return undefined;
+    projects = (parsed as Record<string, unknown>)['projects'];
+  } catch {
+    return undefined;
+  }
+  if (typeof projects !== 'object' || projects === null) return undefined;
+
+  const target = path.resolve(cwd);
+  for (const [dir, entry] of Object.entries(projects as Record<string, unknown>)) {
+    if (typeof entry !== 'object' || entry === null) continue;
+    if ((entry as Record<string, unknown>)['hasTrustDialogAccepted'] !== true) continue;
+    const trusted = path.resolve(dir);
+    if (target === trusted || target.startsWith(`${trusted}${path.sep}`)) return true;
+  }
+  return false;
+}
+
+/**
+ * The one line a captain gets before their first window opens on a modal.
+ *
+ * The failure this exists for is the whole of a new user's first run: Claude
+ * Code asks "Is this a project you trust?" the first time it opens a directory,
+ * **no hook fires and no MCP server loads until it is answered**, so `bluespace`
+ * appears to hang on a security question that says nothing about BlueSpace. A
+ * Crew already gets this diagnosis (`SessionNotReadyError`); the window the
+ * captain actually types into did not, which is the asymmetry this closes.
+ *
+ * It warns and opens anyway. Refusing would be wrong — a captain is sitting
+ * right there and can answer it in one keystroke — and answering it *for* them
+ * is the keystroke this project refuses to press on principle. Naming it before
+ * the screen is taken is the whole of what a launcher can honestly do.
+ */
+export function trustNotice(trusted: boolean | undefined, cwd: string): string | undefined {
+  if (trusted !== false) return undefined;
+  return (
+    `[bluespace] Claude Code has not been told it trusts ${cwd}, so this window opens on its ` +
+    `"Is this a project you trust?" prompt. Nothing loads until you answer it — no BlueSpace ` +
+    `tools, no wake sweep — so press 1 and it will carry on. Answering once covers every ` +
+    `directory beneath it, including the worktrees your Crews get.`
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -833,16 +1098,19 @@ export async function runLauncher(
     stdio?: 'inherit' | 'ignore';
     /** The captain's pinned language. Read from config when not supplied. */
     voice?: CaptainVoice;
+    /** The whole config, injectable so a test never touches the real one. */
+    config?: BlueConfig;
   } = {},
 ): Promise<number> {
   const env = options.env ?? process.env;
   const root = options.root ?? installRoot();
 
-  // The pin wins, the shell's locale is the fallback, and neither is a language
-  // this file chose. `loadConfig` never throws — a broken config file yields
-  // defaults, which here means an undetected language, which means Helm mirrors
-  // the captain: the same benign end state as an empty `LANG`.
-  const voice = options.voice ?? resolveCaptainVoice(loadConfig().language, env);
+  // Read once. `loadConfig` never throws — a broken config file yields defaults,
+  // which here means the captain's ask (ultracode, `auto`) and an undetected
+  // language, which means Helm mirrors them: the same benign end state as an
+  // empty `LANG`.
+  const config = options.config ?? loadConfig();
+  const voice = options.voice ?? resolveCaptainVoice(config.language, env);
 
   let claudePath: string;
   let systemPromptAppend: string;
@@ -862,6 +1130,20 @@ export async function runLauncher(
   const wake =
     captainArgs.length === 0 && !envFlag(env, 'BLUESPACE_NO_WAKE') ? wakePrompt(voice) : undefined;
 
+  // Said before the window opens, because a beat later Claude Code owns the
+  // screen. Only ever printed when something in THIS shell is measurably in the
+  // way — a line every launch would be noise on the mornings it is fine.
+  const posture = resolveHelmPosture(config);
+  if (posture.ultracode) {
+    const notice = ultracodeNotice(ultracodeBlockedBy(env));
+    if (notice !== undefined) errLine(notice);
+  }
+
+  // Same rule: only when something is measurably in the way. An untrusted
+  // directory is the one blocker that stops the window before it starts.
+  const trust = trustNotice(workspaceTrusted(process.cwd(), env['HOME'] ?? os.homedir()), process.cwd());
+  if (trust !== undefined) errLine(trust);
+
   const argv = buildHelmArgv({
     claudePath,
     mcpConfigJson: helmMcpConfig(options.entry ?? blueEntry()),
@@ -873,6 +1155,8 @@ export async function runLauncher(
     // Not conditioned on the clamp. An unclamped window still has the same
     // thirteen tools from the same server, and still should not open on a dialog.
     allowedTools: HELM_ALLOWED_TOOLS,
+    settingsJson: helmSettingsJson(posture.ultracode),
+    permissionMode: posture.permissionMode,
     openingPrompt: wake,
   });
 

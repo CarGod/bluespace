@@ -15,9 +15,10 @@ export {
   projectAllDecisions,
   projectCost,
   projectCrewLog,
+  projectHelmWindows,
   projectOpenDecisions,
   projectTask,
   projectTasks,
   projectUsage,
 } from './projections.js';
-export type { CostProjection, UsageProjection } from './projections.js';
+export type { CostProjection, HelmWindowRef, UsageProjection } from './projections.js';

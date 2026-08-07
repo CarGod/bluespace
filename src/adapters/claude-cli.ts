@@ -49,9 +49,9 @@
  *     marker file; end-of-turn is a `Stop` hook touching another; a dialog the
  *     worker is stuck on is a `Notification` hook writing its JSON payload to a
  *     third; content and cost come from the transcript. All three hooks travel
- *     in inline `--settings` JSON, so a run never touches
- *     `~/.claude/settings.json` — a hook installed there would fire for the
- *     captain's own unrelated sessions.
+ *     in a `--settings` file inside this run's own directory, so a run never
+ *     touches `~/.claude/settings.json` — a hook installed there would fire for
+ *     the captain's own unrelated sessions.
  *
  *     The third one is not defensive programming. Verified on 2.1.222 with
  *     `--permission-mode auto`, in a git repo, editing a tracked file: Claude
@@ -79,7 +79,20 @@
  *     (`startAtByte`), because the CLI appends every turn to the same file and a
  *     reader that started over would bill turn 1 again on turn 2.
  *
- *  6. A SUBAGENT'S TOKENS ARE THE CREW'S BILL. Verified on 2.1.222: records for
+ *  6. THE COMMAND LINE IS SMALL, AND NOTHING UNBOUNDED MAY TRAVEL ON IT. A
+ *     worker is launched by handing argv to a session backend, and the reference
+ *     backend is tmux, which packs the whole command into one 16 KiB message —
+ *     16,364 usable bytes, measured (`TMUX_MAX_COMMAND_BYTES`). BlueSpace's own
+ *     inputs cross that routinely: a Sentinel's prompt is a brief plus an entire
+ *     diff, and one measured at 112,680 bytes. So the appended system prompt and
+ *     the run settings ALWAYS travel as file paths, the opening prompt travels
+ *     as a path once it stops fitting, and the assembled line is measured before
+ *     launch. What that buys is not just a launch that works — it is a refusal
+ *     that names which BlueSpace input was too big, instead of tmux's `command
+ *     too long`, which names nothing. Note what this is NOT about: the kernel's
+ *     `ARG_MAX` is 1 MiB here and was never the constraint.
+ *
+ *  7. A SUBAGENT'S TOKENS ARE THE CREW'S BILL. Verified on 2.1.222: records for
  *     a delegated agent are NOT in the session transcript — they are written to
  *     `<project-dir>/<session-uuid>/subagents/agent-<id>.jsonl`. A Crew that
  *     delegates would otherwise spend money nothing here can see, and the
@@ -233,6 +246,29 @@ const DEFAULT_STRUCTURED_RETRIES = 1;
  * inside the window cancels it: the prompt was answered and work resumed.
  */
 const DEFAULT_BLOCKED_GRACE_MS = 60_000;
+
+/**
+ * The gap between typing a follow-up turn and pressing Enter.
+ *
+ * A `send-keys -l` of any real size arrives at the TUI as a *paste*, and Claude
+ * Code coalesces a paste into `[Pasted text #1]` rather than into characters. An
+ * Enter that lands inside that coalescing window is swallowed as one more
+ * character of the paste, so the message sits in the composer, unsent, forever —
+ * which looks exactly like a worker thinking, because nothing is watching the
+ * screen. Measured on 2.1.224 with a 2,178-byte message: Enter with no gap at
+ * all did not submit; 150ms, 400ms, 800ms and 1500ms all did.
+ *
+ * This is the cheap half of the fix and deliberately not the whole of it — a
+ * delay long enough on this machine today is not a guarantee, so submission is
+ * also *confirmed* below rather than assumed.
+ */
+export const SUBMIT_SETTLE_MS = 400;
+
+/** How long a submitted turn gets to appear in the transcript before Enter is pressed again. */
+const SUBMIT_CONFIRM_MS = 5_000;
+
+/** How many times to press Enter before giving up and saying so. */
+const SUBMIT_ATTEMPTS = 4;
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -417,10 +453,30 @@ export interface LaunchArgvInput {
   sessionId: string;
   profile: DispatchProfile;
   settingScopes: readonly SettingScope[];
-  systemPromptAppend: string;
-  /** Inline JSON carrying this run's hooks. Never a path into ~/.claude. */
-  settingsJson: string;
-  /** Opening message. Lands in the composer UNSENT — see the file header. */
+  /**
+   * PATH to the appended system prompt, not the text.
+   *
+   * `--append-system-prompt-file` exists and is what carries it (verified on
+   * 2.1.224: the flag parses and validates its argument — it is absent from
+   * `--help` but real). The text is unbounded by nature — for a structured run
+   * it has a whole JSON Schema in it — and this line has 16,364 bytes for
+   * everything. See LAUNCH_LINE_BUDGET.
+   */
+  systemPromptFile: string;
+  /**
+   * PATH to this run's settings JSON, not the JSON.
+   *
+   * `--settings` is documented as taking "a settings JSON file or a JSON
+   * string", so a path has always been accepted. Still never a path into
+   * `~/.claude`: it is this run's file, in this run's directory.
+   */
+  settingsFile: string;
+  /**
+   * Opening message. Lands in the composer UNSENT — see the file header.
+   *
+   * Kept inline while it fits the line, and replaced by a short pointer at a
+   * file when it does not. `spawn` decides which; see `promptPointer`.
+   */
   prompt: string;
   /** Extra readable/writable roots, e.g. where a structured verdict is written. */
   addDirs?: readonly string[];
@@ -432,6 +488,12 @@ export interface LaunchArgvInput {
  * Exported and pure because this array IS the protocol: a test asserts it
  * element by element, which is the only way a silent reordering or a dropped
  * flag gets caught before a fleet of workers behaves subtly differently.
+ *
+ * NOTHING UNBOUNDED TRAVELS ON THIS LINE. Every input that can grow with a task
+ * — the appended system prompt, the run settings, and (above a budget) the
+ * opening prompt — arrives as a path to a file written before launch. That is
+ * not tidiness: the line goes to tmux, tmux stops at 16,364 bytes, and a
+ * Sentinel prompt is a brief plus an entire diff. See LAUNCH_LINE_BUDGET.
  *
  * Note what has no branch: `--setting-sources` is unconditional. See header (2).
  */
@@ -445,8 +507,8 @@ export function buildLaunchArgv(input: LaunchArgvInput): string[] {
     profile.permissionMode,
     '--setting-sources',
     input.settingScopes.join(','),
-    '--append-system-prompt',
-    input.systemPromptAppend,
+    '--append-system-prompt-file',
+    input.systemPromptFile,
   ];
 
   // Only when the profile states them: an absent `--model` means the captain's
@@ -455,11 +517,216 @@ export function buildLaunchArgv(input: LaunchArgvInput): string[] {
   if (profile.model !== undefined) argv.push('--model', profile.model);
   for (const dir of input.addDirs ?? []) argv.push('--add-dir', dir);
 
-  argv.push('--settings', input.settingsJson);
+  argv.push('--settings', input.settingsFile);
   // Positional LAST, and last for a reason: everything after a bare positional
   // risks being read as part of it by a future parser.
   if (input.prompt !== '') argv.push(input.prompt);
   return argv;
+}
+
+// ---------------------------------------------------------------------------
+// The line budget — computed before launch, never discovered afterwards
+// ---------------------------------------------------------------------------
+
+/**
+ * Ceiling assumed for a backend that declares none.
+ *
+ * Every backend BlueSpace ships declares one, so this is the value used when a
+ * caller supplies their own. tmux's real ceiling is the smallest thing in play
+ * by a wide margin, so budgeting to it costs a non-tmux backend nothing and
+ * saves a tmux one from a launch it cannot make.
+ */
+const DEFAULT_LAUNCH_BUDGET_BYTES = 15_340;
+
+/**
+ * Room held back for the session backend's own framing.
+ *
+ * THE ARGV THIS ADAPTER BUILDS IS NOT THE WHOLE COMMAND. A backend wraps it —
+ * tmux prepends `new-window -t <session>: -n <window> -c <cwd> -e K=V … -P -F
+ * #{window_name} --` — and every byte of that is spent from the same ceiling.
+ * An adapter that budgeted only its own argv would pass its check and still be
+ * refused, which is the failure it exists to prevent, one layer along.
+ *
+ * The two parts of the wrapper that can actually grow are priced exactly rather
+ * than guessed at, because this adapter supplies both: the working directory and
+ * the environment. What is left is the fixed vocabulary — two subcommand
+ * spellings, six flags, a session name and a sanitised window name capped at 32
+ * characters — and 512 bytes is several times more than that costs.
+ */
+const BACKEND_FRAMING_BYTES = 512;
+
+/** What tmux-style backends spend on `-e KEY=VALUE` for a launch environment. */
+function envFramingBytes(env: Readonly<Record<string, string | undefined>> | undefined): number {
+  if (env === undefined) return 0;
+  const args: string[] = [];
+  for (const [key, value] of Object.entries(env)) {
+    if (value !== undefined) args.push('-e', `${key}=${value}`);
+  }
+  return launchArgvBytes(args);
+}
+
+/**
+ * WHY THIS BUDGET EXISTS, stated once and referenced from everywhere above.
+ *
+ * A worker is launched by handing argv to a session backend, and the reference
+ * backend is tmux, which packs the whole command into a single 16 KiB message
+ * and refuses anything larger with `command too long`. That sentence is the
+ * entire failure report: it names no argument, no size, and nothing a captain
+ * can act on. A real task died on it — a Sentinel whose prompt was a brief plus
+ * a 112,680-byte diff — and then its rework respawn died on it again, after the
+ * Crew had already done the work and committed it. 2.4M tokens, nothing verified.
+ *
+ * So the line is measured BEFORE the launch, against the backend's own declared
+ * ceiling, and an oversized input is refused by BlueSpace naming BlueSpace's own
+ * input. `TMUX_MAX_COMMAND_BYTES` carries the measurement and the date.
+ */
+export const LAUNCH_LINE_BUDGET = 'see TMUX_MAX_COMMAND_BYTES in src/session/tmux.ts';
+
+/** Size an argv the way a backend does: every element, plus its NUL terminator. */
+export function launchArgvBytes(argv: readonly string[]): number {
+  let total = 0;
+  for (const arg of argv) total += Buffer.byteLength(arg, 'utf8') + 1;
+  return total;
+}
+
+/** One named contributor to the line, for an error that points at a cause. */
+export interface LaunchPart {
+  /** What a captain calls it — "the opening prompt", not "argv[13]". */
+  label: string;
+  bytes: number;
+}
+
+/**
+ * The launch line is too long, and here is which of BlueSpace's inputs did it.
+ *
+ * The whole reason this type exists is the message. tmux says `command too
+ * long`; this says which input, how big it is, and how much room there was —
+ * the three facts that turn "BlueSpace is broken" into "that diff is enormous".
+ * Sizes only, never content: the oversized part is usually a diff or a brief.
+ */
+export class LaunchTooLargeError extends Error {
+  constructor(
+    readonly totalBytes: number,
+    readonly limitBytes: number,
+    readonly parts: readonly LaunchPart[],
+  ) {
+    const ranked = [...parts].sort((a, b) => b.bytes - a.bytes);
+    const worst = ranked[0];
+    super(
+      `cannot launch this worker: its command line would be ` +
+        `${totalBytes.toLocaleString('en-US')} bytes, and the session backend accepts ` +
+        `${limitBytes.toLocaleString('en-US')}.\n\n` +
+        (worst === undefined
+          ? ''
+          : `The oversized input is ${worst.label}, at ${worst.bytes.toLocaleString('en-US')} bytes.\n`) +
+        `Everything on the line: ${ranked
+          .map((p) => `${p.label} ${p.bytes.toLocaleString('en-US')}B`)
+          .join(', ')}.\n\n` +
+        `This is the session backend's limit on one command, NOT the kernel's ARG_MAX ` +
+        `(1 MiB, and not what refused this). BlueSpace already passes the system prompt, the ` +
+        `run settings and any large prompt as file paths, so reaching this means something ` +
+        `else on the line grew — an unusually long working directory, --add-dir list, or ` +
+        `binary path.`,
+    );
+    this.name = 'LaunchTooLargeError';
+  }
+}
+
+/**
+ * Refuse a launch that will not fit, before a window or a worktree is spent on it.
+ *
+ * `extraBytes` is what the session backend will add to this argv on its way past
+ * — the working directory, the environment, its own subcommand and flags. It is
+ * a parameter rather than an assumption because the caller is the only layer
+ * that knows both halves: it supplies the cwd and the env, and it knows which
+ * backend is going to wrap them.
+ *
+ * Returns nothing and throws on failure, because there is no useful partial
+ * answer: a launch that does not fit is not a launch.
+ */
+export function assertLaunchFits(
+  argv: readonly string[],
+  limitBytes: number,
+  parts: readonly LaunchPart[],
+  extraBytes = 0,
+): void {
+  const total = launchArgvBytes(argv) + extraBytes;
+  if (total <= limitBytes) return;
+  throw new LaunchTooLargeError(total, limitBytes, parts);
+}
+
+/**
+ * The positional that stands in for a prompt too big to put on the line.
+ *
+ * WHY A POINTER AND NOT THE TEXT. Three routes were available and two do not
+ * survive contact with the thing being built:
+ *
+ *   Typing it in (`sendText` + Enter) is what `send()` does for a follow-up
+ *   turn, and it is wrong here. The launch positional SUBMITS ITSELF (header 3),
+ *   so a prompt delivered by keystroke has to be submitted by keystroke too —
+ *   into a composer whose readiness we are forbidden to observe (THE ONE RULE),
+ *   at a moment when the TUI has only just signalled SessionStart. `send()`
+ *   already collapses newlines because a stray submit splits one message into
+ *   several half-messages; doing that to a brief at launch would start a task on
+ *   its first paragraph.
+ *
+ *   Standard input is not ours. The CLI is launched by the backend into a pty we
+ *   reach only through the backend's own typing interface, which is the route
+ *   above.
+ *
+ *   So: the file. And the honest objection to a file is that reading it is an
+ *   INSTRUCTION, and a worker can ignore an instruction where it cannot ignore
+ *   an argument. Four things answer that, in order of how much they carry:
+ *
+ *   1. IT IS NOT THE ONLY CHANNEL. The same path is named in the appended system
+ *      prompt, which the CLI loads into context itself — no tool call, no
+ *      compliance required. A worker that never reads the composer has still
+ *      been told where its brief is, by a mechanism it cannot skip.
+ *   2. THERE IS NOTHING ELSE TO DO. This text names the path and says the file
+ *      is the brief. It deliberately does not summarise the task, because a
+ *      summary is exactly what a worker would act on INSTEAD of reading.
+ *   3. THE FAILURE IS CONTAINED AND CORRECTLY SIGNED. In practice the only
+ *      prompts this large are Sentinel prompts, and the Sentinel fails closed: no
+ *      verdict file is `pass: false`, "the diff is unverified". A Crew that
+ *      ignored its brief produces a diff the Sentinel rejects. Neither route
+ *      launders a skipped instruction into a pass.
+ *   4. IT IS ONLY USED WHEN NOTHING ELSE FITS. Under the budget the prompt stays
+ *      the positional, exactly as it is today, so the ordinary Crew launch keeps
+ *      the measured self-submitting behaviour and gains no dependence on a Read.
+ *
+ * The run directory is granted with `--add-dir`, so the read cannot fail for
+ * permissions, and the file is written before launch, so it cannot race.
+ */
+export function promptPointer(promptFile: string): string {
+  return (
+    `Your instructions for this session are too long to pass on the command line, so they ` +
+    `are in a file. Read this file now, in full, before doing anything else, and then carry ` +
+    `out what it says as if it had been typed here:\n\n    ${promptFile}\n\n` +
+    `That file is the entire message. Do not act on this line alone — it contains no task, ` +
+    `and guessing at one would waste the run.`
+  );
+}
+
+/**
+ * Told to the worker, in the system prompt, where its brief actually is.
+ *
+ * The second channel from `promptPointer`'s point (1), and the load-bearing half
+ * of it: the appended system prompt travels by file and is loaded by the CLI
+ * itself, so this reaches the model whether or not it reads the composer.
+ */
+function promptFileNotice(promptFile: string): string {
+  return [
+    '',
+    '',
+    '## Where your instructions are',
+    '',
+    'The opening message for this session was too large for the command line and was written',
+    'to a file instead. This is the file, and it is the real message:',
+    '',
+    `    ${promptFile}`,
+    '',
+    'Read it in full before you act. Nothing else in this session restates it.',
+  ].join('\n');
 }
 
 // ---------------------------------------------------------------------------
@@ -474,6 +741,12 @@ interface RunMarkers {
   notify: string;
   /** Where a structured run is told to write its JSON. */
   verdict: string;
+  /** This run's hooks, written out rather than passed inline. See header (4). */
+  settings: string;
+  /** The appended system prompt, passed as `--append-system-prompt-file`. */
+  systemPrompt: string;
+  /** The opening prompt, written only when it is too big for the line. */
+  prompt: string;
 }
 
 /**
@@ -733,7 +1006,7 @@ class ClaudeCliSession implements Session {
   #transcriptPath: string | undefined;
   /** How far into the transcript previous turns read. See header (5). */
   #offset = 0;
-  /** Per subagent transcript, how far previous drains read. See header (6). */
+  /** Per subagent transcript, how far previous drains read. See header (7). */
   readonly #subagentOffsets = new Map<string, number>();
 
   constructor(init: SessionInit) {
@@ -867,7 +1140,7 @@ class ClaudeCliSession implements Session {
   }
 
   /**
-   * Bill the subagents. See header (6) for why they are invisible without this.
+   * Bill the subagents. See header (7) for why they are invisible without this.
    *
    * Drained at the end of the turn rather than followed alongside it: the files
    * are complete once the Stop hook has fired and the settle window has passed,
@@ -1150,7 +1423,96 @@ class ClaudeCliSession implements Session {
     this.#interrupted = false;
 
     await this.#init.backend.sendText(this.#init.endpoint.target, oneLine);
-    await this.#init.backend.sendKey(this.#init.endpoint.target, 'Enter');
+    await this.#submit();
+  }
+
+  /**
+   * Press Enter until the turn has actually started, and fail loudly if it never
+   * does.
+   *
+   * Typing is not sending. `sendText` puts the message in the composer; only a
+   * submit key starts a turn, and a submit key can be eaten (see
+   * `SUBMIT_SETTLE_MS`). The failure that motivated this had no symptom at all:
+   * a rework message sat in the composer as `[Pasted text #1]`, the task stayed
+   * `working` with `reworkCount: 1`, and the only thing that ever moved it was a
+   * human pressing Enter by hand.
+   *
+   * Confirmation comes from the transcript, never the screen: a submitted turn
+   * appends a `user` record, and nothing else does. If there is no transcript to
+   * read yet, one settled Enter is all this can honestly promise, and it says so
+   * by returning rather than pretending to have checked.
+   */
+  async #submit(): Promise<void> {
+    const target = this.#init.endpoint.target;
+    const before = await this.#userTurns();
+
+    // Zero is "this transcript does not record prompts", not "no turn has been
+    // submitted": a session that has run at all was launched with a positional
+    // prompt, and Claude Code writes that as a `user` record before anything
+    // else. A transcript with none of them is one this cannot read the way it
+    // thinks it can — a stand-in harness in the tests, or a future format — and
+    // guessing there would turn every send into four Enters and a hard failure.
+    // The settled Enter below is the half that fixed the observed bug on its
+    // own; confirmation is the belt on top of it, and it is honest about when
+    // it is not wearing one.
+    const confirmable = before !== undefined && before > 0;
+
+    for (let attempt = 1; attempt <= SUBMIT_ATTEMPTS; attempt += 1) {
+      await delay(SUBMIT_SETTLE_MS);
+      await this.#init.backend.sendKey(target, 'Enter');
+      if (!confirmable) return;
+
+      const deadline = Date.now() + SUBMIT_CONFIRM_MS;
+      while (Date.now() < deadline) {
+        await delay(this.#init.timing.pollIntervalMs);
+        const now = await this.#userTurns();
+        if (now !== undefined && now > before) return;
+      }
+    }
+
+    throw new Error(
+      `session "${this.id}" did not accept the follow-up turn: the message was typed into the ` +
+        `composer but ${SUBMIT_ATTEMPTS} Enter presses over ` +
+        `${Math.round((SUBMIT_ATTEMPTS * (SUBMIT_SETTLE_MS + SUBMIT_CONFIRM_MS)) / 1000)}s did not ` +
+        `start a turn — the transcript records no new message. Attach and press Enter to see what ` +
+        `the composer is holding: ${this.attachCommand}`,
+    );
+  }
+
+  /**
+   * How many turns the captain's side of this conversation has, as the
+   * transcript records them. `undefined` means "cannot tell" — no transcript
+   * located yet, or unreadable — which is different from zero and is treated as
+   * such by every caller.
+   */
+  async #userTurns(): Promise<number | undefined> {
+    const file =
+      this.#transcriptPath ??
+      (await findTranscript(this.id, { root: this.#init.transcriptRootPath }).catch(
+        () => undefined,
+      ));
+    if (file === undefined) return undefined;
+
+    let raw: string;
+    try {
+      raw = await fs.readFile(file, 'utf8');
+    } catch {
+      return undefined;
+    }
+
+    let count = 0;
+    for (const line of raw.split('\n')) {
+      if (line === '') continue;
+      let record: unknown;
+      try {
+        record = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      if (!isUserPrompt(record)) continue;
+      count += 1;
+    }
+    return count;
   }
 
   async interrupt(): Promise<void> {
@@ -1292,23 +1654,104 @@ export class ClaudeCliAdapter implements HarnessAdapter {
     };
 
     const structured = req.outputSchema !== undefined;
+
+    // THE LINE BUDGET. Everything below this comment exists because the command
+    // is handed to a session backend that stops at a fixed size — 16,364 bytes
+    // for tmux — and BlueSpace's own inputs cross it routinely. See
+    // LAUNCH_LINE_BUDGET for the failure this replaces.
+    const env = this.#launchEnv();
+    const cwdBytes = Buffer.byteLength(req.cwd, 'utf8') + 1;
+    const envBytes = envFramingBytes(env);
+    /** Everything the backend will add to this argv on its way to the terminal. */
+    const framingBytes = BACKEND_FRAMING_BYTES + cwdBytes + envBytes;
+    /** The whole command's ceiling, which is what the backend actually enforces. */
+    const commandLimitBytes = this.#backend.maxCommandBytes ?? DEFAULT_LAUNCH_BUDGET_BYTES;
+    /** What is left for THIS adapter's argv once the backend has taken its share. */
+    const limitBytes = commandLimitBytes - framingBytes;
+
+    let systemPromptAppend = structured
+      ? req.systemPromptAppend + structuredOutputInstruction(markers.verdict, req.outputSchema)
+      : req.systemPromptAppend;
+
+    // The verdict file lives outside the worktree so a run never leaves a stray
+    // artefact in the diff it is being judged on; a prompt file lives there for
+    // the same reason. Either way the worker has to be granted the directory
+    // explicitly, and one grant covers both.
+    const addDirs: string[] = [];
+
+    // Does the prompt fit as a positional? Measured against the argv that would
+    // actually be sent, not against a guess: the flags, the paths and the cwd
+    // all spend from the same budget. Built once WITHOUT the prompt to price the
+    // rest, because that overhead is what decides how much prompt there is room
+    // for.
+    const overheadArgv = buildLaunchArgv({
+      claudePath,
+      sessionId,
+      profile: req.profile,
+      settingScopes: req.settingScopes,
+      systemPromptFile: markers.systemPrompt,
+      settingsFile: markers.settings,
+      prompt: '',
+      addDirs: [markers.dir],
+    });
+    const roomForPrompt = limitBytes - launchArgvBytes(overheadArgv);
+    const promptFits = Buffer.byteLength(req.prompt, 'utf8') + 1 <= roomForPrompt;
+
+    let positional = req.prompt;
+    if (!promptFits) {
+      // Too big for the line. It becomes a file, the positional becomes a
+      // pointer at it, and the system prompt names the same path so the worker
+      // is told twice through two mechanisms. See `promptPointer`.
+      await fs.writeFile(markers.prompt, req.prompt, 'utf8');
+      positional = promptPointer(markers.prompt);
+      systemPromptAppend += promptFileNotice(markers.prompt);
+    }
+    if (structured || !promptFits) addDirs.push(markers.dir);
+
+    // Written BEFORE the launch, both of them, because the CLI reads them at
+    // startup and a file that is not there yet is a worker that dies explaining
+    // it. `--append-system-prompt-file` validates its path (verified on 2.1.224).
+    await fs.writeFile(markers.settings, buildRunSettings(markers), 'utf8');
+    await fs.writeFile(markers.systemPrompt, systemPromptAppend, 'utf8');
+
     const argv = buildLaunchArgv({
       claudePath,
       sessionId,
       profile: req.profile,
       settingScopes: req.settingScopes,
-      systemPromptAppend: structured
-        ? req.systemPromptAppend + structuredOutputInstruction(markers.verdict, req.outputSchema)
-        : req.systemPromptAppend,
-      settingsJson: buildRunSettings(markers),
-      prompt: req.prompt,
-      // The verdict file lives outside the worktree so a run never leaves a
-      // stray artefact in the diff it is being judged on; that means the worker
-      // has to be granted the directory explicitly.
-      ...(structured ? { addDirs: [markers.dir] } : {}),
+      systemPromptFile: markers.systemPrompt,
+      settingsFile: markers.settings,
+      prompt: positional,
+      ...(addDirs.length > 0 ? { addDirs } : {}),
     });
 
-    const env = this.#launchEnv();
+    // The backstop, and the thing that replaces `command too long`. It should be
+    // unreachable — the prompt is the only input that can grow, and it has just
+    // been bounded — so reaching it means something else did, and the message
+    // has to say what. Checked before the window exists so nothing is left over.
+    //
+    // Priced against the WHOLE command, backend framing included, so the parts
+    // list is the real one: cwd and env are not in this argv but are on the same
+    // line, and naming only what happens to be in `argv` would point a captain
+    // at the wrong input.
+    try {
+      assertLaunchFits(
+        argv,
+        commandLimitBytes,
+        [
+          { label: 'the opening prompt', bytes: Buffer.byteLength(positional, 'utf8') },
+          { label: 'the working directory', bytes: cwdBytes },
+          { label: 'the worker environment', bytes: envBytes },
+          { label: 'the claude binary path', bytes: Buffer.byteLength(claudePath, 'utf8') },
+          { label: 'the run directory paths', bytes: launchArgvBytes(addDirs) },
+        ],
+        framingBytes,
+      );
+    } catch (err) {
+      await cleanupRunDir(markers.dir);
+      throw err;
+    }
+
     let endpoint: SessionEndpoint;
     try {
       endpoint = await this.#backend.launch({
@@ -1400,6 +1843,9 @@ export class ClaudeCliAdapter implements HarnessAdapter {
       stop: path.join(dir, 'stop'),
       notify: path.join(dir, 'notify.json'),
       verdict: path.join(dir, 'output.json'),
+      settings: path.join(dir, 'settings.json'),
+      systemPrompt: path.join(dir, 'system-prompt.md'),
+      prompt: path.join(dir, 'prompt.md'),
     };
   }
 }
@@ -1450,6 +1896,28 @@ async function cleanupRunDir(dir: string): Promise<void> {
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Is this transcript record a turn the captain's side actually submitted?
+ *
+ * Tool results are also written as `user` records and vastly outnumber real
+ * prompts, so counting `type: "user"` alone would report a turn had started
+ * every time the worker ran a command. A submitted prompt is a `user` record
+ * whose content is a string, or an array holding at least one `text` block.
+ */
+function isUserPrompt(record: unknown): boolean {
+  if (!isObject(record)) return false;
+  if (record['type'] !== 'user') return false;
+  if (record['isSidechain'] === true) return false;
+
+  const message = record['message'];
+  if (!isObject(message)) return false;
+
+  const content = message['content'];
+  if (typeof content === 'string') return content !== '';
+  if (!Array.isArray(content)) return false;
+  return content.some((part) => isObject(part) && part['type'] === 'text');
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {

@@ -31,14 +31,24 @@ import {
   buildHelmArgv,
   deniedTools,
   helmMcpConfig,
+  helmSettingsJson,
   helmSystemPrompt,
   runLauncher,
   strictMcpRequested,
+  trustNotice,
+  ultracodeBlockedBy,
+  ultracodeNotice,
   unclampedRequested,
+  workspaceTrusted,
   wakePrompt,
 } from '../src/cli/bluespace.js';
 import { HELM_TOOL_NAMES } from '../src/agents/helm/index.js';
-import { MIRROR_VOICE, resolveCaptainVoice } from '../src/config/index.js';
+import {
+  DEFAULT_HELM_POSTURE,
+  MIRROR_VOICE,
+  defaultConfig,
+  resolveCaptainVoice,
+} from '../src/config/index.js';
 
 // ---------------------------------------------------------------------------
 // A `claude` that costs nothing
@@ -763,5 +773,262 @@ describe('runLauncher', () => {
   it('reports a claude that cannot be started, rather than dying without a reason', async () => {
     const h = await harness({ persona: '# Helm', env: { CLAUDE_CLI_PATH: path.join(os.tmpdir(), 'no-such-claude') } });
     expect(await runLauncher([], { root: h.root, entry: h.entry, env: h.env, stdio: 'ignore' })).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Ultracode, and the posture
+// ---------------------------------------------------------------------------
+
+describe('helmSettingsJson', () => {
+  it('carries the one key that turns ultracode on, and no others', () => {
+    // `--settings` merges a whole settings object into the captain's window. A
+    // second key here would be BlueSpace restyling a session it does not own,
+    // which is the line the rest of this launcher is drawn along.
+    const json = helmSettingsJson(true);
+    expect(json).toBeDefined();
+    expect(JSON.parse(json as string)).toEqual({ ultracode: true });
+  });
+
+  it('passes nothing at all when the captain turned it off', () => {
+    // Not `{"ultracode":false}`: writing the key would still land a flagSettings
+    // tier over their own settings for no reason.
+    expect(helmSettingsJson(false)).toBeUndefined();
+  });
+});
+
+describe('ultracodeBlockedBy', () => {
+  it('is silent when nothing in this shell is in the way', () => {
+    expect(ultracodeBlockedBy({})).toEqual([]);
+    expect(ultracodeBlockedBy({ CLAUDE_CODE_DISABLE_WORKFLOWS: '' })).toEqual([]);
+  });
+
+  it('names the two variables measured to swallow ultracode without a word', () => {
+    // Both measured on 2.1.224: the window opens, the ultracode badge is simply
+    // absent, and nothing anywhere says why. See ULTRACODE_SETTINGS_KEY.
+    expect(ultracodeBlockedBy({ CLAUDE_CODE_DISABLE_WORKFLOWS: '1' })).toEqual([
+      expect.stringContaining('CLAUDE_CODE_DISABLE_WORKFLOWS=1'),
+    ]);
+    expect(ultracodeBlockedBy({ CLAUDE_CODE_EFFORT_LEVEL: 'medium' })).toEqual([
+      expect.stringContaining('CLAUDE_CODE_EFFORT_LEVEL=medium'),
+    ]);
+    expect(
+      ultracodeBlockedBy({ CLAUDE_CODE_DISABLE_WORKFLOWS: '1', CLAUDE_CODE_EFFORT_LEVEL: 'low' }),
+    ).toHaveLength(2);
+  });
+});
+
+describe('ultracodeNotice', () => {
+  it('says nothing when there is nothing to say', () => {
+    expect(ultracodeNotice([])).toBeUndefined();
+  });
+
+  it('hedges the claim it cannot check, and names the command that can', () => {
+    const notice = ultracodeNotice(['CLAUDE_CODE_EFFORT_LEVEL=low (takes the session)']);
+    expect(notice).toBeDefined();
+    // It runs BEFORE the child exists, so it may not assert what the window did.
+    expect(notice).toMatch(/may not take/i);
+    expect(notice).not.toMatch(/did not|failed to/i);
+    // And it must leave the captain with something to do about it.
+    expect(notice).toContain('/effort ultracode');
+    expect(notice).toContain('CLAUDE_CODE_EFFORT_LEVEL=low');
+  });
+});
+
+describe('buildHelmArgv: the posture', () => {
+  const posture = { ...BASE, captainArgs: [], strictMcp: false };
+
+  it('passes both as single-value flags, before the prompt-safe tail', () => {
+    const argv = buildHelmArgv({
+      ...posture,
+      settingsJson: '{"ultracode":true}',
+      permissionMode: 'auto',
+    });
+    expect(valueOf(argv, '--settings')).toBe('{"ultracode":true}');
+    expect(valueOf(argv, '--permission-mode')).toBe('auto');
+    // The ordering rule is unchanged: the last injected flag takes exactly one
+    // value, so nothing the captain typed can be swallowed by a variadic.
+    expect(argv[argv.length - 2]).toBe('--append-system-prompt');
+  });
+
+  it('omits each one entirely when there is nothing to say', () => {
+    const argv = buildHelmArgv(posture);
+    expect(argv).not.toContain('--settings');
+    expect(argv).not.toContain('--permission-mode');
+  });
+
+  it('never passes --effort, which would silently defeat ultracode', () => {
+    // Measured on 2.1.224: `--effort high --settings '{"ultracode":true}'` opens
+    // a window whose own footer reads `● high`. The launch pin wins and nothing
+    // complains, so the only safe amount of --effort here is none.
+    const argv = buildHelmArgv({
+      ...posture,
+      settingsJson: '{"ultracode":true}',
+      permissionMode: 'auto',
+    });
+    expect(argv).not.toContain('--effort');
+  });
+
+  it('puts them ahead of the captain’s argv, so a flag of theirs wins', () => {
+    // Both are single-value options rather than variadic, so a later one
+    // replaces the earlier outright — which is the precedence that makes these
+    // defaults rather than impositions.
+    const argv = buildHelmArgv({
+      ...posture,
+      captainArgs: ['--permission-mode', 'plan'],
+      permissionMode: 'auto',
+    });
+    expect(argv.indexOf('--permission-mode')).toBeLessThan(argv.lastIndexOf('--permission-mode'));
+    expect(argv[argv.length - 1]).toBe('plan');
+  });
+});
+
+describe('runLauncher: the captain’s ask, as the default', () => {
+  it('opens at ultracode in a posture that does not ask', async () => {
+    const h = await harness({ persona: '# Helm' });
+    await runLauncher([], {
+      root: h.root,
+      entry: h.entry,
+      env: h.env,
+      stdio: 'ignore',
+      config: defaultConfig(),
+    });
+
+    const argv = await h.argv();
+    expect(JSON.parse(valueOf(argv, '--settings'))).toEqual({ ultracode: true });
+    expect(valueOf(argv, '--permission-mode')).toBe('auto');
+  });
+
+  it('is `auto` and not `bypassPermissions`, measured rather than preferred', () => {
+    // bypassPermissions opens on a consent modal only a human can dismiss,
+    // defaulting to "No, exit", and dismissing it writes
+    // `bypassPermissionsModeAccepted` into the captain's GLOBAL config — for
+    // every Claude Code session on the machine, set by a launcher they ran to
+    // get a fleet. `auto` reaches the same place with neither cost.
+    expect(DEFAULT_HELM_POSTURE.permissionMode).toBe('auto');
+    expect(DEFAULT_HELM_POSTURE.ultracode).toBe(true);
+  });
+
+  it('lets the captain dial either one back without touching the other', async () => {
+    const h = await harness({ persona: '# Helm' });
+    await runLauncher([], {
+      root: h.root,
+      entry: h.entry,
+      env: h.env,
+      stdio: 'ignore',
+      config: { ...defaultConfig(), helmUltracode: false, helmPermissionMode: 'manual' },
+    });
+
+    const argv = await h.argv();
+    expect(argv).not.toContain('--settings');
+    expect(valueOf(argv, '--permission-mode')).toBe('manual');
+  });
+
+  it('does not widen the clamp by one tool, at any posture', async () => {
+    // THE CONFLATION THIS FREEZES. Permissive means "not asked", never "allowed
+    // more". A deny rule beats an allow rule and beats a permission mode:
+    // measured, `claude --permission-mode auto --disallowedTools Bash,Edit,Write`
+    // asked to run `echo` replied CLAMP_HELD. The deny list must not move
+    // because the posture did.
+    const h = await harness({ persona: '# Helm' });
+    for (const helmPermissionMode of ['auto', 'bypassPermissions', 'manual'] as const) {
+      await runLauncher([], {
+        root: h.root,
+        entry: h.entry,
+        env: h.env,
+        stdio: 'ignore',
+        config: { ...defaultConfig(), helmPermissionMode },
+      });
+      expect(valueOf(await h.argv(), '--disallowedTools')).toBe(HELM_DENIED_TOOLS.join(','));
+    }
+  });
+
+  it('warns on stderr when this shell will swallow ultracode, and launches anyway', async () => {
+    const h = await harness({ persona: '# Helm', env: { CLAUDE_CODE_EFFORT_LEVEL: 'medium' } });
+    const said: string[] = [];
+    const write = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((s: string) => {
+      said.push(String(s));
+      return true;
+    }) as typeof process.stderr.write;
+    try {
+      const code = await runLauncher([], {
+        root: h.root,
+        entry: h.entry,
+        env: h.env,
+        stdio: 'ignore',
+        config: defaultConfig(),
+      });
+      // A blocked ultracode is a worse window, not a broken one.
+      expect(code).toBe(0);
+    } finally {
+      process.stderr.write = write;
+    }
+
+    expect(said.join('')).toContain('CLAUDE_CODE_EFFORT_LEVEL=medium');
+    expect(said.join('')).toContain('/effort ultracode');
+    // The setting is still passed: it is the environment that may defeat it, and
+    // this process has no way to know that it did.
+    expect(JSON.parse(valueOf(await h.argv(), '--settings'))).toEqual({ ultracode: true });
+  });
+
+  it('says nothing at all when the shell is clean', async () => {
+    const h = await harness({ persona: '# Helm' });
+    const said: string[] = [];
+    const write = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((s: string) => {
+      said.push(String(s));
+      return true;
+    }) as typeof process.stderr.write;
+    try {
+      await runLauncher([], {
+        root: h.root,
+        entry: h.entry,
+        env: h.env,
+        stdio: 'ignore',
+        config: defaultConfig(),
+      });
+    } finally {
+      process.stderr.write = write;
+    }
+    // A line every launch is noise on the mornings it is fine.
+    expect(said.join('')).not.toMatch(/ultracode/i);
+  });
+});
+
+describe('workspace trust', () => {
+  /**
+   * The first run every new user takes. Claude Code asks "Is this a project you
+   * trust?" the first time it opens a directory and nothing loads until it is
+   * answered — no hook, no MCP server, no wake sweep — so a cold `bluespace`
+   * sits on a security question that never mentions BlueSpace. A Crew already
+   * gets this diagnosis; the window the captain types into did not.
+   */
+  it('reads trust from the global config, and inherits it from an ancestor', async () => {
+    const home = await fs.mkdtemp(path.join(os.tmpdir(), 'blue-trust-'));
+    await fs.writeFile(
+      path.join(home, '.claude.json'),
+      JSON.stringify({ projects: { '/a/trusted': { hasTrustDialogAccepted: true } } }),
+    );
+
+    expect(workspaceTrusted('/a/trusted', home)).toBe(true);
+    // Inheritance is the whole reason trusting the worktree root once is enough.
+    expect(workspaceTrusted('/a/trusted/deep/worktree', home)).toBe(true);
+    expect(workspaceTrusted('/a/elsewhere', home)).toBe(false);
+    // A sibling whose name merely starts with the trusted path is NOT beneath it.
+    expect(workspaceTrusted('/a/trusted-not-really', home)).toBe(false);
+    // No config to read is "cannot tell", which must not warn.
+    expect(workspaceTrusted('/a/trusted', path.join(home, 'nope'))).toBeUndefined();
+
+    await fs.rm(home, { recursive: true, force: true });
+  });
+
+  it('warns only when the directory is known to be untrusted', () => {
+    expect(trustNotice(true, '/x')).toBeUndefined();
+    expect(trustNotice(undefined, '/x')).toBeUndefined();
+    const said = trustNotice(false, '/x');
+    expect(said).toMatch(/\/x/);
+    expect(said).toMatch(/trust/i);
+    expect(said).toMatch(/wake sweep/i);
   });
 });

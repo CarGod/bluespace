@@ -320,6 +320,42 @@ function byOpenedOldestFirst(a: DecisionFold, b: DecisionFold): number {
 }
 
 // ---------------------------------------------------------------------------
+// Helm's own windows
+// ---------------------------------------------------------------------------
+
+/** A Helm window as the log remembers it: enough to find its transcript. */
+export interface HelmWindowRef {
+  sessionId: string;
+  cwd: string;
+  /** When `blue mcp` registered it — the window's start, near enough. */
+  openedAt: number;
+}
+
+/**
+ * Every Helm window ever registered, MOST RECENT FIRST, one row per session.
+ *
+ * DEDUPLICATED BY SESSION ID, keeping the newest. One window registers once per
+ * `blue mcp` process, and a window whose MCP server is restarted — the harness
+ * does that on `/mcp reconnect`, and on a config reload — registers again under
+ * the same session id. Two rows for one window would double-count its tokens the
+ * moment a caller summed them.
+ *
+ * NOTHING HERE KNOWS WHICH WINDOWS ARE STILL OPEN, and nothing can: this process
+ * did not start them and there is no exit event to pair with the open. That is
+ * why the caller filters on the transcript instead of on this list — a window
+ * the captain closed yesterday still has its row here forever, exactly as an
+ * append-only log requires.
+ */
+export function projectHelmWindows(events: BlueEvent[]): HelmWindowRef[] {
+  const byId = new Map<string, HelmWindowRef>();
+  for (const e of events) {
+    if (e.type !== 'helm.window_opened') continue;
+    byId.set(e.sessionId, { sessionId: e.sessionId, cwd: e.cwd, openedAt: e.at });
+  }
+  return [...byId.values()].sort((a, b) => b.openedAt - a.openedAt);
+}
+
+// ---------------------------------------------------------------------------
 // Consumption — tokens first, dollars derived
 // ---------------------------------------------------------------------------
 

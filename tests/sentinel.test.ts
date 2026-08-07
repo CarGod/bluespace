@@ -21,7 +21,12 @@ import type {
 import { UnsupportedCapabilityError } from '../src/adapters/types.js';
 import type { DispatchProfile, Task } from '../src/types/domain.js';
 import { noTokenUsage, totalTokens, VERDICT_SCHEMA } from '../src/types/domain.js';
-import { MAX_DIFF_CHARS, runSentinel, SENTINEL_MAX_TURNS } from '../src/agents/sentinel/index.js';
+import {
+  MAX_BRIEF_CHARS,
+  MAX_DIFF_CHARS,
+  runSentinel,
+  SENTINEL_MAX_TURNS,
+} from '../src/agents/sentinel/index.js';
 
 // ---------------------------------------------------------------------------
 // Fake adapter
@@ -430,6 +435,69 @@ describe('runSentinel — prompt shaping', () => {
     expect(prompt).toMatch(/TRUNCATED/);
     expect(prompt).toMatch(/treat anything you cannot see as unverified/i);
     expect(prompt.length).toBeLessThan(MAX_DIFF_CHARS + 10_000);
+  });
+
+  it('marks the cut IN BAND, where the evidence actually stops', async () => {
+    // A note after the closing delimiter is a note a reader can reach the end of
+    // the diff without having seen. The marker sits at the exact character the
+    // evidence stops at, so "I have read the whole diff" is not available.
+    const fake = fakeAdapter([exitWith({ pass: true, reasoning: 'ok', unmet: [] })]);
+    await run(fake.adapter, makeTask(), 'x'.repeat(MAX_DIFF_CHARS + 1_000));
+
+    const prompt = fake.spawns[0]?.prompt ?? '';
+    const marker = prompt.indexOf('!!! DIFF TRUNCATED HERE');
+    const endOfDiff = prompt.indexOf('--- END DIFF ---');
+    expect(marker, 'the cut must be marked where it happens').toBeGreaterThan(0);
+    expect(marker, 'the marker belongs inside the diff block').toBeLessThan(endOfDiff);
+  });
+
+  it('never silently drops evidence: the omitted amount is always stated', async () => {
+    const fake = fakeAdapter([exitWith({ pass: true, reasoning: 'ok', unmet: [] })]);
+    const omitted = 40_000;
+    await run(fake.adapter, makeTask(), 'x'.repeat(MAX_DIFF_CHARS + omitted));
+
+    // The number itself, not just the word "truncated". A Sentinel told that
+    // something was cut but not how much cannot weigh what it is missing.
+    expect(fake.spawns[0]?.prompt ?? '').toContain(omitted.toLocaleString('en-US'));
+  });
+
+  it('demands a verdict anyway, because no verdict helps nobody', async () => {
+    // The third option, and the one that is not acceptable: a Sentinel that
+    // refuses to judge because the evidence is incomplete leaves the captain a
+    // dead task and a diff nothing ever looked at.
+    const fake = fakeAdapter([exitWith({ pass: true, reasoning: 'ok', unmet: [] })]);
+    await run(fake.adapter, makeTask(), 'x'.repeat(MAX_DIFF_CHARS + 1_000));
+
+    expect(fake.spawns[0]?.prompt ?? '').toMatch(/Do NOT refuse to answer/i);
+    // And the same instruction in the channel it cannot skip.
+    expect(fake.spawns[0]?.systemPromptAppend ?? '').toMatch(/ALWAYS RETURN A VERDICT/);
+  });
+
+  it('bounds the BRIEF too, and treats cut requirements as unverifiable', async () => {
+    // Cutting requirements is strictly worse than cutting evidence: a verifier
+    // that cannot read a requirement cannot confirm it, and under its own rules
+    // that is a fail rather than a pass.
+    const fake = fakeAdapter([exitWith({ pass: true, reasoning: 'ok', unmet: [] })]);
+    const brief = 'Do the thing.\n'.repeat(MAX_BRIEF_CHARS);
+
+    await run(fake.adapter, makeTask({ brief }), 'diff');
+
+    const prompt = fake.spawns[0]?.prompt ?? '';
+    expect(prompt).toContain('!!! BRIEF TRUNCATED HERE');
+    expect(prompt).toMatch(/some requirements could not be checked/i);
+    expect(prompt).toMatch(/pass: false/);
+    // Bounded by construction: a prompt is a bounded brief plus a bounded diff,
+    // so however large a task gets there is a size this cannot exceed.
+    expect(prompt.length).toBeLessThan(MAX_BRIEF_CHARS + MAX_DIFF_CHARS + 10_000);
+  });
+
+  it('says nothing about truncation when nothing was truncated', async () => {
+    // A standing warning about incomplete evidence would teach the Sentinel to
+    // discount a diff it can see in full.
+    const fake = fakeAdapter([exitWith({ pass: true, reasoning: 'ok', unmet: [] })]);
+    await run(fake.adapter, makeTask(), 'a small diff');
+
+    expect(fake.spawns[0]?.prompt ?? '').not.toMatch(/TRUNCATED/);
   });
 
   it('says plainly when the diff is empty rather than sending a blank block', async () => {

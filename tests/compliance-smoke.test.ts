@@ -70,9 +70,8 @@ describe('flag surface (free)', () => {
     // reader deleting one knows what breaks.
     const required: Array<[flag: string, why: string]> = [
       ['--session-id', 'fixes the transcript path before launch; without it the path is unknowable until after the run'],
-      ['--settings', 'carries the per-run Stop hook inline, so completion never requires touching ~/.claude/settings.json'],
+      ['--settings', 'carries the per-run Stop hook, so completion never requires touching ~/.claude/settings.json'],
       ['--setting-sources', 'scopes which on-disk config a worker inherits; see SpawnRequest.settingScopes'],
-      ['--append-system-prompt', 'attaches CREW_SYSTEM_PROMPT without replacing the harness prompt'],
       ['--permission-mode', 'selects auto; see the permission-mode assertions below'],
       ['--effort', 'per-task reasoning effort from the dispatch profile'],
       ['--model', 'per-project model override'],
@@ -82,6 +81,50 @@ describe('flag surface (free)', () => {
     for (const [flag, why] of required) {
       expect(text, `${flag} is gone — ${why}`).toContain(flag);
     }
+  });
+
+  it('still takes the system prompt as a FILE, which --help does not advertise', async () => {
+    // This one cannot be checked against `--help`, and that is exactly why it
+    // needs its own test. On 2.1.224 the flag is real and undocumented: the help
+    // text mentions it only as `--append-system-prompt[-file]` inside the
+    // description of an unrelated option, so a `toContain` check would pass on
+    // a build that had removed it and fail on one that had not.
+    //
+    // It is load-bearing. A Crew's appended prompt, and a Sentinel's with a whole
+    // JSON Schema in it, are too big for a tmux command line (16,364 bytes) and
+    // now travel as a path. If this flag disappears, every worker fails to launch.
+    //
+    // Probed by invocation, and free: pointing it at a missing file makes the CLI
+    // answer before it does any work at all.
+    const bin = await claudePath();
+    if (bin === undefined) return;
+
+    const missing = join(tmpdir(), `blue-no-such-prompt-${randomUUID()}.md`);
+    const output = await run(bin, ['--append-system-prompt-file', missing, '-p', 'say OK'])
+      .then((r) => `${r.stdout}\n${r.stderr}`)
+      .catch((e: { stdout?: string; stderr?: string; message?: string }) =>
+        `${e.stdout ?? ''}\n${e.stderr ?? ''}\n${e.message ?? ''}`,
+      );
+
+    // It complained about the FILE, which means it parsed the flag. An unknown
+    // option answers `error: unknown option '--append-system-prompt-file'`
+    // instead — verified against a control flag on 2.1.224.
+    expect(output, '--append-system-prompt-file is gone; every worker launch depends on it').toContain(
+      missing,
+    );
+    expect(output).not.toMatch(/unknown option/i);
+  });
+
+  it('still takes settings as a PATH, not only as inline JSON', async () => {
+    const text = await help();
+    if (text === '') return;
+    // The run's hooks used to travel as an inline JSON string. They now travel
+    // as a file, because the inline form spent a command line that has 16,364
+    // bytes for everything. `--settings <file-or-json>` is documented as taking
+    // either; only the file form is bounded.
+    expect(text, '--settings no longer accepts a file path').toMatch(
+      /--settings[\s\S]{0,200}?(file-or-json|settings JSON file)/,
+    );
   });
 
   it('still offers the permission mode BlueSpace relies on, and the one it must avoid', async () => {

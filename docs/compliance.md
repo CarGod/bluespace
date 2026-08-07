@@ -151,11 +151,72 @@ waits for) were **not** re-measured on 2.1.223. Run
 it spends real tokens, which is why it is not the default.
 
 What was verified working: `--session-id` fixes the transcript path before
-launch; `--settings` accepts inline JSON so the completion hook is per-run and
-never touches `~/.claude/settings.json`; the transcript is structured JSONL
-carrying `text`, `thinking`, `tool_use`, tool results, and full `usage`; a
-session survives its own Stop hook, so a follow-up turn is a keystroke rather
-than a new run.
+launch; the transcript is structured JSONL carrying `text`, `thinking`,
+`tool_use`, tool results, and full `usage`; a session survives its own Stop hook,
+so a follow-up turn is a keystroke rather than a new run.
+
+**`--settings` really does load hooks from a path, not only from inline JSON.**
+Measured on 2.1.224: a settings *file* carrying a `SessionStart` hook and a
+`Stop` hook, passed as `--settings <path>`, produced both marker files. That is
+the whole mechanism the adapter waits on — readiness and end-of-turn — so it is
+worth having measured rather than read off the help text, which says only
+"a settings JSON file or a JSON string".
+
+**`--append-system-prompt-file` exists, works, and is not in `--help`.** Measured
+on 2.1.224, two ways, because "the flag parses" and "the file is applied" are
+different claims and only the second is load-bearing:
+
+- Pointed at a missing path it answers `Error: Append system prompt file not
+  found: …`, where an unknown option answers `error: unknown option '…'`
+  (verified against a control flag). So it parses.
+- Given a file whose entire content was *"You must answer every question with
+  exactly the word BLUESPACE-OK and nothing else"*, `-p "What is 2+2?"` answered
+  `BLUESPACE-OK`. So the content is genuinely appended to the system prompt, and
+  the instruction existed nowhere else on the command line.
+
+The help text names it only as `--append-system-prompt[-file]` inside the
+description of `--bare`, so a flag-list check cannot see it — `tests/compliance-
+smoke.test.ts` probes it by invocation instead. It is load-bearing: every worker
+launch passes it, for the reason in the next section.
+
+## The command line is 16 KiB, and that decides the launch protocol
+
+A worker is launched by handing argv to tmux, and **tmux packs an entire command
+into one 16 KiB message**. Measured 2026-08-07 on tmux 3.7b by binary search, and
+measured again with the fixed part of the command padded to 1, 1000, 4000 and
+8000 bytes — the wall does not move, because it is on the whole command rather
+than any one argument:
+
+| total argv bytes | result |
+| --- | --- |
+| 16,364 | delivered |
+| 16,365 | refused |
+
+It is not an arbitrary number: 16,384 less a 16-byte imsg header less the 4-byte
+`argc` of tmux's own message struct. It applies to `new-session`, `new-window`
+and `send-keys` alike; all three were measured and all three land on 16,364. And
+it counts **bytes, not characters** — 5,440 three-byte CJK characters fit and
+5,441 do not, so a Chinese brief reaches the wall at a third of the character
+count an English one does.
+
+**This is not `ARG_MAX`.** The kernel's is 1,048,576 here, and an earlier
+diagnosis that blamed it sent the fix in the wrong direction. The prompt that
+lost a task was 112,680 bytes: a tenth of `ARG_MAX`, and seven times tmux's.
+
+So the launch protocol carries **no unbounded input on the line**. The appended
+system prompt and the run settings always travel as file paths; the opening
+prompt travels as a path once it stops fitting, with a short positional pointing
+at it and the same path repeated in the system prompt, which the CLI loads
+itself. The line is measured before launch and an oversized one is refused by
+BlueSpace naming BlueSpace's own input — `command too long` names nothing, and
+that is the whole reason the check exists rather than being left to tmux.
+
+`send-keys` pays the same ceiling, which is where the rework path used to die, so
+`TmuxBackend.sendText` splits long text across several commands. Verified: 100,000
+bytes of mixed ASCII and CJK sent as nine calls arrive at a raw-mode reader as
+the exact concatenation, in 309ms. (Verified the harness too — a `cat` sink reads
+as total data loss here, because a pane's tty in canonical mode discards a line
+past `MAX_CANON`. A TUI is in raw mode and does not.)
 
 Three things here were believed, then re-measured, and the first draft of this
 document was wrong about all three. They are written out because the cost of
@@ -219,8 +280,21 @@ to a human who is not there.
 
 **Installing a Stop hook into `~/.claude/settings.json`.** Rejected: a hook
 installed globally fires for every Claude Code session on the machine, including
-the captain's own unrelated work. Inline `--settings` JSON scopes it to the run
-that needs it.
+the captain's own unrelated work. A `--settings` file in the run's own directory
+scopes it to the run that needs it. (It was inline JSON until the ceiling above
+was measured; the scoping argument is unchanged, only the transport.)
+
+**Typing a large prompt into the composer instead of pointing at a file.**
+Rejected. The launch positional submits itself, so a prompt delivered by
+keystroke needs a keystroke to submit it too — into a composer whose readiness
+BlueSpace is forbidden to observe, at the moment the TUI has only just signalled
+`SessionStart`. `Session.send()` already collapses newlines because a stray
+submit splits one message into several half-messages; doing that to a brief at
+launch would start a task on its first paragraph. The file is an *instruction*,
+which a worker can ignore where it cannot ignore an argument — so the path is
+named twice, once in the positional and once in the appended system prompt the
+CLI loads by itself, and the positional deliberately contains no summary of the
+task for a non-compliant worker to act on instead.
 
 **Driving the terminal instead of reading the transcript.** Rejected on
 architectural grounds that predate this document; see `src/adapters/types.ts`.
@@ -416,7 +490,7 @@ rejected, and why:
 
 | | |
 | --- | --- |
-| `--permission-mode auto` | Clears the dialog — and also for `WebFetch`, for the captain's own MCP servers, and for every built-in. That is BlueSpace choosing a posture over tools it did not install. It is also a classifier, not a switch: "usually does not prompt — usually", measured above. |
+| `--permission-mode auto` | Clears the dialog — and also for `WebFetch`, for the captain's own MCP servers, and for every built-in. That is BlueSpace choosing a posture over tools it did not install. It is also a classifier, not a switch: "usually does not prompt — usually", measured above. **Superseded, in one direction only:** the captain later asked for exactly that posture, so `auto` is now passed as well (see "Ultracode, and the posture" below). It did not replace `--allowedTools` — a classifier is still not a guarantee, and the thirteen tools this launcher installs are still named outright so the opening turn cannot park on a dialog. |
 | `--permission-mode bypassPermissions` | A modal only a human can dismiss, and dismissing it writes a permanent machine-wide flag. Already rejected for Crews, for the same reason. |
 | `--permission-mode acceptEdits` | Auto-approves edits. This window has no `Edit`. |
 | Asking the captain to approve once | What happens today, at the one moment they cannot answer — before the first turn, on a tool they implicitly asked for by typing `bluespace`. |
@@ -456,3 +530,132 @@ and neither conclusion rests on reading the rule syntax.
 The flag surface stays asserted for free in `tests/compliance-smoke.test.ts`
 (`--allowedTools` exists, and takes `<tools...>`), which is what catches a rename
 without a live session.
+
+## Ultracode, and the posture
+
+Verified against **Claude Code 2.1.224**, macOS, **2026-08-07**. The captain's
+ask was *"能否让我们 bluespace 命令启动的时候，默认就是 effort=ultracode 然后运行模式
+就是超级权限的模式"*. Both halves turned out to be reachable per-invocation, so
+neither is faked and neither is left to a slash command they would have to
+remember.
+
+**Every reading below is off the harness's own chrome, never off the model.** A
+session asked what effort it is running at is the one witness that cannot be
+trusted about it, so each probe was an interactive window in tmux, read by
+capturing the pane.
+
+**`ultracode` is a settings key, not an effort level.** `claude --help` lists
+`--effort <level>` as `(low, medium, high, xhigh, max)` and nothing else. The
+binary's own strings say where it actually comes from: *"Set per session via the
+`ultracode` settings key (--settings or apply_flag_settings)"*, and the in-session
+`/effort ultracode` is the `apply_flag_settings` door onto the same tier.
+`--settings` is the launch door.
+
+| launch | what the window itself showed |
+| --- | --- |
+| `claude --settings '{"ultracode":true}'` | header `✦ ultracode · xhigh effort + dynamic workflows for maximum thoroughness`; footer badge `ultracode`; `/effort` opens with its marker already on `ultracode` |
+| `claude` (control, same directory) | footer badge `◉ xhigh · /effort` — from the captain's own `effortLevel` |
+
+**`--settings` is additive, which is the only reason it may be passed here.** In
+the ultracode window the captain's `~/.claude/settings.json` was still fully in
+force: the model line read `Opus 5 (1M context)` from their `model` key, and the
+debug log showed their twenty permission allow-rules being applied. The flag
+lands in its own `flagSettings` tier and merges; it does not replace.
+
+**Three ways it silently does nothing.** All measured the same way. None of them
+prints a word — the window simply opens without the badge:
+
+| condition | result |
+| --- | --- |
+| `CLAUDE_CODE_DISABLE_WORKFLOWS=1` | no ultracode. Its stated precondition (*"Ultracode needs dynamic workflows enabled"*) fails mutely when set at launch rather than typed at `/effort`. |
+| `CLAUDE_CODE_EFFORT_LEVEL=medium` | no ultracode; the variable takes the session outright. |
+| `--effort high` alongside the setting | footer reads `● high`. The **launch-effort pin** wins. |
+
+The third is ours to simply not do, and the launcher passes no `--effort` at all.
+The first two are the captain's shell, so `ultracodeBlockedBy` detects them and
+`bluespace` prints one hedged line naming the variable and `/effort ultracode`.
+A fourth is not detectable from outside the window — an org effort ceiling, or a
+model that is not xhigh-capable — which is why that line says what to run rather
+than claiming the setting took.
+
+**The posture: `auto`, and the two rejected alternatives were measured, not
+reasoned about.**
+
+| launch | what happened |
+| --- | --- |
+| `--permission-mode auto` | opened straight into the session; footer `⏵⏵ auto mode on (shift+tab to cycle)`; no modal; nothing written to `~/.claude.json` |
+| `--permission-mode bypassPermissions` | opened on a full-screen consent modal, *"WARNING: Claude Code running in Bypass Permissions mode"*, default option `1. No, exit`. Declined, so nothing was written — and `bypassPermissionsModeAccepted` was confirmed absent from `~/.claude.json` before and after, so accepting is what would have created it. The binary is stricter still: *"Cannot set permission mode to bypassPermissions because the session was not launched with --dangerously-skip-permissions"*. |
+
+**The clamp does not widen, and this is the measurement that says so.**
+Permissiveness means the window is not *asked* about the tools it has; it never
+means the window is *allowed more*. A deny rule beats an allow rule and beats a
+permission mode:
+
+```
+claude --permission-mode auto --disallowedTools Bash,Edit,Write \
+  -p 'Attempt to run the shell command: echo CLAMP_OPEN. If the Bash tool is
+      unavailable to you, reply with exactly CLAMP_HELD and nothing else.'
+-> CLAMP_HELD
+```
+
+`HELM_DENIED_TOOLS` is unchanged by any of the above. The only thing that hands
+those tools back is `BLUESPACE_UNCLAMPED=1`.
+
+**End to end, live.** `bluespace` launched with a scratch `BLUESPACE_HOME` opened
+showing `✦ ultracode` and `⏵⏵ auto mode on` together, with `--disallowedTools`
+still in its argv.
+
+## Helm's own window is readable from outside it
+
+Same build and date. The problem: Helm runs in the captain's terminal, under no
+orchestrator, and it has `Agent`. Observed — two sub-agents spending 153.4k and
+128.5k tokens in two minutes with `blue ps` printing nothing and the Starmap
+reading "Nothing needs you · 0 crew working". The captain's question was *"map
+里面为啥看不到当前执行的任务"*.
+
+**An MCP server is handed the launching window's session id.** Measured by
+registering a stub through `--mcp-config` that dumped its own environment:
+
+```
+CLAUDE_CODE_SESSION_ID=4b106d61-67d8-4b4c-9f12-339b4bf49db1
+CLAUDE_PROJECT_DIR=/private/tmp/.../mcpenv
+```
+
+It is written, not inherited: the shell that launched the window carried a
+**different** `CLAUDE_CODE_SESSION_ID`, and the child received the new window's.
+`blue mcp` is therefore the only process in BlueSpace that knows which session
+the captain is talking to Helm in, and it writes one `helm.window_opened` event.
+
+**`--session-id` was the obvious alternative and is a trap.**
+`claude --session-id <uuid> --continue` exits 1 with *"Error: --session-id can
+only be used with --continue or --resume if --fork-session is also specified"*.
+A launcher that always passed it would have broken `bluespace --continue` and
+`bluespace --resume` for a bookkeeping feature.
+
+**Sub-agent transcripts carry a description.** Beside each
+`<session>/subagents/agent-<id>.jsonl` is an `agent-<id>.meta.json`:
+
+```json
+{"agentType":"Explore","description":"Map AULP SDK and template APIs",
+ "toolUseId":"toolu_01F1…","spawnDepth":1}
+```
+
+That description is what makes a row actionable — it is the difference between
+"something spent 153.4k tokens" and "surveying the repos spent 153.4k tokens,
+and that should have been a recon task". It is undocumented and treated as
+best-effort: a sub-agent whose metadata will not parse still gets a row and still
+gets its tokens counted.
+
+**Verified against real transcripts on this machine.** `blue ps`, pointed at a
+Blackbox holding one registered window, printed the window's own 362M tokens and
+its `Explore` sub-agent's 2.5M. The 362M was independently recomputed straight
+from the JSONL, deduplicating by `message.id` exactly as the reader does — 1,650
+usage records collapsing to 777 messages, totalling 362,217,750 tokens, of which
+357.2M are cache reads. The figure is real and it is not a double-count; it is
+what an agentic session's re-read prefix actually costs.
+
+**It is after-the-fact and every surface says so.** Nothing watches that window.
+`blue ps` heads the section *"read from its transcript, as of HH:MM:SS — not
+live"* and the Starmap says the same, because a sub-agent that started a second
+ago has written nothing yet and is genuinely absent — and a view that implied
+otherwise would be the original bug with better numbers on it.

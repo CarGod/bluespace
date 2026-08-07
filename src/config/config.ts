@@ -83,6 +83,41 @@ export const EFFORT_LEVELS: readonly Effort[] = [
 ] as const;
 
 // ---------------------------------------------------------------------------
+// How the Helm window opens
+// ---------------------------------------------------------------------------
+
+/**
+ * What `bluespace` opens at when the captain has pinned nothing.
+ *
+ * THE DEFAULT IS THE ASK, VERBATIM: *"能否让我们 bluespace 命令启动的时候，默认就是
+ * effort=ultracode 然后运行模式就是超级权限的模式"*. It lives here rather than as a
+ * literal in the launcher so that `blue config` can print what an unset key
+ * resolves to, which is the difference between a captain who can see their own
+ * settings and one who has to read our source to find out.
+ *
+ * Both halves are measured — see `ULTRACODE_SETTINGS_KEY` and
+ * `HELM_PERMISSION_MODE_ARGUMENT` in `src/cli/bluespace.ts`. Neither widens the
+ * window's tool clamp, and `permissionMode` here is deliberately NOT
+ * `bypassPermissions`: that one opens on a modal only a human can dismiss and
+ * writes a machine-wide flag into the captain's global config when they do.
+ */
+export const DEFAULT_HELM_POSTURE: { ultracode: boolean; permissionMode: PermissionMode } = {
+  ultracode: true,
+  permissionMode: 'auto',
+};
+
+/** How this window will actually open: the captain's pins over the defaults. */
+export function resolveHelmPosture(cfg: {
+  helmUltracode?: boolean;
+  helmPermissionMode?: PermissionMode;
+}): { ultracode: boolean; permissionMode: PermissionMode } {
+  return {
+    ultracode: cfg.helmUltracode ?? DEFAULT_HELM_POSTURE.ultracode,
+    permissionMode: cfg.helmPermissionMode ?? DEFAULT_HELM_POSTURE.permissionMode,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // The captain's language
 // ---------------------------------------------------------------------------
 
@@ -298,6 +333,42 @@ export interface BlueConfig {
   maxConcurrentCrew: number;
   /** How many times a failed verdict may send a task back to its Crew. */
   maxRework: number;
+  /**
+   * The captain's pin for whether the Helm window opens at ultracode — xhigh
+   * effort plus standing dynamic-workflow orchestration.
+   *
+   * OPTIONAL, AND UNSET IS NOT FALSE. Unset means they never said, which
+   * resolves to {@link DEFAULT_HELM_POSTURE} — on, because that is what they
+   * asked for. `false` means they turned it off and it stays off. The same
+   * shape as `language` above and for the same reason: a default the captain
+   * has not overruled must not be indistinguishable from a choice they made.
+   *
+   * SEPARATE FROM `effort` ABOVE, AND IT HAS TO BE. `effort` is what a Crew is
+   * dispatched with, through `--effort`, whose accepted values are exactly
+   * `low, medium, high, xhigh, max`. `ultracode` is not one of them: it is a
+   * settings key, it is session-scoped, and it reaches the window through
+   * `--settings` rather than a flag. Folding it into `effort` would mean an
+   * enum with a member the flag it feeds cannot spell — and, worse, would make
+   * the window pass `--effort`, which silently defeats ultracode outright. See
+   * `ULTRACODE_SETTINGS_KEY` in the launcher.
+   *
+   * Boolean rather than a level because that is the shape of the thing: the
+   * harness has one ultracode, and a captain who wants the window at plain
+   * xhigh already has `/effort xhigh` inside it.
+   */
+  helmUltracode?: boolean;
+  /**
+   * The captain's pin for the Helm window's permission posture. Unset resolves
+   * to {@link DEFAULT_HELM_POSTURE}.
+   *
+   * They asked for "超级权限的模式", and `auto` is the honest maximum: with
+   * `HELM_DENIED_TOOLS` in force the window has no Bash, Edit, Write or
+   * NotebookEdit at all, so what is left to be asked about is reading, the web,
+   * and MCP calls. `auto` stops the asking. It does NOT hand anything back —
+   * read `HELM_PERMISSION_MODE_ARGUMENT` in the launcher before changing this
+   * to `bypassPermissions`, which was measured and rejected.
+   */
+  helmPermissionMode?: PermissionMode;
   /**
    * The language Helm writes to the captain in — the captain's explicit pin,
    * and it always wins.
@@ -536,6 +607,43 @@ export function mergeConfig(base: BlueConfig, patch: Record<string, unknown>): B
     }
   }
 
+  if ('helmUltracode' in patch) {
+    if (patch.helmUltracode === null) {
+      out.helmUltracode = undefined;
+    } else if (typeof patch.helmUltracode === 'boolean') {
+      out.helmUltracode = patch.helmUltracode;
+    } else if (patch.helmUltracode !== undefined) {
+      warn(
+        `ignoring invalid helmUltracode ${JSON.stringify(patch.helmUltracode)} — expected true or false`,
+      );
+    }
+  }
+
+  if ('helmPermissionMode' in patch && patch.helmPermissionMode === null) {
+    out.helmPermissionMode = undefined;
+  } else if (patch.helmPermissionMode !== undefined) {
+    // Retired names are migrated here too: the Helm posture is drawn from the
+    // same vocabulary as the Crew one, so a config that predates the rename
+    // must not lose this key while keeping the other.
+    const retired =
+      typeof patch.helmPermissionMode === 'string'
+        ? RETIRED_PERMISSION_MODES[patch.helmPermissionMode]
+        : undefined;
+    if (retired !== undefined) {
+      warn(
+        `helmPermissionMode ${JSON.stringify(patch.helmPermissionMode)} is ${retired.why}; using ${JSON.stringify(retired.to)}`,
+      );
+      out.helmPermissionMode = retired.to;
+    } else {
+      const got = pickEnum<PermissionMode>(
+        patch.helmPermissionMode,
+        PERMISSION_MODES,
+        'helmPermissionMode',
+      );
+      if (got.ok) out.helmPermissionMode = got.value;
+    }
+  }
+
   if ('model' in patch) {
     if (patch.model === null) {
       out.model = undefined;
@@ -645,6 +753,14 @@ export function saveConfig(patch: ConfigPatch): BlueConfig {
 function serialize(cfg: BlueConfig): Record<string, unknown> {
   return {
     permissionMode: cfg.permissionMode,
+    // Omitted when unset, like `model` and `language`: an absent key is "you
+    // never said", and writing today's default into the file would freeze it
+    // there — a captain who never touched this would silently stop tracking the
+    // default the day it changed.
+    ...(cfg.helmUltracode !== undefined ? { helmUltracode: cfg.helmUltracode } : {}),
+    ...(cfg.helmPermissionMode !== undefined
+      ? { helmPermissionMode: cfg.helmPermissionMode }
+      : {}),
     ...(cfg.model !== undefined ? { model: cfg.model } : {}),
     ...(cfg.effort !== undefined ? { effort: cfg.effort } : {}),
     ...(cfg.language !== undefined ? { language: cfg.language } : {}),

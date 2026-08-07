@@ -215,6 +215,44 @@ export interface CrewExited {
 }
 
 // ---------------------------------------------------------------------------
+// Helm's own window
+// ---------------------------------------------------------------------------
+
+/**
+ * A Helm window opened, and here is where to find what it does.
+ *
+ * THE ONE SPENDER THAT USED TO BE OUTSIDE THE LOG. Every other consumer here is
+ * a process BlueSpace starts and watches. Helm is not: it runs in the captain's
+ * own terminal, and it has `Agent`, so it can fan out. Observed — a template
+ * upgrade in which Helm spawned two sub-agents that burned 153.4k and 128.5k
+ * tokens in two minutes while `blue ps` showed nothing and the Starmap said
+ * "Nothing needs you · 0 crew working". The captain's question was exactly that:
+ * *"map 里面为啥看不到当前执行的任务"*.
+ *
+ * This event does not carry the spend, and cannot: nothing in this process is
+ * watching that window. It carries the ONE FACT that makes the spend findable
+ * afterwards — the harness's session id, which is the name of the transcript on
+ * disk and of the `subagents/` directory beside it. `src/helm/window.ts` reads
+ * those; `blue ps` folds this event to know which ones to read.
+ *
+ * Written by `blue mcp`, from `CLAUDE_CODE_SESSION_ID` in its own environment.
+ * That is the only vantage point that knows: the MCP server is spawned BY the
+ * window, so it is handed the window's session id whatever flags the window was
+ * launched with — including `--continue` and `--resume`, which `--session-id`
+ * cannot be combined with at all ("Error: --session-id can only be used with
+ * --continue or --resume if --fork-session is also specified", measured on
+ * 2.1.224). Making the launcher mint the id instead would have broken
+ * `bluespace --continue` outright.
+ */
+export interface HelmWindowOpened {
+  type: 'helm.window_opened';
+  /** The harness's own session id — a UUID, and the transcript's filename. */
+  sessionId: string;
+  /** Where the captain ran `bluespace`. Shown so two windows are tellable apart. */
+  cwd: string;
+}
+
+// ---------------------------------------------------------------------------
 // Decisions
 // ---------------------------------------------------------------------------
 
@@ -295,6 +333,7 @@ export type BlueEventBody =
   | CrewToolResult
   | CrewUsage
   | CrewExited
+  | HelmWindowOpened
   | DecisionOpened
   | DecisionResolved
   | SentinelStarted

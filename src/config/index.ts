@@ -9,6 +9,7 @@
 export type { BlueConfig, CaptainVoice, ConfigPatch } from './config.js';
 export {
   DEFAULT_ADDRESS,
+  DEFAULT_HELM_POSTURE,
   DEFAULT_MAX_TOKENS_PER_TASK,
   EFFORT_LEVELS,
   LOCALE_ENV_VARS,
@@ -25,6 +26,7 @@ export {
   localeVarInEffect,
   normalizeLanguage,
   resolveCaptainVoice,
+  resolveHelmPosture,
   saveConfig,
 } from './config.js';
 

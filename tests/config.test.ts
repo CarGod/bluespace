@@ -26,6 +26,7 @@ import {
   localeVarInEffect,
   normalizeLanguage,
   resolveCaptainVoice,
+  resolveHelmPosture,
   saveConfig,
   slugify,
 } from '../src/config/index.js';
@@ -434,6 +435,59 @@ describe('invalid values are dropped, not fatal', () => {
     const cfg = saveConfig({ permissionMode: 'dontAsk' });
     expect(cfg.permissionMode).toBe('dontAsk');
     expect(cfg.maxConcurrentCrew).toBe(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// How the Helm window opens
+// ---------------------------------------------------------------------------
+
+describe('the Helm posture', () => {
+  it('defaults to the captain’s ask: ultracode, and a posture that does not ask', () => {
+    expect(resolveHelmPosture(defaultConfig())).toEqual({
+      ultracode: true,
+      permissionMode: 'auto',
+    });
+  });
+
+  it('distinguishes “never said” from “turned it off”', () => {
+    // The distinction is the whole reason these are optional. An unset key
+    // tracks the default if it ever changes; `false` is a decision that stays
+    // made. A required key with a default value cannot express the difference.
+    expect(resolveHelmPosture({}).ultracode).toBe(true);
+    expect(resolveHelmPosture({ helmUltracode: false }).ultracode).toBe(false);
+  });
+
+  it('is settable and clearable, and unset keys are not written to disk', () => {
+    saveConfig({ helmUltracode: false, helmPermissionMode: 'manual' });
+    expect(loadConfig().helmUltracode).toBe(false);
+    expect(loadConfig().helmPermissionMode).toBe('manual');
+
+    saveConfig({ helmUltracode: null, helmPermissionMode: null });
+    const cleared = loadConfig();
+    expect(cleared.helmUltracode).toBeUndefined();
+    expect(cleared.helmPermissionMode).toBeUndefined();
+    // Cleared means ABSENT, not `false` — writing today's default into the file
+    // would freeze a captain who never touched it onto the old value.
+    const onDisk = JSON.parse(fs.readFileSync(configPath(), 'utf8')) as Record<string, unknown>;
+    expect('helmUltracode' in onDisk).toBe(false);
+    expect('helmPermissionMode' in onDisk).toBe(false);
+  });
+
+  it('drops a nonsense value instead of reading it as “off”', () => {
+    // A typo that silently turned ultracode off would be indistinguishable from
+    // it never working, which is the failure this whole feature is about.
+    writeConfig('{"helmUltracode":"yes","helmPermissionMode":"superuser"}');
+    const cfg = loadConfig();
+    expect(cfg.helmUltracode).toBeUndefined();
+    expect(cfg.helmPermissionMode).toBeUndefined();
+    expect(resolveHelmPosture(cfg)).toEqual({ ultracode: true, permissionMode: 'auto' });
+    expect(warnSpy).toHaveBeenCalled();
+  });
+
+  it('migrates a retired permission mode here too, rather than dropping the key', () => {
+    writeConfig('{"helmPermissionMode":"default"}');
+    expect(loadConfig().helmPermissionMode).toBe('manual');
   });
 });
 
