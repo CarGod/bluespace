@@ -10,6 +10,13 @@ The rules that constrain you are in `CLAUDE.md`. This is the craft.
 Tool names below are the `mcp__bluespace__*` set; each tool's own description says when to
 reach for it, so what follows is judgement, not a call sequence to replay.
 
+**You have no shell.** Every `blue …`, `git …` and `gh …` command on this page is one the
+captain runs in their own terminal — quote them, never attempt them. What you have for
+looking at anything on disk is `Read`, `Glob` and `Grep`, and what you use them for is
+bounded by the rule in `CLAUDE.md`: reading to decide which project, how many tasks, and
+what a brief must say is intake; reading until you have the captain's answer is a task you
+should have created.
+
 ---
 
 ## The wake sweep
@@ -149,14 +156,28 @@ that is this window. Never send the captain to a terminal to answer something.
 
 A task in `ready` or `landed` has a branch in its worktree, and nothing has been pushed.
 Whether it has been *merged* is a separate field: `get_task` returns `mergedInto` once the
-captain landed it, and nothing else does. `get_task` also gives you `worktree`;
-`list_projects` gives the project's `defaultBranch`. Inspect it read-only:
+captain landed it, and nothing else does.
 
-```
-git -C <worktree> log --oneline <defaultBranch>..HEAD
-git -C <worktree> diff --stat <defaultBranch>...HEAD
-git -C <worktree> diff <defaultBranch>...HEAD
-```
+**You have no shell, so you do not read the diff — the Sentinel already did.** That is the
+division of labour, not a gap in it: an independent context read the brief and the diff and
+returned a verdict, and `get_task` hands you the two things that verdict left behind.
+
+- `outcome` — for a passed mission, **the Sentinel's own reasoning, verbatim**. This is the
+  finding. Report it in your own words, against the brief, in a sentence or two.
+- `artifact` — the branch name the work sits on. `worktree` is the directory it sits in.
+
+When the captain asks something the verdict does not answer — "did it touch the retry
+path?", "what did it call the new column?" — open the files with `Read`, `Glob` and `Grep`
+under the `worktree` path. That shows you the code **as it now stands**, not what changed,
+and the difference is worth being honest about: say "the handler now does X", never "the
+diff adds X", unless the Sentinel's reasoning is where you got it. If the real question is
+what changed line by line, the captain reads it themselves — `git -C <worktree> diff` in
+their own terminal — or it is a recon task.
+
+Reading three or four files to answer a specific question is judgement. Reading your way
+through the repository to form your own verdict is re-running the Sentinel by hand, in a
+context that has already read the brief and is therefore the wrong one to do it — that is
+the failure mode, and it is the same one described in `CLAUDE.md`.
 
 A recon's deliverable is a report the Crew wrote as `REPORT.md` in its worktree. When the
 task lands, the orchestrator copies it to `<dataDir>/reports/<taskId>.md` — usually
@@ -277,7 +298,8 @@ tidy up after a run.
 `blue gc --dry-run` shows the list without touching anything. `--force` takes the kept ones
 regardless, after listing what it costs and asking — mention it only if they ask for it,
 and say what it destroys: the checkout and anything uncommitted in it. Commits themselves
-survive on their branch.
+survive on their branch. All three are theirs to type; you are quoting a command, not
+offering to run one.
 
 A recon's worktree never becomes collectable on its own — its report is either uncommitted
 or sitting on a branch nobody merges, so the safe sweep always keeps it. What changed is

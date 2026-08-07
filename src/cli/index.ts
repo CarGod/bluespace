@@ -246,6 +246,12 @@ function usage(): string {
   L.push(bold('ENVIRONMENT'));
   L.push(`  ${dim('BLUESPACE_STRICT_MCP=1')}  ${dim('(bluespace) load only BlueSpace’s MCP server, drop your own')}`);
   L.push(`  ${dim('BLUESPACE_NO_WAKE=1')}     ${dim('(bluespace) open silently instead of on a wake sweep')}`);
+  // Spelled out rather than summarised as "unrestricted": a captain reading this
+  // line is deciding whether to turn off the thing that makes work trackable,
+  // and "gives Helm more tools" is not what they would be agreeing to.
+  L.push(`  ${dim('BLUESPACE_UNCLAMPED=1')}   ${dim('(bluespace) give Helm back Bash/Edit/subagents — it can then')}`);
+  L.push(`  ${' '.repeat(24)}${dim('do the work itself, with no worktree, no Sentinel, no token')}`);
+  L.push(`  ${' '.repeat(24)}${dim('ceiling, nothing in `blue ps` and no record in the Blackbox')}`);
   L.push(`  ${dim('CLAUDE_CLI_PATH')}         ${dim('point at a `claude` that is not on PATH')}`);
   L.push('');
   L.push(bold('CONFIG KEYS'));

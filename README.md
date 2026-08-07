@@ -116,14 +116,26 @@ blue inbox               # read the queue from anywhere; answer in the window fr
 
 ### `bluespace` vs `claude`
 
-`bluespace` is a launcher, not a fork: it runs **your** `claude` with two things added
-for that one invocation — the BlueSpace MCP server (`--mcp-config`, inline) and Helm's
-operating contract from `CLAUDE.md` (`--append-system-prompt`). Nothing is written to
+`bluespace` is a launcher, not a fork: it runs **your** `claude` with three things added
+for that one invocation — the BlueSpace MCP server (`--mcp-config`, inline), Helm's
+operating contract from `CLAUDE.md` (`--append-system-prompt`), and a deny list that keeps
+Helm on the dispatching side of the line (`--disallowedTools`). Nothing is written to
 `~/.claude.json`, nothing is registered, and deleting the binary removes every trace.
 Plain `claude` stays plain: no BlueSpace tools, no BlueSpace rules, in any directory.
 
 It passes your arguments straight through and returns the session's exit code, so
 `bluespace --model opus`, `bluespace --continue`, and `bluespace "开始吧"` all work.
+
+**A Helm window has no Bash, no Edit and no subagents.** It has Read, Glob, Grep, the web
+tools and every MCP tool you or BlueSpace gave it — enough to read your repository, work
+out which project a request belongs to, and write a brief a stranger could execute. It does
+not have the tools to do the work, and that is the point rather than a limitation: the
+failure this prevents is Helm quietly answering "check whether this bug is real and fix it"
+by grepping through your code itself. That investigation looks like it worked. It has no
+worktree, no Sentinel, no token ceiling, nothing in `blue ps`, no record in the Blackbox,
+and it is gone when the window closes — which is every property you opened a fleet to get.
+Prose in `CLAUDE.md` could not stop it, because reading a repository with `grep` really is
+read-only. `BLUESPACE_UNCLAMPED=1` hands the tools back if you want them.
 
 A bare `bluespace` opens on Helm's **wake sweep** — what needs you, what came back,
 what is still running — instead of an empty prompt. BlueSpace cannot paint Claude Code's
@@ -179,12 +191,22 @@ Stated plainly, because these are the claims people assume:
   branch sitting in a worktree. On a mission it means the Sentinel read the diff and
   passed it; a recon has no diff to grade, so it lands on its report with nothing
   checking it. Merging it is a separate act, and yours to ask for.
-- **Helm never writes your code, but nothing sandboxes it.** Helm is a persona in your
-  own Claude Code window, holding whatever tools that window has. `CLAUDE.md` tells it
-  to stay read-only over your projects and to route every change through a Crew — that
-  is an instruction to a model, not a boundary the code enforces. The isolation that
-  *is* enforced is the Crew's: its own worktree, on a throwaway branch, proven distinct
-  from your checkout by four separate checks before it is handed over (`src/worktree/`).
+- **Helm never writes your code, and no longer merely promises not to.** The `bluespace`
+  launcher denies the window `Bash`, `Edit`, `Write`, `NotebookEdit` and the native
+  subagent tools, so the levers are absent rather than discouraged. `CLAUDE.md` still
+  states the rule — a model surprised by a missing tool argues with you about it — but the
+  rule is not what holds.
+
+  Be clear about what that is and is not. It is a flag on your own `claude`, not a
+  sandbox: it removes tools, and `BLUESPACE_UNCLAMPED=1` puts them back. What it cannot
+  constrain is judgement — Helm can still read your repository, because routing a request
+  and writing a brief require it, and no flag can tell reading-to-decide apart from
+  reading-as-the-answer. That line is drawn in `CLAUDE.md`, and it is drawn there because
+  it genuinely cannot be drawn anywhere else.
+
+  The isolation that is *fully* enforced is the Crew's: its own worktree, on a throwaway
+  branch, proven distinct from your checkout by four separate checks before it is handed
+  over (`src/worktree/`).
 - **Nothing reclaims a worktree on its own.** A finished task keeps its worktree,
   because the branch in it is the deliverable and deleting it would throw the work away
   at the moment it succeeded. Only cancelling a task removes one automatically. Nothing
@@ -254,6 +276,9 @@ blue config set <k> <v>       change one setting (validated)
 
 BLUESPACE_STRICT_MCP=1        (bluespace) load only BlueSpace's MCP server, drop your own
 BLUESPACE_NO_WAKE=1           (bluespace) open silently instead of on a wake sweep
+BLUESPACE_UNCLAMPED=1         (bluespace) give Helm back Bash/Edit/subagents — it can then
+                              do the work itself, with no worktree, no Sentinel, no token
+                              ceiling, nothing in `blue ps` and no record in the Blackbox
 CLAUDE_CLI_PATH               point at a `claude` that is not on PATH
 ```
 

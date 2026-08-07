@@ -24,13 +24,16 @@ import * as path from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 
 import {
+  HELM_DENIED_TOOLS,
   MissingPersonaError,
   WAKE_PROMPT,
   buildHelmArgv,
+  deniedTools,
   helmMcpConfig,
   helmSystemPrompt,
   runLauncher,
   strictMcpRequested,
+  unclampedRequested,
 } from '../src/cli/bluespace.js';
 
 // ---------------------------------------------------------------------------
@@ -113,10 +116,14 @@ const BASE = {
   mcpConfigJson: '{"mcpServers":{}}',
   root: '/opt/bluespace',
   systemPromptAppend: '# Helm\nrules',
+  deniedTools: ['Bash', 'Edit'],
 };
 
+/** Every flag the launcher injects that swallows following non-flag tokens. */
+const VARIADIC_FLAGS = ['--mcp-config', '--add-dir', '--disallowedTools'] as const;
+
 describe('buildHelmArgv', () => {
-  it('injects the tools, the contract, and the install root — and nothing else', () => {
+  it('injects the tools, the contract, the install root and the clamp — and nothing else', () => {
     const argv = buildHelmArgv({ ...BASE, captainArgs: [], strictMcp: false });
 
     expect(argv).toEqual([
@@ -125,6 +132,8 @@ describe('buildHelmArgv', () => {
       '{"mcpServers":{}}',
       '--add-dir',
       '/opt/bluespace',
+      '--disallowedTools',
+      'Bash,Edit',
       '--append-system-prompt',
       '# Helm\nrules',
     ]);
@@ -140,8 +149,64 @@ describe('buildHelmArgv', () => {
       const last = argv[argv.length - 2];
       expect(last, 'the last injected flag must take exactly one value').toBe('--append-system-prompt');
       // And the variadic ones are never at the end.
-      expect(argv.indexOf('--mcp-config')).toBeLessThan(argv.indexOf('--append-system-prompt'));
-      expect(argv.indexOf('--add-dir')).toBeLessThan(argv.indexOf('--append-system-prompt'));
+      for (const flag of VARIADIC_FLAGS) {
+        expect(argv.indexOf(flag)).toBeLessThan(argv.indexOf('--append-system-prompt'));
+      }
+    }
+  });
+
+  it('never lets a variadic flag sit where the next token would be swallowed', () => {
+    // THE FREEZE. The rule is not "--append-system-prompt is last" — that is one
+    // way to satisfy it. The rule is that nothing the captain typed, and nothing
+    // BlueSpace appends, may land directly behind a flag that takes `<x...>`.
+    //
+    // It is frozen structurally rather than by comparing to a golden argv so it
+    // keeps holding when a flag is added: whatever follows a variadic must be
+    // another flag, and a flag is what terminates the variadic above it.
+    //
+    // Why this matters more than it looks: under `-p` a swallowed prompt is a
+    // loud error, but the Helm window is interactive, and there it fails
+    // SILENTLY — the composer opens empty, no turn runs, nothing is written to
+    // the transcript. That is not a bug anyone finds by reading the diff.
+    const cases: Array<{ name: string; input: Parameters<typeof buildHelmArgv>[0] }> = [
+      { name: 'bare window', input: { ...BASE, captainArgs: [], strictMcp: false } },
+      { name: 'strict mcp', input: { ...BASE, captainArgs: [], strictMcp: true } },
+      { name: 'unclamped', input: { ...BASE, deniedTools: [], captainArgs: [], strictMcp: false } },
+      {
+        name: 'full deny list',
+        input: { ...BASE, deniedTools: HELM_DENIED_TOOLS, captainArgs: [], strictMcp: true },
+      },
+      {
+        name: 'wake sweep',
+        input: { ...BASE, captainArgs: [], strictMcp: false, openingPrompt: WAKE_PROMPT },
+      },
+      {
+        name: 'captain’s own argv',
+        input: { ...BASE, captainArgs: ['--continue', 'ship it'], strictMcp: false },
+      },
+    ];
+
+    for (const { name, input } of cases) {
+      const argv = buildHelmArgv(input);
+      const injectedEnd = argv.indexOf('--append-system-prompt') + 2;
+
+      for (const flag of VARIADIC_FLAGS) {
+        const at = argv.indexOf(flag);
+        if (at < 0) continue;
+        // Exactly one value, then a flag. Anything else and the token after the
+        // value is read as a second directory / config / tool name.
+        const after = argv[at + 2];
+        expect(after, `${name}: nothing follows ${flag}’s value`).toBeDefined();
+        expect(after?.startsWith('-'), `${name}: ${flag} is followed by \`${after}\`, which it would eat`).toBe(
+          true,
+        );
+      }
+
+      // And everything BlueSpace did not inject sits past the last injected flag.
+      const tail = argv.slice(injectedEnd);
+      for (const flag of VARIADIC_FLAGS) {
+        expect(tail, `${name}: ${flag} escaped into the captain’s half of the argv`).not.toContain(flag);
+      }
     }
   });
 
@@ -164,6 +229,23 @@ describe('buildHelmArgv', () => {
     expect(strict.indexOf('--strict-mcp-config')).toBe(strict.indexOf('--mcp-config') + 2);
   });
 
+  it('passes the deny list as ONE comma-joined token', () => {
+    const argv = buildHelmArgv({ ...BASE, deniedTools: HELM_DENIED_TOOLS, captainArgs: [], strictMcp: false });
+    // `--disallowedTools` takes comma or space separated names (measured on
+    // 2.1.223, both forms). One token is chosen so the whole clamp is a single
+    // argv element — which is what lets the ordering test above reason about it.
+    expect(valueOf(argv, '--disallowedTools')).toBe(HELM_DENIED_TOOLS.join(','));
+    expect(argv.filter((a) => a === '--disallowedTools')).toHaveLength(1);
+  });
+
+  it('omits the flag entirely when unclamped, rather than passing an empty value', () => {
+    // `--disallowedTools ""` would leave a variadic with nothing of its own to
+    // read, and the next token — the captain's prompt — is what it would take.
+    const argv = buildHelmArgv({ ...BASE, deniedTools: [], captainArgs: [], strictMcp: false });
+    expect(argv).not.toContain('--disallowedTools');
+    expect(argv).not.toContain('');
+  });
+
   it('puts the opening prompt last, where a positional is read as a prompt', () => {
     const argv = buildHelmArgv({ ...BASE, captainArgs: [], strictMcp: false, openingPrompt: WAKE_PROMPT });
     expect(argv[argv.length - 1]).toBe(WAKE_PROMPT);
@@ -176,6 +258,60 @@ describe('buildHelmArgv', () => {
     expect(() =>
       buildHelmArgv({ ...BASE, captainArgs: ['--add-dir', '/x'], strictMcp: false, openingPrompt: 'hi' }),
     ).toThrow(/refusing/i);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The clamp
+// ---------------------------------------------------------------------------
+
+describe('HELM_DENIED_TOOLS', () => {
+  it('denies every way to do the captain’s work in this window', () => {
+    // The observed failure: Helm answered "check whether this bug is real and
+    // fix it" by running ls/grep/sed over the captain's repository. No task row,
+    // no worktree, no Sentinel, no ceiling, nothing in `blue ps`.
+    for (const tool of ['Bash', 'Edit', 'Write', 'NotebookEdit']) {
+      expect(HELM_DENIED_TOOLS, `${tool} would let Helm do a Crew's job itself`).toContain(tool);
+    }
+  });
+
+  it('denies every way to create a worker outside the fleet', () => {
+    // `CLAUDE.md` has always said this. Until now it was a request: the model
+    // could reach the tool, and nothing but its own compliance stopped it.
+    // `Agent` is 2.1.223's name for the subagent launcher; `Task` is the older
+    // one and is still accepted, so both are denied (docs/compliance.md).
+    for (const tool of ['Agent', 'Task', 'Workflow', 'Monitor', 'RemoteTrigger', 'EnterWorktree']) {
+      expect(HELM_DENIED_TOOLS, `${tool} creates work the Blackbox never sees`).toContain(tool);
+    }
+  });
+
+  it('keeps everything intake and judgement need', () => {
+    // The reason this is `--disallowedTools` and not `--tools`: measured on
+    // 2.1.223, `--tools Read,Glob,Grep` also strips every mcp__* tool, which
+    // takes away Helm's own levers. A deny list cannot do that by construction —
+    // but it CAN be extended carelessly, which is what this freezes.
+    for (const tool of ['Read', 'Glob', 'Grep', 'WebFetch', 'WebSearch', 'Skill']) {
+      expect(HELM_DENIED_TOOLS, `${tool} is how Helm routes a request and writes a brief`).not.toContain(
+        tool,
+      );
+    }
+    // Nothing namespaced may ever appear here. Helm without `mcp__bluespace__*`
+    // is not a safer Helm, it is a model talking about a fleet it cannot see.
+    expect(HELM_DENIED_TOOLS.filter((t) => t.startsWith('mcp__'))).toEqual([]);
+  });
+});
+
+describe('deniedTools', () => {
+  it('clamps by default, and only the captain can undo it', () => {
+    expect(deniedTools({})).toEqual(HELM_DENIED_TOOLS);
+    expect(unclampedRequested({})).toBe(false);
+    expect(unclampedRequested({ BLUESPACE_UNCLAMPED: '0' })).toBe(false);
+    expect(unclampedRequested({ BLUESPACE_UNCLAMPED: '' })).toBe(false);
+
+    for (const on of ['1', 'true', 'yes']) {
+      expect(unclampedRequested({ BLUESPACE_UNCLAMPED: on })).toBe(true);
+      expect(deniedTools({ BLUESPACE_UNCLAMPED: on })).toEqual([]);
+    }
   });
 });
 
@@ -232,6 +368,29 @@ describe('helmSystemPrompt', () => {
     const blank = await harness({ persona: '   \n' });
     expect(() => helmSystemPrompt(blank.root)).toThrow(MissingPersonaError);
   });
+
+  it('tells the window which tools it was actually denied, by name', async () => {
+    const h = await harness({ persona: '# Helm' });
+    const prompt = helmSystemPrompt(h.root, HELM_DENIED_TOOLS);
+
+    for (const tool of HELM_DENIED_TOOLS) expect(prompt).toContain(tool);
+    expect(prompt).toMatch(/enforced in this window, not requested/i);
+    // A model that finds Bash missing with no explanation reports a broken tool
+    // to the captain and asks them to fix it.
+    expect(prompt).toMatch(/never report one as broken/i);
+  });
+
+  it('does not claim a clamp the unclamped window does not have', async () => {
+    const h = await harness({ persona: '# Helm' });
+    const prompt = helmSystemPrompt(h.root, []);
+
+    // Saying "you have no Bash" to a window that has one teaches the model that
+    // its system prompt is unreliable — a worse outcome than the missing rule.
+    expect(prompt).not.toMatch(/enforced in this window/i);
+    expect(prompt).toContain('BLUESPACE_UNCLAMPED=1');
+    // The rule survives the enforcement being off; only who holds it changes.
+    expect(prompt).toMatch(/no worktree, no\s+Sentinel/);
+  });
 });
 
 describe('strictMcpRequested', () => {
@@ -261,10 +420,36 @@ describe('runLauncher', () => {
     expect(JSON.parse(valueOf(argv, '--mcp-config'))).toHaveProperty('mcpServers.bluespace');
     expect(valueOf(argv, '--append-system-prompt')).toContain('rules go here');
     expect(valueOf(argv, '--add-dir')).toBe(h.root);
+    // Three halves now: the tools, the contract, and the boundary that stops the
+    // contract from being a suggestion.
+    expect(valueOf(argv, '--disallowedTools')).toBe(HELM_DENIED_TOOLS.join(','));
     // The greeting is a turn, not chrome: BlueSpace cannot write into Claude
     // Code's welcome box, so a bare `bluespace` asks Helm for the wake sweep.
     expect(argv[argv.length - 1]).toBe(WAKE_PROMPT);
     expect(argv).not.toContain('--strict-mcp-config');
+  });
+
+  it('clamps the window by default, and says so in the same breath it clamps it', async () => {
+    const h = await harness({ persona: '# Helm' });
+    await runLauncher([], { root: h.root, entry: h.entry, env: h.env, stdio: 'ignore' });
+
+    const argv = await h.argv();
+    const denied = valueOf(argv, '--disallowedTools').split(',');
+    expect(denied).toContain('Bash');
+    expect(denied).toContain('Agent');
+    // The argv and the system prompt must agree: they are read by the same
+    // model, and a disagreement between them is the model's to resolve.
+    const prompt = valueOf(argv, '--append-system-prompt');
+    for (const tool of denied) expect(prompt).toContain(tool);
+  });
+
+  it('hands the tools back on BLUESPACE_UNCLAMPED, and stops claiming otherwise', async () => {
+    const h = await harness({ persona: '# Helm', env: { BLUESPACE_UNCLAMPED: '1' } });
+    await runLauncher([], { root: h.root, entry: h.entry, env: h.env, stdio: 'ignore' });
+
+    const argv = await h.argv();
+    expect(argv).not.toContain('--disallowedTools');
+    expect(valueOf(argv, '--append-system-prompt')).toContain('BLUESPACE_UNCLAMPED=1');
   });
 
   it('reproduces the window’s exit code instead of flattening it', async () => {

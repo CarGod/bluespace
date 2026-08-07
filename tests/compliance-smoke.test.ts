@@ -125,6 +125,10 @@ describe('flag surface (free)', () => {
       ['--strict-mcp-config', 'BLUESPACE_STRICT_MCP=1 isolates the window from the captain’s own servers'],
       ['--append-system-prompt', 'carries CLAUDE.md, without which the tools are not Helm'],
       ['--add-dir', 'lets the window read skills/bluespace/SKILL.md from the install root'],
+      // Losing this one is quieter than losing the others and worse than most:
+      // the window still opens, still calls itself Helm, and can now do the
+      // captain's work itself with nothing behind it. See src/cli/bluespace.ts.
+      ['--disallowedTools', 'keeps Helm on the dispatching side of the line'],
     ];
     for (const [flag, why] of required) {
       expect(text, `${flag} is gone — ${why}`).toContain(flag);

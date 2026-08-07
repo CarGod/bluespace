@@ -29,9 +29,31 @@
  *                                 wherever the captain happens to be standing.
  *   `--add-dir <install root>`    so the session can read the skill, the
  *                                 compliance doc, and its own source.
+ *   `--disallowedTools <list>`    the boundary, enforced rather than requested —
+ *                                 see `HELM_DENIED_TOOLS` below.
  *
  * and a plain `claude` keeps none of it. That is the whole product decision:
  * `bluespace` is Helm, `claude` is Claude Code, and neither leaks into the other.
+ *
+ * WHY THE FOURTH FLAG EXISTS, FOR THE READER WHO IS ABOUT TO DELETE IT.
+ *
+ * It is the difference between a fleet and a chat window. Observed, on this
+ * machine, from a real session: the captain registered a project and asked Helm
+ * to confirm and fix a reported bug. Helm read the bug report through its own
+ * MCP tool — correct, that is intake — and then ran `ls`, `grep` and `sed` over
+ * the captain's repository and investigated the bug itself. `create_task` was
+ * never called. That investigation had no worktree, no Sentinel, no token
+ * ceiling, no row in `blue ps`, no event in the Blackbox, and it died with the
+ * session. Every single property the fleet exists to provide was absent, and the
+ * captain's conclusion was the correct one: then what is any of this for.
+ *
+ * `CLAUDE.md` did not stop it, and could not have. Reading a repository with
+ * `grep` IS read-only, so "you are read-only over the captain's projects" did
+ * not forbid it; and "do not use native delegation tools" forbids Helm handing
+ * work to a subagent, not Helm simply doing the work itself. Prose closed the
+ * two doors nobody walked through. The rule is now in `CLAUDE.md` as well — a
+ * model that is surprised by a missing tool argues with the user about it — but
+ * the rule is not what holds. This flag is.
  *
  * IT IS A LAUNCHER, NOT A WRAPPER. Every argument the captain passes goes
  * through untouched, stdio is inherited (this is an interactive session — see
@@ -43,9 +65,15 @@
  * will look for it: `--setting-sources`, `--permission-mode`, `--model`,
  * `--settings`. Those are how BlueSpace constrains a CREW — a process it starts,
  * owns, and grades. This window is the captain's own session, in their own
- * terminal, with their own settings, hooks, model and permission posture. The
- * launcher adds Helm to it; it does not take the captain's Claude Code away and
- * hand back a narrower one. Anything they want changed, they pass themselves.
+ * terminal, with their own settings, hooks, model and permission posture, and
+ * the launcher does not swap those out for narrower ones of its choosing.
+ *
+ * `--disallowedTools` is the one exception, and it is not a smaller version of
+ * that list — it is a different kind of thing. Those four flags change how the
+ * captain's own work is done. This one says which agent the window is. A Helm
+ * that can edit their code is not a stricter Helm or a looser Helm; it is the
+ * thing BlueSpace was built to replace, wearing Helm's name.
+ * `BLUESPACE_UNCLAMPED=1` gives it back, with both eyes open.
  *
  * `--strict-mcp-config` is the one flag in that family with a real argument for
  * it, and it is opt-in for the same reason — see `strictMcpRequested`.
@@ -92,7 +120,7 @@ function blueEntry(): string {
 }
 
 // ---------------------------------------------------------------------------
-// The three things injected into the window
+// The four things injected into the window
 // ---------------------------------------------------------------------------
 
 /**
@@ -139,11 +167,17 @@ export class MissingPersonaError extends Error {
  * would drift out of agreement with them silently. Editing `CLAUDE.md` must be
  * enough to change Helm.
  *
- * The appended note below is not persona — it is orientation. It says three
- * things the file itself cannot say, because the file was written for a session
- * whose working directory is this repo and this session's is not.
+ * The appended note below is not persona — it is orientation. It says the things
+ * the file itself cannot say, because the file was written for a session whose
+ * working directory is this repo and this session's is not, and because only the
+ * launcher knows which tools this particular window was handed.
+ *
+ * That last part is why `denied` is a parameter. A model told "you have no Bash"
+ * in a window that has one learns that its system prompt lies; a model that finds
+ * Bash missing with no explanation reports a broken tool to the captain and asks
+ * them to fix it. Both are avoided by saying what actually happened at launch.
  */
-export function helmSystemPrompt(root: string): string {
+export function helmSystemPrompt(root: string, denied: readonly string[] = HELM_DENIED_TOOLS): string {
   const personaPath = path.join(root, 'CLAUDE.md');
   let persona: string;
   try {
@@ -155,6 +189,25 @@ export function helmSystemPrompt(root: string): string {
 
   const skill = path.join(root, 'skills', 'bluespace', 'SKILL.md');
 
+  const boundary =
+    denied.length > 0
+      ? `The read-only boundary is **enforced in this window, not requested**. This launch denied:
+
+    ${denied.join(', ')}
+
+Their absence is deliberate, not a fault — do not look for a way around it, do not ask the
+captain to enable one, and never report one as broken. Work that changes anything goes
+through \`mcp__bluespace__create_task\`, which is the only route that comes with a worktree,
+a Sentinel, a ceiling and a record.
+
+You keep everything intake and judgement need: Read, Glob and Grep over the captain's code,
+the web tools, and every \`mcp__*\` tool including your own.`
+      : `This window was opened with \`BLUESPACE_UNCLAMPED=1\`, so the boundary above is only a rule
+you are choosing to keep — Bash, Edit and the native delegation tools are all present. The
+captain asked for that; it does not change what you do. Reaching one of them for their
+project work still produces exactly the thing the rule describes: work with no worktree, no
+Sentinel, no ceiling, nothing in \`blue ps\` and no record in the Blackbox.`;
+
   return `${persona.trimEnd()}
 
 ---
@@ -163,9 +216,10 @@ export function helmSystemPrompt(root: string): string {
 
 You were opened by the \`bluespace\` launcher. The working directory is wherever the
 captain ran it — usually one of their own repositories, not BlueSpace's. Everything above
-applies unchanged there, including that you are read-only over their projects: being
-inside a repo is not permission to edit it, and the fact that you *can* reach the Edit
-tool is not a reason to. Work goes through \`mcp__bluespace__create_task\`.
+applies unchanged there: being inside a repo is not permission to edit it, and a question
+that can only be answered by digging through their code is a task, not a turn.
+
+${boundary}
 
 Your levers come from a \`bluespace\` MCP server started for this window alone. It is not
 installed in the captain's configuration and it is gone when this window closes — a plain
@@ -182,6 +236,124 @@ That directory is reachable from this window. Load it before the wake sweep, bef
 writing a brief, before answering a decision, and before reviewing a diff — it is the
 craft the rules above assume you already have.
 `;
+}
+
+/**
+ * The tools a Helm window does not get, and the argument for each one.
+ *
+ * TWO QUESTIONS DECIDE THE LIST, and nothing else does:
+ *
+ *   1. Does it let Helm do the captain's project work itself?
+ *   2. Does it let Helm create a worker outside the fleet?
+ *
+ * A "yes" to either is a way to produce work with no worktree, no Sentinel, no
+ * ceiling, no Blackbox event and no row in `blue ps`. Everything else stays, and
+ * the things that stay matter as much as the things that go — Helm has to read a
+ * repository to route a request and to write a brief a stranger could execute,
+ * and it reads linked issues and pasted URLs during intake.
+ *
+ * WHY `--disallowedTools` AND NOT `--tools`. `--tools Read,Glob,Grep` looks like
+ * the tighter, more obviously correct clamp. It is unusable: measured on 2.1.223,
+ * it strips the MCP tools too. The probed session reported its tools as
+ * "EndConversation, Glob, Grep, and Read", and `mcp__bluespace__list_projects`
+ * was gone despite `--mcp-config` being passed. That is not a clamped Helm, it is
+ * a Helm with no levers at all — the exact half-Helm `MissingPersonaError` exists
+ * to refuse, arrived at from the other side. `--disallowedTools` names what goes
+ * and leaves everything else, MCP included; measured in the same shape, with the
+ * list below, `mcp__bluespace__*` survives and Bash is reported as unavailable.
+ *
+ * NAMES ARE READ OFF THIS MACHINE, NOT GUESSED. A session was asked to list its
+ * own tools: on 2.1.223 the subagent launcher reports itself as `Agent`, not
+ * `Task`. Both are listed anyway, because `Task` is still a name this build
+ * accepts and a rename in either direction must not quietly unclamp the window.
+ *
+ * EVERY ENTRY MUST BE A NAME THIS BUILD KNOWS. An unrecognised one is not
+ * silently ignored — it prints `Permission deny rule "X" matches no known tool —
+ * check for typos.` onto the captain's screen before the window opens. Measured:
+ * `Zzzbogus` warns, `Task` does not. So a guessed or stale name is not a
+ * harmless belt-and-braces entry; it is a warning on the front door that reads
+ * like a BlueSpace bug. Verify a new entry against a real session before adding
+ * it, the same way these were.
+ */
+export const HELM_DENIED_TOOLS: readonly string[] = [
+  // -- Doing the captain's work ------------------------------------------------
+  //
+  // The one that actually happened. `ls`, `grep`, `sed` over the captain's repo
+  // is how an intake request became an investigation with nothing behind it —
+  // and `grep` is read-only, so no rule about not writing was ever violated.
+  // Denying Bash also closes every shell-shaped side door at once: `git commit`,
+  // `claude -p`, `claude --bg`, a background `&`, and running the test suite.
+  'Bash',
+  // Editing their files IS the mission a Crew would have run. There is no small
+  // exception: a one-line fix Helm makes by hand is a fix with no verifier.
+  'Edit',
+  'Write',
+  'NotebookEdit',
+
+  // -- Creating a worker outside the fleet -------------------------------------
+  //
+  // `Agent` is what 2.1.223 calls the subagent launcher; `Task` is the same
+  // lever's older name and is still accepted. Work made this way is invisible to
+  // `blue ps` and to the Blackbox and dies with the window. This is the rule
+  // `CLAUDE.md` already stated and had no way to enforce.
+  'Agent',
+  'Task',
+  // "Execute a workflow script that orchestrates multiple subagents
+  // deterministically" — the same hole, at fleet scale, with its own scheduler.
+  'Workflow',
+  // Runs a shell command as a background process and streams its stdout. It is
+  // Bash through a second door, and denying Bash without it would be theatre.
+  'Monitor',
+  // Creates and runs routines on claude.ai. Delegation that is not even on this
+  // machine, so `blue ps` could not see it even in principle.
+  'RemoteTrigger',
+  // Creates a git worktree on a new branch inside the captain's repository and
+  // moves the session into it. Two faults: it writes to their repo, and it is a
+  // second worktree system alongside `src/worktree/` that nothing here tracks.
+  'EnterWorktree',
+
+  // -- Deliberately NOT denied, since the next reader will ask -------------------
+  //
+  // Read / Glob / Grep — Helm cannot route a request or write a brief blind.
+  //   This is also why the boundary needed a new RULE and not just a longer deny
+  //   list: reading is legitimate right up to the moment it becomes the answer,
+  //   and no flag can tell those apart. `CLAUDE.md` draws that line.
+  // WebFetch / WebSearch — intake reads the linked issue and the pasted URL.
+  // every `mcp__*` — Helm's own levers, and the captain's servers with them.
+  // Skill — the captain's skills are intake capability, not delegation.
+  // LSP — read-only code intelligence over a server it does not start.
+  // TaskCreate / TaskUpdate / TaskList / TaskGet — the session's own to-do list,
+  //   bookkeeping with no process behind it. Not to be confused with
+  //   `mcp__bluespace__create_task`, which is the real one.
+  // TaskStop / SendMessage — they reach an existing worker and cannot start one;
+  //   with Bash, Agent, Workflow, Monitor and RemoteTrigger denied, no worker
+  //   they could reach can exist in this window in the first place.
+];
+
+/**
+ * Hand the window back unclamped, for a captain who means it.
+ *
+ * The case for having an escape hatch at all: the deny list is measured against
+ * one Claude Code build, and a future one may rename a tool Helm genuinely needs
+ * into something on that list. A captain locked out of their own front door by
+ * our list, with no way to test the theory, would be worse served than one who
+ * can turn it off and tell us what they saw.
+ *
+ * What they give up is not subtle, and `blue --help` spells it out rather than
+ * calling it a mode: an unclamped Helm can edit the repository it is standing in
+ * and can spawn its own subagents, and work produced either way has no worktree,
+ * no Sentinel, no token ceiling, nothing in `blue ps` and no record in the
+ * Blackbox. It is not a
+ * "trusted mode" — it is the fleet turned off while the fleet's vocabulary keeps
+ * working, which is the one failure mode the captain cannot see from the outside.
+ */
+export function unclampedRequested(env: NodeJS.ProcessEnv = process.env): boolean {
+  return envFlag(env, 'BLUESPACE_UNCLAMPED');
+}
+
+/** The deny list this launch will pass, or nothing at all when unclamped. */
+export function deniedTools(env: NodeJS.ProcessEnv = process.env): readonly string[] {
+  return unclampedRequested(env) ? [] : HELM_DENIED_TOOLS;
 }
 
 /**
@@ -228,6 +400,8 @@ export interface HelmLaunchInput {
   captainArgs: readonly string[];
   /** Drop the captain's own MCP servers. Opt-in; see `docs/compliance.md`. */
   strictMcp: boolean;
+  /** Tools the window must not have. Empty only when deliberately unclamped. */
+  deniedTools: readonly string[];
   /** The opening turn, or undefined for a window that waits. */
   openingPrompt?: string | undefined;
 }
@@ -240,14 +414,21 @@ export interface HelmLaunchInput {
  * invisible at the call site and a reader "tidying" it would break the product
  * in a way no type checks.
  *
- * THE ORDERING RULE. `--mcp-config <configs...>` and `--add-dir <directories...>`
- * are VARIADIC: they swallow every following token that does not start with `-`,
- * including the captain's prompt. Measured on 2.1.223:
+ * THE ORDERING RULE. `--mcp-config <configs...>`, `--add-dir <directories...>`
+ * and `--disallowedTools <tools...>` are all VARIADIC: they swallow every
+ * following token that does not start with `-`, including the captain's prompt.
+ * Measured on 2.1.223:
  *
  *     claude -p --add-dir /some/dir "reply OK"
  *       -> Error: Input must be provided ... when using --print   (prompt eaten)
  *     claude -p --mcp-config '{"mcpServers":{}}' "reply OK"
  *       -> Error: MCP config file not found: <cwd>/reply OK       (prompt eaten)
+ *
+ * A variadic flag placed immediately before the positional prompt does not fail
+ * loudly in an interactive window the way it does under `-p`: the session opens
+ * with an empty composer, no turn runs, and no transcript is written. Three
+ * probes of this launcher's own shape were lost that way before the cause was
+ * found — so the rule is frozen in `tests/launcher.test.ts` rather than trusted.
  *
  * So the last flag BlueSpace injects must take exactly one value, and
  * `--append-system-prompt` does. Everything the captain passes, and the opening
@@ -268,6 +449,15 @@ export function buildHelmArgv(input: HelmLaunchInput): string[] {
   if (input.strictMcp) argv.push('--strict-mcp-config');
 
   argv.push('--add-dir', input.root);
+
+  // One comma-joined token rather than one token per tool. `--disallowedTools`
+  // accepts either (`--help`: "Comma or space-separated"), and the comma form was
+  // the one measured on 2.1.223; it also keeps the whole clamp as a single argv
+  // element, which is what makes the ordering test above able to freeze it.
+  // Empty means BLUESPACE_UNCLAMPED — pass no flag rather than an empty value,
+  // which the variadic would fill from the next token.
+  if (input.deniedTools.length > 0) argv.push('--disallowedTools', input.deniedTools.join(','));
+
   argv.push('--append-system-prompt', input.systemPromptAppend); // must stay last
 
   argv.push(...input.captainArgs);
@@ -392,7 +582,9 @@ export async function runLauncher(
   let systemPromptAppend: string;
   try {
     claudePath = resolveClaudeBinary(env);
-    systemPromptAppend = helmSystemPrompt(root);
+    // The same list the argv will carry, so the window is never told about a
+    // clamp it does not have — or left to discover one nobody mentioned.
+    systemPromptAppend = helmSystemPrompt(root, deniedTools(env));
   } catch (e: unknown) {
     errLine(e instanceof Error ? e.message : String(e));
     return 1;
@@ -411,6 +603,7 @@ export async function runLauncher(
     systemPromptAppend,
     captainArgs,
     strictMcp: strictMcpRequested(env),
+    deniedTools: deniedTools(env),
     openingPrompt: wake,
   });
 

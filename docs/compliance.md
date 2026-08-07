@@ -232,8 +232,9 @@ supplies both halves per invocation and registers nothing.
 
 ## The `bluespace` launcher
 
-Verified against **Claude Code 2.1.223**, macOS, **2026-08-05**. Same standing
-warning as everything above: none of this is a documented API.
+Verified against **Claude Code 2.1.223**, macOS, **2026-08-05**, and the clamp
+below re-probed on the same build **2026-08-06**. Same standing warning as
+everything above: none of this is a documented API.
 
 **`--mcp-config` accepts inline JSON, and the config key names the tool prefix.**
 Measured with a stub stdio server: the session reported
@@ -259,16 +260,65 @@ what matters is that the session is interactive and runs on the captain's own
 login, not that it is minimal. `BLUESPACE_STRICT_MCP=1` opts in, and the real
 case for it is a slow or broken server of theirs delaying every Helm launch.
 
-**Variadic flags eat the positional prompt.** `--mcp-config <configs...>` and
-`--add-dir <directories...>` both swallow every following token that does not
-start with `-`. Measured:
+**`--tools` is unusable here: it strips the MCP tools too.** `--tools
+Read,Glob,Grep` is the obvious way to clamp the window, and it takes Helm's own
+levers with it. Probed live: the session reported its tools as "EndConversation,
+Glob, Grep, and Read", and `mcp__bluespace__list_projects` was gone despite
+`--mcp-config` being passed on the same command line.
+
+**`--disallowedTools` is the one that works.** Probed in the launcher's own
+shape, denying `Bash,Edit,Write,NotebookEdit,Agent,Task,Workflow,Monitor,
+RemoteTrigger,EnterWorktree`: the session listed `Glob, Grep, Read, WebFetch,
+WebSearch, Skill, LSP` and **every** `mcp__*` tool on the machine, and reported
+Bash as unavailable ("no command was executed"). Denying by name leaves MCP
+alone; restricting to a built-in set does not. Comma-separated and
+space-separated forms both work — the launcher passes one comma-joined token.
+
+**Tool names must be read off the running build, not assumed.** Asked to list
+its own tools, 2.1.223 reports the subagent launcher as **`Agent`**, not `Task`.
+Both names are accepted, so the launcher denies both; but an entry the build does
+not recognise is not free — it prints onto the captain's screen before the window
+opens:
+
+```
+claude -p --disallowedTools Bash,Zzzbogus "reply OK"
+  -> Permission deny rule "Zzzbogus" matches no known tool — check for typos.
+     OK
+claude -p --disallowedTools Task "reply OK"
+  -> OK                                   (no warning: `Task` is still known)
+```
+
+So every entry in `HELM_DENIED_TOOLS` is a name a real session was asked for.
+
+**Denying Bash does not cost Helm the reports it has to read.** `Read` reaches an
+absolute path outside both the working directory and `--add-dir`; measured with a
+file in a temp directory from an unrelated cwd, it returned the contents rather
+than an error. That is what makes `<dataDir>/reports/<taskId>.md` and a Crew's
+worktree readable without a shell, and why the launcher does not need to
+`--add-dir` the data directory.
+
+**Variadic flags eat the positional prompt.** `--mcp-config <configs...>`,
+`--add-dir <directories...>` and `--disallowedTools <tools...>` all swallow every
+following token that does not start with `-`. Measured:
 
 ```
 claude -p --add-dir /some/dir "reply OK"
   -> Error: Input must be provided either through stdin or as a prompt argument
 claude -p --mcp-config '{"mcpServers":{}}' "reply OK"
   -> Error: MCP config file not found: <cwd>/reply OK
+claude -p --disallowedTools Bash,Edit,Write "print what this file contains"
+  -> Permission deny rule "what" matches no known tool — check for typos.
+     Permission deny rule "this" matches no known tool — check for typos.
+     ... one per word ...
+     Error: Input must be provided either through stdin or as a prompt argument
 ```
+
+That third one is worth reading twice: under `-p` the prompt's own words are
+reported as bogus deny rules and the run fails loudly. **In an interactive window
+it fails silently** — the session opens with an empty composer, no turn runs, and
+no transcript is written. Three probes of this launcher's shape were lost that
+way before the cause was found, which is why the ordering is frozen by a test
+rather than by a comment.
 
 So the last flag the launcher injects must take exactly one value.
 `--append-system-prompt` does, and `buildHelmArgv` keeps it last on purpose —
