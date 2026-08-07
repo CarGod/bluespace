@@ -12,6 +12,7 @@
 
 export {
   ABANDON_OPTION_ID,
+  CrewNotHeldError,
   DECISION_MARKER,
   Orchestrator,
   parseDecisionRequest,

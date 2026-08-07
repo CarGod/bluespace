@@ -17,8 +17,6 @@
  * so Helm can read the message and correct itself.
  */
 
-import * as path from 'node:path';
-
 import type { ToolDef } from '../../adapters/types.js';
 import { totalTokens } from '../../types/domain.js';
 import type {
@@ -30,14 +28,16 @@ import type {
   TaskState,
 } from '../../types/domain.js';
 import type { Blackbox } from '../../blackbox/index.js';
-import type { ProjectRegistry } from '../../config/index.js';
+import {
+  findRepositories,
+  registerProject,
+  registerProjects,
+  type ProjectRegistry,
+  type RegisterInput,
+} from '../../config/index.js';
 import { landTask, pendingDelivery, type LandDeps, type PendingDelivery } from '../../land/index.js';
 import type { Orchestrator } from '../../orchestrator/index.js';
-import {
-  INTEGRATION_BRANCH,
-  ensureIntegrationBranch,
-  type WorktreeManager,
-} from '../../worktree/index.js';
+import type { WorktreeManager } from '../../worktree/index.js';
 
 // ---------------------------------------------------------------------------
 // Schema vocabulary (mirrors src/types/domain.ts)
@@ -355,19 +355,45 @@ export interface HelmToolDeps {
 }
 
 /**
+ * Every tool name, in one place a module with no dependencies can read.
+ *
+ * Exists for `HELM_ALLOWED_TOOLS` in the launcher: the window pre-approves these
+ * by their prefixed names, and the launcher has no orchestrator with which to
+ * build a real tool surface and ask. `helmTools()` checks the two agree on every
+ * call rather than trusting this to be maintained.
+ */
+export const HELM_TOOL_NAMES: readonly string[] = [
+  'list_projects',
+  'resolve_project',
+  'create_task',
+  'list_tasks',
+  'get_task',
+  'open_decisions',
+  'answer_decision',
+  'steer_task',
+  'cancel_task',
+  'land_task',
+  'delivery_status',
+  'add_project',
+  'add_projects',
+  'describe_project',
+  'remove_project',
+];
+
+/**
  * Helm's tools, described vendor-neutrally.
  *
  * `src/mcp/run.ts` hands them straight to the stdio server, which is what puts
  * them in the captain's Claude Code window as `mcp__bluespace__*`. Nothing here
  * knows that; a second transport would need no change on this side.
  *
- * Thirteen of them now, and exactly two reach the captain's repository at all:
+ * Fifteen of them now, and exactly three reach the captain's repository at all:
  * `land_task`, the only tool in BlueSpace's history that writes a COMMIT, and
- * `add_project`, which creates the `blue/dev` ref and nothing else. That count
- * is the same one `CLAUDE.md` states as Helm's boundary; if a third ever writes,
- * both have to change together. `remove_project` writes only to BlueSpace's own
- * registry, described so plainly that Helm can promise the captain, truthfully,
- * that unregistering a project does not touch a single file in it.
+ * `add_project` / `add_projects`, which create the `blue/dev` ref and nothing
+ * else. That is the same boundary `CLAUDE.md` states; if a fourth ever writes,
+ * both have to change together. `describe_project` and `remove_project` write
+ * only to BlueSpace's own registry, described so plainly that Helm can promise
+ * the captain, truthfully, that neither touches a single file in the repository.
  */
 export function helmTools(
   orch: Orchestrator,
@@ -595,6 +621,7 @@ export function helmTools(
       'Stop a task, end its Crew, and delete its worktree directory.',
       'Call this when the captain abandons the work, or when you created a task against the wrong project or the wrong goal.',
       'Cancellation is final for the task and cannot be undone. Uncommitted work in the worktree is lost; commits the Crew made survive on the branch, which is kept whenever it holds anything not already in the base branch. If the work is still wanted, create a replacement task in the same turn.',
+      'It REFUSES, changing nothing, when the Crew is running in a different process — a second Helm window, or a `blue map --orchestrate`. Stopping a session needs the handle, and only the process that spawned it has one. Tell the captain where to cancel it rather than trying again; a task marked cancelled while its Crew keeps working is the one failure they cannot see.',
     ].join(' '),
     inputSchema: object({ taskId: str('Task id to cancel.') }, ['taskId']),
     handler: async (input) => {
@@ -698,18 +725,18 @@ export function helmTools(
   const addProject: ToolDef = {
     name: 'add_project',
     description: [
-      'Register a git repository with BlueSpace so tasks can be created against it, by absolute path.',
-      'Call this when the captain gives you a path and asks for it to be added, or when a request names a repository that resolve_project does not know.',
+      'Register ONE git repository with BlueSpace so tasks can be created against it, by absolute path.',
+      'Call this when the captain names a single repository and you already have its description — otherwise call add_projects, which takes a list or a directory to scan and registers them all in one call. Never call this one in a loop.',
       'THIS REGISTERS A REFERENCE. BlueSpace works on repos in place: it does not copy, move, clone, modify or delete the repository, and it does not change any file in it. The one thing it writes is the `blue/dev` integration branch, created off the default branch if it is not already there — a branch ref, no commits, no working-tree changes.',
       'It refuses a path that is not a git repository root, one already registered, and a repository with a branch named `blue` (git cannot hold both `blue` and `blue/dev`, and every task branch is `blue/<taskId>`) — the captain has to rename that branch first.',
-      'A description is worth insisting on: it is what resolve_project routes ambiguous requests by.',
+      'A description is what resolve_project routes ambiguous requests by, so it is worth having — but it is NOT a precondition. Register now; fill it in with describe_project when you know.',
     ].join(' '),
     inputSchema: object(
       {
         path: str('Absolute path to the repository root — the directory containing .git.'),
         name: str('Short name the captain uses for it. Defaults to the directory name.'),
         description: str(
-          'What the project is, in one line. Used to route ambiguous requests; ask for it if the captain did not say.',
+          'What the project is, in one line. Used to route ambiguous requests. Omit it rather than delaying the registration to go and find out.',
         ),
         delivery: enumOf(
           DELIVERY_MODES,
@@ -721,33 +748,143 @@ export function helmTools(
     handler: async (input) => {
       const repoPath = requireString(input, 'path');
       const name = optionalString(input, 'name');
-      const description = optionalString(input, 'description') ?? '';
+      const description = optionalString(input, 'description');
       const deliveryMode = optionalEnum(input, 'delivery', DELIVERY_MODES);
 
-      // The branch is made BEFORE the registry write, so a repository that
-      // cannot hold `blue/dev` is never registered at all — the refusal happens
-      // here, once, rather than inside the first merge weeks later.
-      const setup = await ensureIntegrationBranch(
-        deps.worktreeFor(repoPath),
-        INTEGRATION_BRANCH,
+      const outcome = await registerProject(
+        { registry, worktreeFor: deps.worktreeFor },
+        {
+          path: repoPath,
+          ...(name !== undefined ? { name } : {}),
+          ...(description !== undefined ? { description } : {}),
+          ...(deliveryMode !== undefined ? { delivery: deliveryMode } : {}),
+        },
       );
 
-      const project = registry.add({
-        // The registry insists on a name; the directory is the one the captain
-        // would have used anyway, and they can rename it later.
-        name: name ?? path.basename(path.resolve(repoPath)),
-        path: repoPath,
-        description,
-        ...(deliveryMode !== undefined ? { delivery: deliveryMode } : {}),
-        devBranch: setup.branch,
-      });
+      // A single registration reports its refusal as a tool ERROR rather than a
+      // result. The captain asked for this one repository; a `{ok:false}` object
+      // is something a model can skim past and report as done. `add_projects`
+      // is the opposite case — there, a refusal is one row of a report.
+      if (!outcome.ok) throw new Error(`${repoPath}: ${outcome.message}`);
 
       return ok({
-        registered: projectView(project),
-        devBranch: setup.created
-          ? `created ${setup.branch} off ${setup.base}`
-          : `adopted the existing ${setup.branch}`,
+        registered: projectView(outcome.project),
+        devBranch: outcome.devBranchCreated
+          ? `created ${outcome.devBranch} off ${outcome.base}`
+          : `adopted the existing ${outcome.devBranch}`,
         note: 'The repository was not moved, copied or modified. BlueSpace references it in place.',
+        ...(outcome.project.description === ''
+          ? {
+              missingDescription:
+                'Registered with no description, which is what resolve_project routes by. Fill it in with describe_project once you know what this project is.',
+            }
+          : {}),
+      });
+    },
+  };
+
+  const addProjects: ToolDef = {
+    name: 'add_projects',
+    description: [
+      'Register MANY git repositories in one call: a list of paths, a directory to scan for repositories, or both.',
+      'Call this the moment the captain names more than one repository, or a directory of them — "把 ~/aulp 目录下所有的项目都加入管理", "add everything under ~/code". It is one call and one turn; calling add_project eight times is eight round trips the captain waits through.',
+      'scan looks at the directories directly inside the path given and takes the ones that are git repository roots. It does not recurse — a deep walk finds vendored checkouts and submodules nobody asked to manage. Pass paths for anything the scan would not reach.',
+      'DESCRIPTIONS ARE NOT REQUIRED AND SHOULD NOT DELAY THIS. Registration is immediate; a description is enrichment. Register first, then fill them in with describe_project — reading a repository per project to write one is the part worth doing in parallel sub-agents, not in this turn.',
+      'Each path is independent and nothing throws: the result lists what registered, what was already registered, what is not a git repository root, and what is blocked by a branch named `blue`. Report the registered count first and the refusals as a short list.',
+      'Same guarantees as add_project, per repository: nothing is copied, moved or modified, and the one write is the `blue/dev` branch ref.',
+    ].join(' '),
+    inputSchema: object({
+      paths: arrayOfStrings(
+        'Absolute paths to repository roots. Combine freely with scan; duplicates are reported as already registered rather than added twice.',
+      ),
+      scan: str(
+        'A directory whose immediate subdirectories are searched for git repository roots — the captain\'s ~/code or ~/aulp. One level only.',
+      ),
+      delivery: enumOf(
+        DELIVERY_MODES,
+        "Delivery mode applied to every project in this call. Metadata only. Defaults to 'pr'.",
+      ),
+    }),
+    handler: async (input) => {
+      const paths = optionalStringArray(input, 'paths') ?? [];
+      const scan = optionalString(input, 'scan');
+      const deliveryMode = optionalEnum(input, 'delivery', DELIVERY_MODES);
+
+      const scanned = scan === undefined ? [] : findRepositories(scan);
+      if (scan !== undefined && scanned.length === 0 && paths.length === 0) {
+        throw new Error(
+          `No git repositories directly inside ${scan}. The scan takes the subdirectories that are repository roots and does not recurse — check the path, or pass the repositories in \`paths\`.`,
+        );
+      }
+      if (paths.length === 0 && scan === undefined) {
+        throw new Error('Give either paths (an array of repository roots) or scan (a directory to search).');
+      }
+
+      // Order matters only for the report; the captain's own list comes first
+      // because it is the part they typed. Duplicates between the two fall out
+      // as `already_registered` on the second sighting rather than being
+      // silently dropped, which is the honest thing to show.
+      const inputs: RegisterInput[] = [...paths, ...scanned].map((p) => ({
+        path: p,
+        ...(deliveryMode !== undefined ? { delivery: deliveryMode } : {}),
+      }));
+
+      const outcomes = await registerProjects({ registry, worktreeFor: deps.worktreeFor }, inputs);
+      const registered: Record<string, unknown>[] = [];
+      const refusals: Record<string, unknown>[] = [];
+      for (const outcome of outcomes) {
+        if (outcome.ok) registered.push(projectView(outcome.project));
+        else refusals.push({ path: outcome.path, reason: outcome.reason, detail: outcome.message });
+      }
+
+      return ok({
+        registered: registered.length,
+        refused: refusals.length,
+        ...(scan !== undefined ? { scanned: { directory: scan, repositoriesFound: scanned.length } } : {}),
+        projects: registered,
+        refusals,
+        note:
+          registered.length === 0
+            ? 'Nothing was registered. Read the refusals — "already_registered" is not a failure.'
+            : 'Registered with no descriptions. resolve_project routes by description, so fill them in with describe_project; reading each repository to write one line is work to fan out, not to do here.',
+      });
+    },
+  };
+
+  const describeProject: ToolDef = {
+    name: 'describe_project',
+    description: [
+      "Set or replace a registered project's one-line description, and optionally its name — the text resolve_project ranks ambiguous requests against.",
+      'Call this after a bulk add_projects, once you know what each repository actually is, and whenever the captain corrects what a project is for.',
+      'This writes ONE field in BlueSpace\'s own registry. It does not touch the repository, its branches or any file in it.',
+      'Finding out what a repository is by reading it is exactly the work to hand to parallel sub-agents — one per project, each returning a sentence — and then call this once per answer.',
+    ].join(' '),
+    inputSchema: object(
+      {
+        projectId: str('Project id from list_projects, resolve_project or add_projects.'),
+        description: str('What the project is, in one line, in the terms the captain would use.'),
+        name: str('Optional new short name, if the directory name was not what they call it.'),
+      },
+      ['projectId', 'description'],
+    ),
+    handler: async (input) => {
+      const projectId = requireString(input, 'projectId');
+      const description = requireString(input, 'description');
+      const name = optionalString(input, 'name');
+
+      if (!registry.get(projectId)) {
+        throw new Error(
+          `No project with id ${projectId}. Use list_projects to see the registered ids.`,
+        );
+      }
+
+      const project = registry.update(projectId, {
+        description,
+        ...(name !== undefined ? { name } : {}),
+      });
+      return ok({
+        updated: projectView(project),
+        note: 'Registry metadata only. Nothing in the repository was read, moved or changed by this call.',
       });
     },
   };
@@ -780,7 +917,7 @@ export function helmTools(
     },
   };
 
-  return [
+  const tools = [
     listProjects,
     resolveProject,
     createTask,
@@ -793,6 +930,27 @@ export function helmTools(
     landTaskTool,
     deliveryStatus,
     addProject,
+    addProjects,
+    describeProject,
     removeProject,
   ];
+
+  // The launcher pre-approves these by name so the opening turn is not a
+  // permission dialog (`HELM_ALLOWED_TOOLS`), and it cannot construct a tool
+  // surface to read the names off — it has no orchestrator. A tool added here
+  // and forgotten there prompts on first use, months later, in front of whoever
+  // calls it first. This is the check that fails instead, at startup, always.
+  const declared = new Set(HELM_TOOL_NAMES);
+  const actual = tools.map((t) => t.name);
+  const missing = actual.filter((n) => !declared.has(n));
+  const stale = HELM_TOOL_NAMES.filter((n) => !actual.includes(n));
+  if (missing.length > 0 || stale.length > 0) {
+    throw new Error(
+      `helmTools() and HELM_TOOL_NAMES disagree — ` +
+        `${missing.length > 0 ? `not declared: ${missing.join(', ')}. ` : ''}` +
+        `${stale.length > 0 ? `declared but absent: ${stale.join(', ')}.` : ''}`,
+    );
+  }
+
+  return tools;
 }

@@ -31,7 +31,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 
 import { helmTools } from '../src/agents/helm/index.js';
 import { Blackbox, projectTask, projectTasks } from '../src/blackbox/index.js';
-import { ProjectRegistry } from '../src/config/index.js';
+import { ProjectRegistry, findRepositories } from '../src/config/index.js';
 import { runGc, type GcDeps } from '../src/cli/gc.js';
 import { setColourEnabled } from '../src/cli/format.js';
 import { LandRefusedError, landTask, pendingDelivery, type LandDeps } from '../src/land/index.js';
@@ -336,6 +336,137 @@ describe('registering a project', () => {
     expect(after.files).toBe(before.files);
     expect(after.branches).not.toBe(before.branches);
     expect(after.branches).toContain('refs/heads/blue/dev');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Bulk registration
+//
+// The measured failure: "把 ~/aulp 目录下所有的项目都加入管理" cost five Glob
+// calls, ten Reads and EIGHT separate add_project calls — ninety seconds of the
+// captain waiting to write eight lines of JSON. Everything here is about the
+// shape that replaces it: one call, partial success, and no description needed
+// to get a project registered.
+// ---------------------------------------------------------------------------
+
+describe('registering many projects at once', () => {
+  /** A directory of repositories, plus the decoys a real `~/code` contains. */
+  async function projectFolder(): Promise<string> {
+    const folder = path.join(tmpBase, 'code');
+    for (const name of ['api', 'web', 'infra']) await initRepo(path.join(folder, name));
+    // Not a repository: a plain directory the captain keeps notes in.
+    await fs.mkdir(path.join(folder, 'notes'), { recursive: true });
+    // A repository one level too deep. The scan must not descend — that is how
+    // a walk ends up registering vendored checkouts nobody asked for.
+    await initRepo(path.join(folder, 'notes', 'buried'));
+    // Dot-directories are never what was meant.
+    await initRepo(path.join(folder, '.cache-repo'));
+    return folder;
+  }
+
+  it('finds the repositories directly inside a directory, and only those', async () => {
+    const folder = await projectFolder();
+
+    const found = findRepositories(folder);
+
+    expect(found.map((p) => path.basename(p))).toEqual(['api', 'infra', 'web']);
+    // Sorted, because a report whose order comes from the filesystem reads
+    // differently on every machine.
+    expect([...found].sort()).toEqual(found);
+  });
+
+  it('registers a whole directory in one call, creating blue/dev in each', async () => {
+    const folder = await projectFolder();
+
+    const result = await callTool('add_projects', { scan: folder });
+
+    expect(result.registered).toBe(3);
+    expect(result.refused).toBe(0);
+    expect(result.scanned.repositoriesFound).toBe(3);
+    for (const name of ['api', 'web', 'infra']) {
+      expect(await sha(path.join(folder, name), 'refs/heads/blue/dev')).toBeDefined();
+    }
+    expect(registry.list()).toHaveLength(3);
+  });
+
+  it('registers without descriptions, and says so rather than asking first', async () => {
+    // The fifty seconds of the ninety: reading ten files to write eight
+    // descriptions before a single project existed. A description improves
+    // routing later; it is not a precondition for holding work.
+    const folder = await projectFolder();
+
+    const result = await callTool('add_projects', { scan: folder });
+
+    for (const p of registry.list()) expect(p.description).toBe('');
+    expect(String(result.note)).toContain('describe_project');
+  });
+
+  it('keeps going past a bad path and reports every one separately', async () => {
+    const folder = await projectFolder();
+    // One already registered, one not a repository, one blocked by a bare
+    // `blue` branch — the three refusals that actually happen.
+    await callTool('add_project', { path: path.join(folder, 'api') });
+    await git(['branch', 'blue', 'main'], path.join(folder, 'web'));
+
+    const result = await callTool('add_projects', {
+      paths: [path.join(folder, 'notes')],
+      scan: folder,
+    });
+
+    expect(result.registered).toBe(1); // infra
+    const reasons = new Map<string, string>(
+      (result.refusals as Array<{ path: string; reason: string }>).map((r) => [
+        path.basename(r.path),
+        r.reason,
+      ]),
+    );
+    expect(reasons.get('api')).toBe('already_registered');
+    expect(reasons.get('web')).toBe('branch_conflict');
+    expect(reasons.get('notes')).toBe('not_a_repo');
+    // The refusal is total per repository: `web` was left exactly as it was.
+    expect(await sha(path.join(folder, 'web'), 'refs/heads/blue/dev')).toBeUndefined();
+  });
+
+  it('describe_project fills in what the bulk add deliberately left empty', async () => {
+    const folder = await projectFolder();
+    await callTool('add_projects', { scan: folder });
+    const api = registry.list().find((p) => p.name === 'api');
+    expect(api).toBeDefined();
+
+    const before = await repoFingerprint(path.join(folder, 'api'));
+    const result = await callTool('describe_project', {
+      projectId: api?.id,
+      description: 'the billing API',
+    });
+
+    expect(result.updated.description).toBe('the billing API');
+    expect(registry.get(api?.id ?? '')?.description).toBe('the billing API');
+    // Registry metadata only: not one byte of the repository moved.
+    expect(await repoFingerprint(path.join(folder, 'api'))).toEqual(before);
+  });
+
+  it('refuses a scan that found nothing rather than reporting an empty success', async () => {
+    const empty = path.join(tmpBase, 'empty');
+    await fs.mkdir(empty, { recursive: true });
+
+    await expect(callTool('add_projects', { scan: empty })).rejects.toThrow(/No git repositories/);
+  });
+
+  it('recognises a repository already registered under another spelling', async () => {
+    // A scan of `~/code` and a symlink in `~/work` are the same repository. The
+    // registry stores realpaths precisely so it cannot hold both — the point
+    // here is that the second sighting reports "already registered", the row a
+    // captain reads as normal, instead of a generic failure they have to decode.
+    const folder = await projectFolder();
+    const link = path.join(tmpBase, 'api-link');
+    await fs.symlink(path.join(folder, 'api'), link);
+
+    await callTool('add_projects', { scan: folder });
+    const result = await callTool('add_projects', { paths: [link] });
+
+    expect(result.registered).toBe(0);
+    expect(result.refusals[0].reason).toBe('already_registered');
+    expect(registry.list().filter((p) => p.name === 'api')).toHaveLength(1);
   });
 });
 

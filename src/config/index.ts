@@ -30,3 +30,16 @@ export {
 
 export type { ProjectMatch } from './projects.js';
 export { PROJECTS_FILE, ProjectRegistry, ProjectRegistryError, slugify } from './projects.js';
+
+export type {
+  RegisterDeps,
+  RegisterInput,
+  RegisterOutcome,
+  RegisterRefusal,
+} from './register.js';
+export {
+  findRepositories,
+  isRepositoryRoot,
+  registerProject,
+  registerProjects,
+} from './register.js';

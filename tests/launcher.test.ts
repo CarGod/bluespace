@@ -24,6 +24,7 @@ import * as path from 'node:path';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 
 import {
+  HELM_ALLOWED_TOOLS,
   HELM_DENIED_TOOLS,
   MissingPersonaError,
   WAKE_PROMPT,
@@ -36,6 +37,7 @@ import {
   unclampedRequested,
   wakePrompt,
 } from '../src/cli/bluespace.js';
+import { HELM_TOOL_NAMES } from '../src/agents/helm/index.js';
 import { MIRROR_VOICE, resolveCaptainVoice } from '../src/config/index.js';
 
 // ---------------------------------------------------------------------------
@@ -145,10 +147,11 @@ const BASE = {
   root: '/opt/bluespace',
   systemPromptAppend: '# Helm\nrules',
   deniedTools: ['Bash', 'Edit'],
+  allowedTools: ['mcp__bluespace__list_tasks'],
 };
 
 /** Every flag the launcher injects that swallows following non-flag tokens. */
-const VARIADIC_FLAGS = ['--mcp-config', '--add-dir', '--disallowedTools'] as const;
+const VARIADIC_FLAGS = ['--mcp-config', '--add-dir', '--disallowedTools', '--allowedTools'] as const;
 
 describe('buildHelmArgv', () => {
   it('injects the tools, the contract, the install root and the clamp — and nothing else', () => {
@@ -162,6 +165,8 @@ describe('buildHelmArgv', () => {
       '/opt/bluespace',
       '--disallowedTools',
       'Bash,Edit',
+      '--allowedTools',
+      'mcp__bluespace__list_tasks',
       '--append-system-prompt',
       '# Helm\nrules',
     ]);
@@ -201,8 +206,18 @@ describe('buildHelmArgv', () => {
       { name: 'strict mcp', input: { ...BASE, captainArgs: [], strictMcp: true } },
       { name: 'unclamped', input: { ...BASE, deniedTools: [], captainArgs: [], strictMcp: false } },
       {
-        name: 'full deny list',
-        input: { ...BASE, deniedTools: HELM_DENIED_TOOLS, captainArgs: [], strictMcp: true },
+        name: 'no allow list',
+        input: { ...BASE, allowedTools: [], captainArgs: [], strictMcp: false },
+      },
+      {
+        name: 'full lists',
+        input: {
+          ...BASE,
+          deniedTools: HELM_DENIED_TOOLS,
+          allowedTools: HELM_ALLOWED_TOOLS,
+          captainArgs: [],
+          strictMcp: true,
+        },
       },
       {
         name: 'wake sweep',
@@ -274,6 +289,20 @@ describe('buildHelmArgv', () => {
     expect(argv).not.toContain('');
   });
 
+  it('passes the allow list as ONE comma-joined token, and omits it when empty', () => {
+    const argv = buildHelmArgv({
+      ...BASE,
+      allowedTools: HELM_ALLOWED_TOOLS,
+      captainArgs: [],
+      strictMcp: false,
+    });
+    expect(valueOf(argv, '--allowedTools')).toBe(HELM_ALLOWED_TOOLS.join(','));
+
+    const none = buildHelmArgv({ ...BASE, allowedTools: [], captainArgs: [], strictMcp: false });
+    expect(none).not.toContain('--allowedTools');
+    expect(none).not.toContain('');
+  });
+
   it('puts the opening prompt last, where a positional is read as a prompt', () => {
     const argv = buildHelmArgv({ ...BASE, captainArgs: [], strictMcp: false, openingPrompt: WAKE_PROMPT });
     expect(argv[argv.length - 1]).toBe(WAKE_PROMPT);
@@ -303,14 +332,39 @@ describe('HELM_DENIED_TOOLS', () => {
     }
   });
 
-  it('denies every way to create a worker outside the fleet', () => {
-    // `CLAUDE.md` has always said this. Until now it was a request: the model
-    // could reach the tool, and nothing but its own compliance stopped it.
-    // `Agent` is 2.1.223's name for the subagent launcher; `Task` is the older
-    // one and is still accepted, so both are denied (docs/compliance.md).
-    for (const tool of ['Agent', 'Task', 'Workflow', 'Monitor', 'RemoteTrigger', 'EnterWorktree']) {
+  it('denies the shell under every name, including the one a sub-agent is offered', () => {
+    // `Monitor` runs a shell command as a background process. It is the one that
+    // matters most now that sub-agents are allowed: the probe that measured
+    // propagation saw a sub-agent offered exactly `[Monitor, WebFetch]` when it
+    // went looking for a shell. Denying Bash and leaving that reachable would be
+    // theatre.
+    expect(HELM_DENIED_TOOLS).toContain('Bash');
+    expect(HELM_DENIED_TOOLS, 'Monitor is Bash through a second door').toContain('Monitor');
+  });
+
+  it('denies the delegation this window could not see the end of', () => {
+    // Not "delegation" as a category any more — `Agent` is allowed. These three
+    // are the ones whose workers this window does not clamp, does not wait on,
+    // or cannot reach: a workflow's own scheduler, a routine running on
+    // claude.ai, and a session that has moved itself into a new worktree of the
+    // captain's repository.
+    for (const tool of ['Workflow', 'RemoteTrigger', 'EnterWorktree']) {
       expect(HELM_DENIED_TOOLS, `${tool} creates work the Blackbox never sees`).toContain(tool);
     }
+  });
+
+  it('allows the subagent launcher under BOTH of its names, or neither', () => {
+    // `Agent` is 2.1.223's name and `Task` is the older one, still accepted.
+    // They are ONE lever with two spellings, so a list that splits them either
+    // does nothing (on a build that uses the other name) or denies exactly what
+    // it meant to allow. Whichever way a future edit goes, it must go together.
+    const agent = HELM_DENIED_TOOLS.includes('Agent');
+    const task = HELM_DENIED_TOOLS.includes('Task');
+    expect(agent, 'Agent and Task are the same tool — deny both or neither').toBe(task);
+    // And today: allowed. Helm fans out its own bookkeeping (CLAUDE.md), and
+    // what a sub-agent may do about the captain's code is a rule, not a flag —
+    // what it CAN do is already this list, which it inherits.
+    expect(agent).toBe(false);
   });
 
   it('keeps everything intake and judgement need', () => {
@@ -326,6 +380,49 @@ describe('HELM_DENIED_TOOLS', () => {
     // Nothing namespaced may ever appear here. Helm without `mcp__bluespace__*`
     // is not a safer Helm, it is a model talking about a fleet it cannot see.
     expect(HELM_DENIED_TOOLS.filter((t) => t.startsWith('mcp__'))).toEqual([]);
+  });
+
+  it('still denies every way to produce a diff, which is what makes sub-agents safe', () => {
+    // The load-bearing claim of the whole change: `--disallowedTools` propagates
+    // to sub-agents (measured on 2.1.223 — a sub-agent told to `echo … >
+    // proof.txt` found no shell tool and wrote nothing). So allowing `Agent` is
+    // only safe while this list still contains everything that writes. If a
+    // future edit takes Edit or Write out of it, the fan-out rule in CLAUDE.md
+    // stops being backed by anything.
+    for (const tool of ['Bash', 'Edit', 'Write', 'NotebookEdit']) {
+      expect(HELM_DENIED_TOOLS, `a sub-agent inheriting this list must not have ${tool}`).toContain(
+        tool,
+      );
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The allow list
+// ---------------------------------------------------------------------------
+
+describe('HELM_ALLOWED_TOOLS', () => {
+  it('pre-approves exactly the tools this launcher installed, and nothing else', () => {
+    // A first-run window used to park forever: the wake sweep's first call is
+    // `open_decisions`, an MCP tool the session had never seen, so Claude Code
+    // asked — with nobody having typed anything yet.
+    expect(HELM_ALLOWED_TOOLS).toContain('mcp__bluespace__open_decisions');
+    expect(HELM_ALLOWED_TOOLS).toContain('mcp__bluespace__list_tasks');
+
+    // Every entry is one of ours. Approving a built-in, or another server's
+    // tool, would be BlueSpace choosing a permission posture over something it
+    // did not install — the line src/cli/bluespace.ts draws at the top.
+    for (const tool of HELM_ALLOWED_TOOLS) expect(tool.startsWith('mcp__bluespace__')).toBe(true);
+    expect(HELM_ALLOWED_TOOLS).toHaveLength(HELM_TOOL_NAMES.length);
+  });
+
+  it('names every tool helmTools() actually serves', () => {
+    // A tool added to helmTools() and forgotten here prompts on first use,
+    // months later, in front of whoever calls it first. `helmTools()` throws on
+    // the same disagreement; this is the half that runs without an orchestrator.
+    for (const name of HELM_TOOL_NAMES) {
+      expect(HELM_ALLOWED_TOOLS).toContain(`mcp__bluespace__${name}`);
+    }
   });
 });
 
@@ -537,6 +634,9 @@ describe('runLauncher', () => {
     // Three halves now: the tools, the contract, and the boundary that stops the
     // contract from being a suggestion.
     expect(valueOf(argv, '--disallowedTools')).toBe(HELM_DENIED_TOOLS.join(','));
+    // …and the tools it just installed, marked approved, so the wake sweep below
+    // is a report rather than a permission dialog nobody is there to answer.
+    expect(valueOf(argv, '--allowedTools')).toBe(HELM_ALLOWED_TOOLS.join(','));
     // The greeting is a turn, not chrome: BlueSpace cannot write into Claude
     // Code's welcome box, so a bare `bluespace` asks Helm for the wake sweep.
     expect(argv[argv.length - 1]).toBe(WAKE_PROMPT);
@@ -550,11 +650,15 @@ describe('runLauncher', () => {
     const argv = await h.argv();
     const denied = valueOf(argv, '--disallowedTools').split(',');
     expect(denied).toContain('Bash');
-    expect(denied).toContain('Agent');
+    expect(denied).toContain('Monitor');
     // The argv and the system prompt must agree: they are read by the same
     // model, and a disagreement between them is the model's to resolve.
     const prompt = valueOf(argv, '--append-system-prompt');
     for (const tool of denied) expect(prompt).toContain(tool);
+    // And the prompt has to say the one thing the flag cannot: that a sub-agent
+    // inherits this list. A model that assumes otherwise either refuses to fan
+    // out at all, or fans out expecting a diff back.
+    expect(prompt).toMatch(/propagates to every sub-agent/i);
   });
 
   it('hands the tools back on BLUESPACE_UNCLAMPED, and stops claiming otherwise', async () => {
@@ -564,6 +668,10 @@ describe('runLauncher', () => {
     const argv = await h.argv();
     expect(argv).not.toContain('--disallowedTools');
     expect(valueOf(argv, '--append-system-prompt')).toContain('BLUESPACE_UNCLAMPED=1');
+    // The allow list is not part of the clamp and does not come off with it: an
+    // unclamped window has the same tools from the same server and should not
+    // open on a dialog either.
+    expect(valueOf(argv, '--allowedTools')).toBe(HELM_ALLOWED_TOOLS.join(','));
   });
 
   it('reproduces the window’s exit code instead of flattening it', async () => {

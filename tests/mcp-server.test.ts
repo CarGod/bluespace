@@ -318,6 +318,8 @@ describe('tools/list', () => {
       'land_task',
       'delivery_status',
       'add_project',
+      'add_projects',
+      'describe_project',
       'remove_project',
     ]);
 

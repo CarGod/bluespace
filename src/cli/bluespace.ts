@@ -34,6 +34,9 @@
  *                                 compliance doc, and its own source.
  *   `--disallowedTools <list>`    the boundary, enforced rather than requested —
  *                                 see `HELM_DENIED_TOOLS` below.
+ *   `--allowedTools <list>`       the tools this launcher just installed, marked
+ *                                 as approved, so the opening turn is not a
+ *                                 permission dialog — see `HELM_ALLOWED_TOOLS`.
  *
  * and a plain `claude` keeps none of it. That is the whole product decision:
  * `bluespace` is Helm, `claude` is Claude Code, and neither leaks into the other.
@@ -71,12 +74,14 @@
  * terminal, with their own settings, hooks, model and permission posture, and
  * the launcher does not swap those out for narrower ones of its choosing.
  *
- * `--disallowedTools` is the one exception, and it is not a smaller version of
- * that list — it is a different kind of thing. Those four flags change how the
- * captain's own work is done. This one says which agent the window is. A Helm
- * that can edit their code is not a stricter Helm or a looser Helm; it is the
- * thing BlueSpace was built to replace, wearing Helm's name.
- * `BLUESPACE_UNCLAMPED=1` gives it back, with both eyes open.
+ * The two exceptions are both about BlueSpace's OWN tool surface, which is why
+ * they are exceptions and `--permission-mode` is not. `--disallowedTools` says
+ * which agent the window is: a Helm that can edit the captain's code is not a
+ * stricter or looser Helm, it is the thing BlueSpace was built to replace
+ * wearing Helm's name (`BLUESPACE_UNCLAMPED=1` gives it back, with both eyes
+ * open). `--allowedTools` says that the tools this command just installed are
+ * approved — see `HELM_ALLOWED_TOOLS`. Neither touches the captain's posture
+ * over a single tool that was in the window before `bluespace` ran.
  *
  * `--strict-mcp-config` is the one flag in that family with a real argument for
  * it, and it is opt-in for the same reason — see `strictMcpRequested`.
@@ -94,6 +99,7 @@ import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { ClaudeCliUnavailableError, resolveClaudeBinary } from '../adapters/claude-cli.js';
+import { HELM_TOOL_NAMES } from '../agents/helm/index.js';
 import {
   LOCALE_ENV_VARS,
   MIRROR_VOICE,
@@ -298,12 +304,20 @@ through \`mcp__bluespace__create_task\`, which is the only route that comes with
 a Sentinel, a ceiling and a record.
 
 You keep everything intake and judgement need: Read, Glob and Grep over the captain's code,
-the web tools, and every \`mcp__*\` tool including your own.`
+the web tools, every \`mcp__*\` tool including your own, and sub-agents.
+
+**That list above propagates to every sub-agent you spawn** — measured, not assumed. A
+sub-agent of yours has no Bash, no Edit, no Write. It cannot produce a diff and it cannot
+run a command, so the only thing it can hand back is text. That is what makes fanning out
+safe, and it is also exactly why the rule in the contract still binds: a sub-agent could
+never have made the change, but it could have produced *the answer about their code*, and
+that is a recon task. Fan out on your own bookkeeping; dispatch everything about theirs.`
       : `This window was opened with \`BLUESPACE_UNCLAMPED=1\`, so the boundary above is only a rule
-you are choosing to keep — Bash, Edit and the native delegation tools are all present. The
-captain asked for that; it does not change what you do. Reaching one of them for their
-project work still produces exactly the thing the rule describes: work with no worktree, no
-Sentinel, no ceiling, nothing in \`blue ps\` and no record in the Blackbox.`;
+you are choosing to keep — Bash, Edit and everything else are present, in this window and in
+any sub-agent you spawn. The captain asked for that; it does not change what you do.
+Reaching one of them for their project work still produces exactly the thing the rule
+describes: work with no worktree, no Sentinel, no ceiling, nothing in \`blue ps\` and no
+record in the Blackbox.`;
 
   return `${persona.trimEnd()}
 
@@ -348,16 +362,49 @@ craft the rules above assume you already have.
 /**
  * The tools a Helm window does not get, and the argument for each one.
  *
- * TWO QUESTIONS DECIDE THE LIST, and nothing else does:
+ * ONE QUESTION DECIDES THE LIST, and it is not the one it used to be:
  *
- *   1. Does it let Helm do the captain's project work itself?
- *   2. Does it let Helm create a worker outside the fleet?
+ *   Can this tool produce a change to the captain's repository, or run a
+ *   command in it — directly, or through anything it starts?
  *
- * A "yes" to either is a way to produce work with no worktree, no Sentinel, no
- * ceiling, no Blackbox event and no row in `blue ps`. Everything else stays, and
- * the things that stay matter as much as the things that go — Helm has to read a
- * repository to route a request and to write a brief a stranger could execute,
- * and it reads linked issues and pasted URLs during intake.
+ * A "yes" is a way to produce work with no worktree, no Sentinel, no ceiling, no
+ * Blackbox event and no row in `blue ps`. Everything else stays, and the things
+ * that stay matter as much as the things that go — Helm has to read a repository
+ * to route a request and to write a brief a stranger could execute, and it reads
+ * linked issues and pasted URLs during intake.
+ *
+ * WHY `Agent` CAME BACK, AND WHY THAT IS NOT A HOLE.
+ *
+ * The previous list denied the subagent launcher outright, on the argument that
+ * a subagent is "a worker outside the fleet". Measured on 2.1.223, that argument
+ * was resting on something better than itself: **`--disallowedTools` propagates
+ * to sub-agents.** A window launched with `--disallowedTools Bash Edit Write`
+ * spawned a sub-agent and told it to `echo … > proof.txt`; the sub-agent's own
+ * transcript shows it calling `ToolSearch` for a shell tool and getting back
+ * `[Monitor, WebFetch]` — no Bash — and `proof.txt` was never written.
+ *
+ * So a Helm sub-agent inherits this whole list. It cannot edit a file, cannot
+ * run a command, cannot commit and cannot spawn anything that can. Whatever it
+ * is asked to do, the deliverable it can physically produce is text handed back
+ * to Helm — which is the same thing Helm's own Read/Glob/Grep produce, only in
+ * parallel and without spending the captain's context.
+ *
+ * That splits the question cleanly, and the split is the whole point:
+ *
+ *   THE CLAMP DECIDES WHAT IS POSSIBLE. Nothing in this window, or under it,
+ *   can produce a diff or run a command. That is enforced and it is not
+ *   negotiable by prose.
+ *
+ *   THE PROSE DECIDES WHAT IS APPROPRIATE. `CLAUDE.md` still says that anything
+ *   which produces a change to the captain's code, or the answer they asked
+ *   about their code, is a task — never a sub-agent. A sub-agent could not have
+ *   made the change anyway; it could have produced the *answer*, and that rule
+ *   is what stops it, exactly as it stops Helm reading four files itself.
+ *
+ * `Monitor` stays denied for the same measurement: it was in the list offered to
+ * that sub-agent, and it runs a shell command as a background process. Denying
+ * Bash while leaving Monitor reachable — from the window or from anything it
+ * spawns — would be theatre.
  *
  * WHY `--disallowedTools` AND NOT `--tools`. `--tools Read,Glob,Grep` looks like
  * the tighter, more obviously correct clamp. It is unusable: measured on 2.1.223,
@@ -371,8 +418,11 @@ craft the rules above assume you already have.
  *
  * NAMES ARE READ OFF THIS MACHINE, NOT GUESSED. A session was asked to list its
  * own tools: on 2.1.223 the subagent launcher reports itself as `Agent`, not
- * `Task`. Both are listed anyway, because `Task` is still a name this build
- * accepts and a rename in either direction must not quietly unclamp the window.
+ * `Task`. Neither is on this list any more, and the rule that mattered while they
+ * were survives the reversal — they are one lever with two accepted spellings, so
+ * a future edit puts BOTH back or neither. Splitting them either does nothing or
+ * clamps exactly what it meant to leave alone, depending on which name the build
+ * of the day uses.
  *
  * EVERY ENTRY MUST BE A NAME THIS BUILD KNOWS. An unrecognised one is not
  * silently ignored — it prints `Permission deny rule "X" matches no known tool —
@@ -397,22 +447,30 @@ export const HELM_DENIED_TOOLS: readonly string[] = [
   'Write',
   'NotebookEdit',
 
-  // -- Creating a worker outside the fleet -------------------------------------
+  // -- Running a command by another name ---------------------------------------
   //
-  // `Agent` is what 2.1.223 calls the subagent launcher; `Task` is the same
-  // lever's older name and is still accepted. Work made this way is invisible to
-  // `blue ps` and to the Blackbox and dies with the window. This is the rule
-  // `CLAUDE.md` already stated and had no way to enforce.
-  'Agent',
-  'Task',
-  // "Execute a workflow script that orchestrates multiple subagents
-  // deterministically" — the same hole, at fleet scale, with its own scheduler.
-  'Workflow',
   // Runs a shell command as a background process and streams its stdout. It is
   // Bash through a second door, and denying Bash without it would be theatre.
+  // Measured to be among the tools a sub-agent is still offered, which is what
+  // makes leaving it here load-bearing rather than tidy.
   'Monitor',
+
+  // -- Delegation this window cannot see the end of ----------------------------
+  //
+  // "Execute a workflow script that orchestrates multiple subagents
+  // deterministically" — its own scheduler, dozens of agents, none of them a
+  // turn Helm is waiting on. Two reasons it stays denied where `Agent` does not.
+  // First, nothing Helm does needs it: fanning out reads to fill in fleet
+  // metadata is a handful of parallel sub-agents in one turn, not a program.
+  // Second, the propagation result above was measured for a sub-agent spawned by
+  // `Agent`; a workflow's own spawn path was not, and a misfire on a
+  // subscription is quota — real, uncapped and invisible until the plan says no.
+  // A capability with no use and an unmeasured blast radius is not a close call.
+  'Workflow',
   // Creates and runs routines on claude.ai. Delegation that is not even on this
-  // machine, so `blue ps` could not see it even in principle.
+  // machine, so neither `blue ps` nor the clamp above could reach it in
+  // principle: a routine there is not a sub-agent of this window and inherits
+  // nothing from it.
   'RemoteTrigger',
   // Creates a git worktree on a new branch inside the captain's repository and
   // moves the session into it. Two faults: it writes to their repo, and it is a
@@ -421,6 +479,13 @@ export const HELM_DENIED_TOOLS: readonly string[] = [
 
   // -- Deliberately NOT denied, since the next reader will ask -------------------
   //
+  // Agent / Task — the subagent launcher, under 2.1.223's name and its older
+  //   one. BOTH or NEITHER: they are one lever with two accepted spellings, so a
+  //   list that allows `Agent` and denies `Task` either does nothing (this
+  //   build) or denies exactly what it meant to allow (a build that renames it
+  //   back). Allowing them is what lets Helm answer in one turn instead of ten —
+  //   see `CLAUDE.md`, "fan out". What a sub-agent may be asked to do is a rule,
+  //   not a flag, because what it CAN do is already this list.
   // Read / Glob / Grep — Helm cannot route a request or write a brief blind.
   //   This is also why the boundary needed a new RULE and not just a longer deny
   //   list: reading is legitimate right up to the moment it becomes the answer,
@@ -432,10 +497,58 @@ export const HELM_DENIED_TOOLS: readonly string[] = [
   // TaskCreate / TaskUpdate / TaskList / TaskGet — the session's own to-do list,
   //   bookkeeping with no process behind it. Not to be confused with
   //   `mcp__bluespace__create_task`, which is the real one.
-  // TaskStop / SendMessage — they reach an existing worker and cannot start one;
-  //   with Bash, Agent, Workflow, Monitor and RemoteTrigger denied, no worker
-  //   they could reach can exist in this window in the first place.
+  // TaskStop / SendMessage — they reach an existing worker and cannot start one.
 ];
+
+/**
+ * The tools this launcher installed, marked approved for the window it installed
+ * them in — `mcp__bluespace__list_tasks` and its twelve siblings, by name.
+ *
+ * THE BUG THIS FIXES. A first-run `bluespace` parked forever. The wake sweep's
+ * very first call is `open_decisions`, an MCP tool the session has never seen, so
+ * Claude Code asked for permission — and nothing had typed anything into that
+ * window yet, so the dialog sat there with the captain looking at an empty
+ * report. Every claim about the opening turn ("a turn, not a banner", and the
+ * only honest proof the wiring works) was false for every new user; the machine
+ * this was written on only worked because its captain had approved the tools
+ * months earlier and the approval was remembered.
+ *
+ * WHY THIS AND NOT `--permission-mode`. `auto` would also clear the dialog, and
+ * it would clear it for `WebFetch`, for the captain's own MCP servers, and for
+ * everything else in the window — a posture BlueSpace would be choosing on their
+ * behalf over tools it did not install. That is precisely the line the flag list
+ * at the top of this file draws. Naming our own thirteen tools changes nothing
+ * about how the captain's own tools behave, and it is deterministic where a
+ * classifier is not (`docs/compliance.md`: "auto usually does not prompt —
+ * usually"). `bypassPermissions` is worse again: a modal only a human can
+ * dismiss, and dismissing it writes a permanent machine-wide flag.
+ *
+ * WHY IT IS NOT A LOOSENING. The captain typed `bluespace`. That command's
+ * entire content is "open a window with these tools and these rules" — consenting
+ * to the command is consenting to its levers, and a dialog asking again is asking
+ * about the thing they just ran, at the one moment they cannot answer it. What is
+ * approved here is exactly what `--mcp-config` put there and nothing else: no
+ * built-in, no other server, and nothing persisted — the flag lives for one
+ * invocation, unlike the approval a captain clicks through.
+ *
+ * `land_task` is on the list, and that is the one worth defending. It writes a
+ * commit — but the dialog was never what protected the captain from it. It
+ * refuses anything unverified, any recon and any conflict on its own; it cannot
+ * reach `main`; and `CLAUDE.md` gates it on the captain having said to land that
+ * task. A prompt that fires immediately after they said "合并吧" asks them to
+ * confirm their own sentence.
+ *
+ * NAMES COME FROM THE TOOL DEFINITIONS, not from a list retyped here — a tool
+ * added to `helmTools()` and forgotten here would prompt on first use, months
+ * later, in front of whoever happened to be the first to call it.
+ * `tests/helm.test.ts` freezes the two together.
+ */
+export const HELM_ALLOWED_TOOLS: readonly string[] = HELM_TOOL_NAMES.map(
+  // The prefix Claude Code gives a tool is `mcp__<config key>__<tool>`, and the
+  // config key is `MCP_SERVER_NAME` — the same constant `helmMcpConfig` keys the
+  // server with, so renaming it cannot leave these pointing at nothing.
+  (name) => `mcp__${MCP_SERVER_NAME}__${name}`,
+);
 
 /**
  * Hand the window back unclamped, for a captain who means it.
@@ -535,6 +648,8 @@ export interface HelmLaunchInput {
   strictMcp: boolean;
   /** Tools the window must not have. Empty only when deliberately unclamped. */
   deniedTools: readonly string[];
+  /** Tools pre-approved for this window: BlueSpace's own, and nothing else. */
+  allowedTools: readonly string[];
   /** The opening turn, or undefined for a window that waits. */
   openingPrompt?: string | undefined;
 }
@@ -547,10 +662,10 @@ export interface HelmLaunchInput {
  * invisible at the call site and a reader "tidying" it would break the product
  * in a way no type checks.
  *
- * THE ORDERING RULE. `--mcp-config <configs...>`, `--add-dir <directories...>`
- * and `--disallowedTools <tools...>` are all VARIADIC: they swallow every
- * following token that does not start with `-`, including the captain's prompt.
- * Measured on 2.1.223:
+ * THE ORDERING RULE. `--mcp-config <configs...>`, `--add-dir <directories...>`,
+ * `--disallowedTools <tools...>` and `--allowedTools <tools...>` are all
+ * VARIADIC: they swallow every following token that does not start with `-`,
+ * including the captain's prompt. Measured on 2.1.223:
  *
  *     claude -p --add-dir /some/dir "reply OK"
  *       -> Error: Input must be provided ... when using --print   (prompt eaten)
@@ -590,6 +705,11 @@ export function buildHelmArgv(input: HelmLaunchInput): string[] {
   // Empty means BLUESPACE_UNCLAMPED — pass no flag rather than an empty value,
   // which the variadic would fill from the next token.
   if (input.deniedTools.length > 0) argv.push('--disallowedTools', input.deniedTools.join(','));
+
+  // Same shape, same reason. A deny rule beats an allow rule, so these two lists
+  // cannot fight even if a later edit puts a name in both — and today they are
+  // disjoint by construction: one is built-ins, the other is `mcp__bluespace__*`.
+  if (input.allowedTools.length > 0) argv.push('--allowedTools', input.allowedTools.join(','));
 
   argv.push('--append-system-prompt', input.systemPromptAppend); // must stay last
 
@@ -750,6 +870,9 @@ export async function runLauncher(
     captainArgs,
     strictMcp: strictMcpRequested(env),
     deniedTools: deniedTools(env),
+    // Not conditioned on the clamp. An unclamped window still has the same
+    // thirteen tools from the same server, and still should not open on a dialog.
+    allowedTools: HELM_ALLOWED_TOOLS,
     openingPrompt: wake,
   });
 

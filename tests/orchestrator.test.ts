@@ -34,6 +34,7 @@ import { UnsupportedCapabilityError } from '../src/adapters/types.js';
 import { Blackbox } from '../src/blackbox/index.js';
 import type { BlueConfig, ProjectRegistry } from '../src/config/index.js';
 import {
+  CrewNotHeldError,
   Orchestrator,
   assertTransition,
   canTransition,
@@ -391,6 +392,31 @@ function harness(
 
   open = { bb, orch, adapter, worktrees, project: merged, verdicts, sentinelRuns, errors };
   return open;
+}
+
+/**
+ * A second Orchestrator over the same Blackbox — what a separate `blue` process
+ * is, exactly: every task readable, not one live session handle.
+ *
+ * It shares the log because that is the point (state is a projection, and both
+ * processes project the same one) and shares nothing else, because `#live` is
+ * per-instance and unprojectable, which is the whole reason the gap exists.
+ */
+function coldOrchestrator(h: Harness): Orchestrator {
+  return new Orchestrator({
+    blackbox: h.bb,
+    adapter: new FakeAdapter(),
+    config: {
+      permissionMode: 'auto',
+      maxTokensPerTask: 100_000_000,
+      maxBudgetUsdPerTask: 25,
+      maxConcurrentCrew: 4,
+      maxRework: 2,
+      dataDir: DATA_DIR,
+    },
+    registry: fakeRegistry([h.project]),
+    worktreeFor: () => h.worktrees as unknown as WorktreeManager,
+  });
 }
 
 afterEach(() => {
@@ -1046,6 +1072,65 @@ describe('cancelTask', () => {
     await h.orch.cancelTask(task.id);
     expect(stateOf(h, task.id)).toBe('cancelled');
     expect(h.adapter.spawns).toHaveLength(0);
+  });
+
+  /**
+   * The cross-process half, which is what `blue cancel` runs into every time.
+   *
+   * A second Orchestrator over the SAME log is exactly what a separate `blue`
+   * process is: it can read every task, and it holds no session handle for any
+   * of them. Cancelling from there used to write `cancelled` into the log and
+   * stop — the Crew kept running, its worktree stayed, and `blue ps` reported
+   * the whole thing as over.
+   */
+  it('refuses to cancel a Crew this process does not hold, and changes nothing', async () => {
+    const h = harness();
+    const task = newTask(h);
+    await h.orch.tick();
+    const crew = h.adapter.crewFor(task.id);
+
+    const cold = coldOrchestrator(h);
+    expect(cold.holdsCrew(task.id)).toBe(false);
+    await expect(cold.cancelTask(task.id)).rejects.toBeInstanceOf(CrewNotHeldError);
+
+    // Nothing moved: not the state, not the session, not the worktree.
+    expect(stateOf(h, task.id)).toBe('working');
+    expect(crew.interrupted).toBe(false);
+    expect(crew.closed).toBe(false);
+    expect(h.worktrees.removed).toHaveLength(0);
+
+    // And the process that DOES hold it still can.
+    await h.orch.cancelTask(task.id);
+    expect(stateOf(h, task.id)).toBe('cancelled');
+  });
+
+  it('lets any process cancel a task that never had a Crew', async () => {
+    // The common case for `blue cancel`: a queued task the captain changed their
+    // mind about. Nothing was spawned, so there is nothing to fail to stop, and
+    // refusing here would be caution with no failure behind it.
+    const h = harness({ maxConcurrentCrew: 0 });
+    const task = newTask(h);
+    await h.orch.tick();
+
+    await coldOrchestrator(h).cancelTask(task.id);
+    expect(stateOf(h, task.id)).toBe('cancelled');
+  });
+
+  it('records a forced cancellation without pretending it tore anything down', async () => {
+    // The escape hatch for a fleet process that died holding the handle. It
+    // records the cancellation and does nothing else — the session it cannot
+    // reach is untouched and the worktree is left for `blue gc` to judge.
+    const h = harness();
+    const task = newTask(h);
+    await h.orch.tick();
+    const crew = h.adapter.crewFor(task.id);
+
+    await coldOrchestrator(h).cancelTask(task.id, { force: true });
+
+    expect(stateOf(h, task.id)).toBe('cancelled');
+    expect(crew.interrupted).toBe(false);
+    expect(crew.closed).toBe(false);
+    expect(h.worktrees.removed).toHaveLength(0);
   });
 
   /**

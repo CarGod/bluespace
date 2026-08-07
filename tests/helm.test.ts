@@ -15,7 +15,7 @@
 import { describe, expect, it } from 'vitest';
 
 import type { ToolDef } from '../src/adapters/types.js';
-import { helmTools } from '../src/agents/helm/index.js';
+import { HELM_TOOL_NAMES, helmTools } from '../src/agents/helm/index.js';
 import type { Blackbox } from '../src/blackbox/index.js';
 import type { ProjectRegistry } from '../src/config/index.js';
 import type { Orchestrator } from '../src/orchestrator/index.js';
@@ -184,8 +184,21 @@ describe('helmTools — shape', () => {
       'land_task',
       'delivery_status',
       'add_project',
+      'add_projects',
+      'describe_project',
       'remove_project',
     ]);
+  });
+
+  /**
+   * The launcher pre-approves these tools by name so a first-run window opens on
+   * a report rather than a permission dialog (`HELM_ALLOWED_TOOLS`). It has no
+   * orchestrator, so it cannot build a tool surface and read the names off — it
+   * reads `HELM_TOOL_NAMES`. A tool added here and forgotten there would prompt
+   * on first use, months later, in front of whoever called it first.
+   */
+  it('agrees with the name list the launcher pre-approves', () => {
+    expect(list.map((t) => t.name)).toEqual([...HELM_TOOL_NAMES]);
   });
 
   /**
@@ -216,6 +229,37 @@ describe('helmTools — shape', () => {
     expect(add?.description).toMatch(/in place/i);
     expect(remove?.description).toMatch(/DELETES NOTHING/);
     expect(remove?.description).toMatch(/left exactly as they are/i);
+  });
+
+  /**
+   * Two tools that do the same thing differ only by their trigger clauses, and a
+   * model picks by those. The measured failure is the loop: eight `add_project`
+   * calls for one "add everything in this folder", ninety seconds of waiting.
+   */
+  it('points the single-repo tool at the bulk one, and the bulk one away from descriptions', () => {
+    const one = list.find((t) => t.name === 'add_project');
+    const many = list.find((t) => t.name === 'add_projects');
+
+    expect(one?.description).toMatch(/add_projects/);
+    expect(one?.description).toMatch(/never call this one in a loop/i);
+
+    expect(many?.description).toMatch(/more than one repository/i);
+    expect(many?.description).toMatch(/DESCRIPTIONS ARE NOT REQUIRED/);
+    // The scan's one real limit, stated where the model reads it: a deep walk
+    // would register vendored checkouts nobody asked to manage.
+    expect(many?.description).toMatch(/does not recurse/i);
+  });
+
+  /**
+   * A task marked cancelled while its Crew keeps working is the one failure the
+   * captain cannot see from the outside, so the refusal has to be in the
+   * description — a model that retries or reports success has already lost it.
+   */
+  it('warns that cancel_task refuses a Crew held by another process', () => {
+    const cancel = list.find((t) => t.name === 'cancel_task');
+    expect(cancel?.description).toMatch(/REFUSES/);
+    expect(cancel?.description).toMatch(/different process/i);
+    expect(cancel?.description).toMatch(/changing nothing/i);
   });
 
   it('describes every tool prescriptively — what it does AND when to call it', () => {
@@ -259,6 +303,10 @@ describe('helmTools — shape', () => {
     expect(required('land_task')).toEqual(['taskId']);
     expect(required('delivery_status')).toEqual([]); // every project by default
     expect(required('add_project')).toEqual(['path']);
+    // Neither paths nor scan is required on its own — either will do, and the
+    // handler refuses when both are absent with a message naming both.
+    expect(required('add_projects')).toEqual([]);
+    expect(required('describe_project')).toEqual(['description', 'projectId']);
     expect(required('remove_project')).toEqual(['projectId']);
   });
 

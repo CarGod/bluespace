@@ -96,6 +96,7 @@ for the CLI, and they check before they accept any work.
 ```bash
 # 1. Tell BlueSpace where your code lives. It references repos in place and never moves them.
 blue projects add ~/code/api --desc "payments API, Go, deploys from main"
+blue projects add --scan ~/code    # …or register everything in there at once
 
 # 2. Open a window that IS Helm. In any repo. Nothing to install, nothing registered.
 bluespace
@@ -116,26 +117,39 @@ blue inbox               # read the queue from anywhere; answer in the window fr
 
 ### `bluespace` vs `claude`
 
-`bluespace` is a launcher, not a fork: it runs **your** `claude` with three things added
+`bluespace` is a launcher, not a fork: it runs **your** `claude` with four things added
 for that one invocation — the BlueSpace MCP server (`--mcp-config`, inline), Helm's
-operating contract from `CLAUDE.md` (`--append-system-prompt`), and a deny list that keeps
-Helm on the dispatching side of the line (`--disallowedTools`). Nothing is written to
-`~/.claude.json`, nothing is registered, and deleting the binary removes every trace.
-Plain `claude` stays plain: no BlueSpace tools, no BlueSpace rules, in any directory.
+operating contract from `CLAUDE.md` (`--append-system-prompt`), a deny list that keeps
+Helm on the dispatching side of the line (`--disallowedTools`), and those same MCP tools
+marked approved so the first turn is a report rather than a permission dialog
+(`--allowedTools`). Nothing is written to `~/.claude.json`, nothing is registered, and
+deleting the binary removes every trace. Plain `claude` stays plain: no BlueSpace tools, no
+BlueSpace rules, in any directory. Your own permission posture is untouched — the only
+tools pre-approved are the ones that command just installed.
 
 It passes your arguments straight through and returns the session's exit code, so
 `bluespace --model opus`, `bluespace --continue`, and `bluespace "开始吧"` all work.
 
-**A Helm window has no Bash, no Edit and no subagents.** It has Read, Glob, Grep, the web
-tools and every MCP tool you or BlueSpace gave it — enough to read your repository, work
-out which project a request belongs to, and write a brief a stranger could execute. It does
-not have the tools to do the work, and that is the point rather than a limitation: the
-failure this prevents is Helm quietly answering "check whether this bug is real and fix it"
-by grepping through your code itself. That investigation looks like it worked. It has no
-worktree, no Sentinel, no token ceiling, nothing in `blue ps`, no record in the Blackbox,
-and it is gone when the window closes — which is every property you opened a fleet to get.
-Prose in `CLAUDE.md` could not stop it, because reading a repository with `grep` really is
-read-only. `BLUESPACE_UNCLAMPED=1` hands the tools back if you want them.
+**A Helm window has no Bash, no Edit and no Write — and neither does anything it
+spawns.** It has Read, Glob, Grep, the web tools, every MCP tool you or BlueSpace gave it,
+and sub-agents — enough to read your repository, work out which project a request belongs
+to, and write a brief a stranger could execute. It does not have the tools to do the work,
+and that is the point rather than a limitation: the failure this prevents is Helm quietly
+answering "check whether this bug is real and fix it" by grepping through your code itself.
+That investigation looks like it worked. It has no worktree, no Sentinel, no token ceiling,
+nothing in `blue ps`, no record in the Blackbox, and it is gone when the window closes —
+which is every property you opened a fleet to get. Prose in `CLAUDE.md` could not stop it,
+because reading a repository with `grep` really is read-only.
+`BLUESPACE_UNCLAMPED=1` hands the tools back if you want them.
+
+**Sub-agents are allowed, and the deny list is why.** Measured on 2.1.223,
+`--disallowedTools` propagates: a sub-agent of a Helm window has no shell and no editor
+either, so the only thing it can hand back is text. That makes it safe for Helm to fan out
+its *own* work — reading twenty repositories to fill in what each one is, comparing briefs,
+summarising across tasks — in one turn instead of twenty. It does not make it a way to
+answer questions about your code: that is still a recon task, with a worktree and a record,
+and `CLAUDE.md` is what draws that line. The clamp decides what is possible; the contract
+decides what is appropriate.
 
 A bare `bluespace` opens on Helm's **wake sweep** — what needs you, what came back,
 what is still running — instead of an empty prompt. BlueSpace cannot paint Claude Code's
@@ -192,10 +206,10 @@ Stated plainly, because these are the claims people assume:
   passed it; a recon has no diff to grade, so it lands on its report with nothing
   checking it. Merging it is a separate act, and yours to ask for.
 - **Helm never writes your code, and no longer merely promises not to.** The `bluespace`
-  launcher denies the window `Bash`, `Edit`, `Write`, `NotebookEdit` and the native
-  subagent tools, so the levers are absent rather than discouraged. `CLAUDE.md` still
-  states the rule — a model surprised by a missing tool argues with you about it — but the
-  rule is not what holds.
+  launcher denies the window `Bash`, `Edit`, `Write` and `NotebookEdit` — and every
+  sub-agent it spawns inherits that, measured — so the levers are absent rather than
+  discouraged. `CLAUDE.md` still states the rule — a model surprised by a missing tool
+  argues with you about it — but the rule is not what holds.
 
   Be clear about what that is and is not. It is a flag on your own `claude`, not a
   sandbox: it removes tools, and `BLUESPACE_UNCLAMPED=1` puts them back. What it cannot
@@ -251,7 +265,8 @@ blue mcp                      serve Helm's tools over stdio — `bluespace` star
 
 blue inbox                    read the decisions waiting on you  ← start here
       --list                  render only, do not prompt
-blue ps                       what the fleet is doing, and how to watch a worker
+blue ps                       what is in flight, plus what finished in the last day
+      -a, --all               every task ever — the log keeps them all
 blue log <taskId>             replay one task's events from the Blackbox
       -f, --follow            keep streaming new events
       --limit <n>             show only the last n events
@@ -259,13 +274,17 @@ blue map                      start the Starmap server and print its URL (defaul
       --port <n>              port to listen on
       --orchestrate           also run the dispatch loop
 blue land <taskId>            merge a verified task into blue/dev — never into main
+blue cancel <taskId>          end a task, stop its Crew, remove its worktree
+      --force                 record it anyway when no Crew is held here — see below
 blue gc                       reclaim finished tasks' worktrees whose work is merged
       -n, --dry-run           report what it would reclaim, change nothing
       --force                 take unmerged and dirty ones too — lists them, then asks
       -y, --yes               skip that question (the only way to force non-interactively)
 blue projects                 list registered projects
-blue projects add <path>      register a repo
-      --name X --desc Y --delivery pr|local   (delivery is metadata; default pr)
+blue projects add <path…>     register one repo, or several
+      --scan <dir>            register every repo directly inside <dir> (one level)
+      --name X --desc Y       one repo at a time; refused for a batch
+      --delivery pr|local     (metadata; default pr)
 blue projects rm <id>         forget a project
 blue config                   print the effective config and where it lives
 blue config set <k> <v>       change one setting (validated)
@@ -276,9 +295,11 @@ blue config set <k> <v>       change one setting (validated)
 
 BLUESPACE_STRICT_MCP=1        (bluespace) load only BlueSpace's MCP server, drop your own
 BLUESPACE_NO_WAKE=1           (bluespace) open silently instead of on a wake sweep
-BLUESPACE_UNCLAMPED=1         (bluespace) give Helm back Bash/Edit/subagents — it can then
-                              do the work itself, with no worktree, no Sentinel, no token
+BLUESPACE_UNCLAMPED=1         (bluespace) give Helm back Bash/Edit/Write — it can then do
+                              the work itself, with no worktree, no Sentinel, no token
                               ceiling, nothing in `blue ps` and no record in the Blackbox
+                              (Helm has sub-agents either way; clamped, they inherit the
+                              same denials and cannot write a file or run a command)
 CLAUDE_CLI_PATH               point at a `claude` that is not on PATH
 ```
 
@@ -298,6 +319,16 @@ process that dispatched it holds that handle — `blue mcp`, or `blue map --orch
 So the ordinary way to answer is to tell Helm, in the window from step 2. `blue inbox`
 reads the queue from anywhere; if you try to answer from a terminal that is not running
 the fleet, it says so and leaves the decision open rather than pretending.
+
+**Cancelling has the same shape, for the same reason.** `blue cancel <taskId>` ends a task,
+stops its Crew and removes its worktree — when this process is the one holding that Crew.
+When it is not, it refuses and tells you where to cancel instead, because the alternative
+is writing `cancelled` into the log while the Crew keeps running: a task that looks over,
+is not, and is still spending your quota. A task that never dispatched has no Crew to
+stop, so cancelling it works from anywhere. `blue cancel <taskId> --force` is for the case
+the refusal cannot help with — the fleet process died holding the handle — and it does
+exactly one thing: records the cancellation. It stops nothing and deletes nothing, and it
+says so.
 
 ---
 

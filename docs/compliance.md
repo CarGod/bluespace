@@ -126,14 +126,24 @@ Everything here was checked empirically, not inferred.
 | | |
 | --- | --- |
 | Claude Code | **2.1.222** — full sweep, live runs included |
-| | **2.1.223** — flag surface only, re-checked 2026-08-05 |
-| Date | **2026-08-04** |
+| | **2.1.223 / 2.1.224** — flag surface, plus the live probes below, 2026-08-06 |
+| Date | **2026-08-04**, extended 2026-08-06 |
 | Platform | macOS (darwin 25.5.0), tmux 3.7b |
 
-**Read that second row carefully.** On 2.1.223 only the free half of
+The build moved from 2.1.223 to 2.1.224 partway through that second session — the
+CLI updates itself — and every probe below behaved identically on both. Where one
+version is named, that is the build the probe ran on, not a claim about the other.
+
+**Read that second row carefully.** On 2.1.223 the free half of
 `tests/compliance-smoke.test.ts` was re-run: every flag BlueSpace passes still
-exists, and `--permission-mode` still offers `auto` and `dontAsk`. That catches
+exists, `--permission-mode` still offers `auto` and `dontAsk`, and
+`--allowedTools` / `--disallowedTools` both still take `<tools...>`. That catches
 a renamed or deleted flag, which is the likeliest regression — and nothing else.
+Live probes were also run and are written up under "The `bluespace` launcher":
+that `--disallowedTools` propagates to sub-agents, what a sub-agent is offered
+when it goes looking for a shell, and that `--allowedTools` is what keeps a
+first-run window off a permission dialog.
+
 The behaviours below that no flag list can prove (a positional prompt submitting
 itself, `auto` editing without a dialog, hooks firing on the schedule the adapter
 waits for) were **not** re-measured on 2.1.223. Run
@@ -268,7 +278,8 @@ Glob, Grep, and Read", and `mcp__bluespace__list_projects` was gone despite
 
 **`--disallowedTools` is the one that works.** Probed in the launcher's own
 shape, denying `Bash,Edit,Write,NotebookEdit,Agent,Task,Workflow,Monitor,
-RemoteTrigger,EnterWorktree`: the session listed `Glob, Grep, Read, WebFetch,
+RemoteTrigger,EnterWorktree` — the list as it stood then; `Agent` and `Task` came
+off it later, see below — the session listed `Glob, Grep, Read, WebFetch,
 WebSearch, Skill, LSP` and **every** `mcp__*` tool on the machine, and reported
 Bash as unavailable ("no command was executed"). Denying by name leaves MCP
 alone; restricting to a built-in set does not. Comma-separated and
@@ -289,6 +300,52 @@ claude -p --disallowedTools Task "reply OK"
 ```
 
 So every entry in `HELM_DENIED_TOOLS` is a name a real session was asked for.
+
+**`--disallowedTools` propagates to sub-agents.** Measured on 2.1.223, and it is
+the measurement the current deny list is built on. A window launched with
+`--disallowedTools Bash Edit Write` spawned a sub-agent through `Agent` and told
+it to run `echo … > proof.txt`. The sub-agent's own transcript shows it calling
+`ToolSearch` for a shell tool and getting back exactly `[Monitor, WebFetch]` — no
+Bash — and `proof.txt` was never created.
+
+Two consequences, and both are load-bearing:
+
+- **`Agent` and `Task` are no longer denied.** A Helm sub-agent inherits the
+  clamp, so it cannot edit a file, run a command, or commit; the only thing it
+  can hand back is text. That makes fanning out reads safe *as a capability*.
+  What a sub-agent may be asked to *do* is a separate question, and it stays in
+  `CLAUDE.md`: anything that produces a change to the captain's code, or the
+  answer they asked about their code, is a task. The clamp decides what is
+  possible; the prose decides what is appropriate.
+- **`Monitor` must stay denied.** It was in the list that sub-agent was offered,
+  and it runs a shell command as a background process. Denying Bash while leaving
+  it reachable — from the window or from anything under it — would be theatre.
+
+`Workflow` and `RemoteTrigger` also stay denied, and not by the same argument:
+this probe covered a sub-agent spawned by `Agent`, not a workflow's own scheduler,
+and a routine on claude.ai is not a child of this window at all and inherits
+nothing from it.
+
+**Re-measured 2026-08-06 with the WHOLE deny list, not three names of it**, in a
+real `bluespace` window whose captain has `Bash(*)`, `Edit(*)` and `Write(*)`
+allowed in `~/.claude/settings.json` — so this is also the proof that a deny rule
+beats the captain's own allow rules, in the sub-agent as well as in the window.
+Helm was told to spawn one sub-agent and have it create a file. The sub-agent's
+own transcript (`<session>/subagents/agent-*.jsonl`) contains, verbatim:
+
+```
+ToolSearch  {"query":"select:Bash,Write,Edit,NotebookEdit","max_results":10}
+  -> No matching deferred tools found
+```
+
+and it then listed its whole surface: `Agent`, `Artifact`, `Glob`, `Grep`,
+`Read`, `Skill`, `ToolSearch` loaded, plus `ExitWorktree`, `SendMessage`,
+`TaskStop`, `WebFetch`, `WebSearch` and the `mcp__*` families deferred. No file
+appeared. Two things that earlier probe could not show: **`Monitor` is absent
+too**, so denying it really does reach a sub-agent rather than only the window;
+and `Agent` is present, so a sub-agent can spawn its own — which is safe for the
+same reason and by the same evidence, since what it would spawn inherits the same
+list again.
 
 **Denying Bash does not cost Helm the reports it has to read.** `Read` reaches an
 absolute path outside both the working directory and `--add-dir`; measured with a
@@ -341,3 +398,61 @@ config, else from `LC_ALL` / `LC_MESSAGES` / `LANG`, and omitted entirely when
 neither names a language. The instruction itself stays English: it is addressed
 to the model, not to the captain, and a translated copy of it would be a second
 thing to keep in step.
+
+**That claim was false for every new user until `--allowedTools` was added, and
+it is worth writing down how.** The wake sweep's first call is `open_decisions` —
+an MCP tool the session has never seen. Claude Code asks before running one, and
+the launcher passed no permission flags at all, so a first-run `bluespace` opened
+on a dialog with nobody having typed anything into that window yet. The wake
+sweep never reached the screen. The machine this document was written on only
+worked because its captain had approved the tools long before and the approval
+was remembered per project — which is exactly the shape of bug that survives
+every test its own author runs.
+
+The fix names BlueSpace's own tools and nothing else:
+`--allowedTools mcp__bluespace__list_tasks,mcp__bluespace__open_decisions,…`,
+built from `HELM_TOOL_NAMES` so a tool added later cannot be forgotten. What was
+rejected, and why:
+
+| | |
+| --- | --- |
+| `--permission-mode auto` | Clears the dialog — and also for `WebFetch`, for the captain's own MCP servers, and for every built-in. That is BlueSpace choosing a posture over tools it did not install. It is also a classifier, not a switch: "usually does not prompt — usually", measured above. |
+| `--permission-mode bypassPermissions` | A modal only a human can dismiss, and dismissing it writes a permanent machine-wide flag. Already rejected for Crews, for the same reason. |
+| `--permission-mode acceptEdits` | Auto-approves edits. This window has no `Edit`. |
+| Asking the captain to approve once | What happens today, at the one moment they cannot answer — before the first turn, on a tool they implicitly asked for by typing `bluespace`. |
+
+The narrow flag is also the honest one: it changes nothing about how the
+captain's own tools behave, it persists nothing, and it approves exactly what
+`--mcp-config` put in the window one command earlier.
+
+**Live-measured on 2026-08-06, both directions, in a directory Claude Code had
+never opened** — this paragraph used to say the opposite, that the reasoning was
+sound but unrun, so what follows is the run.
+
+Treatment: `bluespace`, no arguments, a fresh `BLUESPACE_HOME` holding one failed
+and one queued task, cwd a brand-new repository with no entry in `~/.claude.json`
+and no approval anywhere on the machine (checked: **zero** projects carried a
+`bluespace` allow rule, so nothing was riding on a remembered click). Nobody
+touched the keyboard. Its transcript: `mcp__bluespace__list_tasks` → result,
+`mcp__bluespace__open_decisions` → result, then the fleet report, 14.6s from
+launch.
+
+Control: the identical argv with `allowedTools: []` and nothing else changed —
+same `--mcp-config`, same deny list, same wake prompt, same kind of fresh
+directory. It parked on
+
+```
+ bluespace - open_decisions (MCP)
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and don't ask again for bluespace - open_decisions commands in …
+   3. No
+```
+
+and was still sitting there 65 seconds later with `open_decisions` issued and no
+tool result in the transcript. So the dialog is real, the flag is what clears it,
+and neither conclusion rests on reading the rule syntax.
+
+The flag surface stays asserted for free in `tests/compliance-smoke.test.ts`
+(`--allowedTools` exists, and takes `<tools...>`), which is what catches a rename
+without a live session.

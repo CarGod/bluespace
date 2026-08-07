@@ -79,6 +79,29 @@ const DECISION_CONTEXT_CHARS = 2000;
 /** Option id that lets a captain end a task from the decision inbox. */
 export const ABANDON_OPTION_ID = 'abandon';
 
+/**
+ * Cancelling a Crew this process does not hold.
+ *
+ * A named error rather than a bare `throw new Error`, because two callers have
+ * to tell the captain something different about it: `blue cancel` can offer
+ * `--force`, and Helm's `cancel_task` — which has no force and should not — must
+ * report where the fleet actually is. The message carries the shared half.
+ */
+export class CrewNotHeldError extends Error {
+  constructor(
+    readonly taskId: TaskId,
+    readonly crewId: CrewId,
+  ) {
+    super(
+      `task ${taskId} has a Crew (${crewId}) that is not running in this process, so nothing here ` +
+        `can stop it. Cancel it where the fleet is running — Helm's cancel_task in the Claude Code ` +
+        `window serving \`blue mcp\`, or the Starmap started with \`blue map --orchestrate\`. ` +
+        `Nothing was changed.`,
+    );
+    this.name = 'CrewNotHeldError';
+  }
+}
+
 export interface DecisionRequest {
   question: string;
   options: DecisionOption[];
@@ -432,17 +455,45 @@ export class Orchestrator {
    * `needs_rework` first) and from `ready` it is not reachable at all — a
    * verified diff can only land or fail. In that last case the task is failed
    * with a cancellation reason rather than silently ignored.
+   *
+   * REFUSES when this process is not the one holding that Crew, for the same
+   * reason `resolveDecision` and `steer` do: `#live` is per-process and
+   * unprojectable, so a `blue` that never dispatched anything has no session to
+   * interrupt and no way to reach the one that does. Without this guard a cold
+   * `blue cancel` wrote `cancelled` into the log and stopped there — the Crew
+   * kept running in its tmux session, kept spending quota against a task nobody
+   * was waiting on, and its worktree stayed on disk with `blue ps` reporting the
+   * whole thing as over. A half-cancelled task is worse than an uncancellable
+   * one, because only one of them is visible.
+   *
+   * A task with no `crewId` is exempt: nothing was ever spawned for it, so
+   * cancelling is a pure log write and every process can do it correctly. That
+   * covers the common case of a queued task the captain changed their mind about.
+   *
+   * `force` is the captain's own hands, and it does exactly one thing: record
+   * the cancellation. It cannot stop a Crew it does not hold and does not touch
+   * the worktree — callers must say so rather than implying a teardown happened.
+   * Helm has no way to pass it; `blue cancel --force` does.
    */
-  async cancelTask(id: TaskId): Promise<void> {
+  async cancelTask(id: TaskId, opts: { force?: boolean } = {}): Promise<void> {
     const task = this.task(id);
     if (!task) throw new Error(`unknown task ${id}`);
     if (isTerminal(task.state)) return;
+
+    if (opts.force !== true && task.crewId !== undefined && !this.#live.has(id)) {
+      throw new CrewNotHeldError(id, task.crewId);
+    }
 
     await this.#teardown(id, { removeWorktree: true });
 
     if (!this.#walkTo(id, 'cancelled', 'cancelled_by_captain')) {
       this.#failTask(id, 'cancelled_by_captain');
     }
+  }
+
+  /** True when this process holds the live session for that task. */
+  holdsCrew(id: TaskId): boolean {
+    return this.#live.has(id);
   }
 
   // -----------------------------------------------------------------------

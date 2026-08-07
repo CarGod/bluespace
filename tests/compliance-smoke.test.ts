@@ -129,10 +129,26 @@ describe('flag surface (free)', () => {
       // the window still opens, still calls itself Helm, and can now do the
       // captain's work itself with nothing behind it. See src/cli/bluespace.ts.
       ['--disallowedTools', 'keeps Helm on the dispatching side of the line'],
+      // Without it the wake sweep parks on a permission dialog for the fleet's
+      // own tools, before the captain has typed anything into the window.
+      ['--allowedTools', 'pre-approves mcp__bluespace__* so the opening turn can run'],
     ];
     for (const [flag, why] of required) {
       expect(text, `${flag} is gone — ${why}`).toContain(flag);
     }
+  });
+
+  it('still takes tool names on both permission lists, which is how they are passed', async () => {
+    const text = await help();
+    if (text === '') return;
+
+    // Both are variadic (`<tools...>`) and both accept "Comma or space-separated"
+    // names. The launcher passes one comma-joined token to each, and the ordering
+    // freeze in tests/launcher.test.ts depends on their being variadic — if a
+    // future build made either take a single value, the freeze would be
+    // protecting against a hazard that no longer exists, which is worth knowing.
+    expect(text).toMatch(/--allowedTools[\s\S]{0,120}<tools\.\.\.>/);
+    expect(text).toMatch(/--disallowedTools[\s\S]{0,120}<tools\.\.\.>/);
   });
 
   it('still takes a positional prompt, which is how the wake sweep opens', async () => {

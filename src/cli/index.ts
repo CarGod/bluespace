@@ -40,20 +40,21 @@ import {
   addressTerm,
   configPath,
   detectLanguage,
+  findRepositories,
   loadConfig,
   localeVarInEffect,
   normalizeLanguage,
+  registerProjects,
   saveConfig,
 } from '../config/index.js';
 import type { BlueConfig, ConfigPatch } from '../config/index.js';
 import { landTask, pendingDelivery, LandRefusedError } from '../land/index.js';
-import { Orchestrator } from '../orchestrator/index.js';
+import { CrewNotHeldError, Orchestrator } from '../orchestrator/index.js';
 import {
   DevBranchConflictError,
   INTEGRATION_BRANCH,
   MergeConflictError,
   WorktreeManager,
-  ensureIntegrationBranch,
 } from '../worktree/index.js';
 import { addTokenCounts, isTerminal, noTokens, totalTokens } from '../types/domain.js';
 import type {
@@ -67,8 +68,10 @@ import type {
 } from '../types/domain.js';
 import type { BlueEvent } from '../types/events.js';
 
+import { cancelOutcome } from './cancel.js';
 import { runGc } from './gc.js';
 import { decisionNudge, runInbox } from './inbox.js';
+import { psView } from './ps.js';
 import {
   bold,
   clockTime,
@@ -145,6 +148,7 @@ const VALUE_FLAGS = new Set([
   'interval',
   'limit',
   'depends-on',
+  'scan',
 ]);
 
 type Flags = Map<string, string | true>;
@@ -231,9 +235,15 @@ function usage(): string {
     ['log <taskId>', "replay one task's events from the Blackbox"],
     ['map', 'start the Starmap server and print its URL'],
     ['land <taskId>', `merge a verified task into ${INTEGRATION_BRANCH}  (never into main)`],
+    // Deliberately vaguer than it was. The old line promised a Crew stopped and
+    // a worktree removed for every cancellation; a queued task has neither, and
+    // a running one is only stoppable from the process that holds it. The
+    // command itself now says which of the three happened — the summary should
+    // not pre-empt it with the most dramatic one.
+    ['cancel <taskId>', 'end a task — it says what it actually stopped'],
     ['gc', 'reclaim the worktrees whose work is merged  [--dry-run] [--force]'],
     ['projects', 'list registered projects'],
-    ['projects add <path>', 'register a repo  [--name X] [--desc Y] [--delivery pr|local]'],
+    ['projects add <path…>', 'register one repo, several, or --scan <dir> for a folder of them'],
     ['projects rm <id>', 'forget a project'],
     ['config', 'print the effective config and where it lives'],
     ['config set <k> <v>', 'change one setting (validated)'],
@@ -253,9 +263,11 @@ function usage(): string {
   // Spelled out rather than summarised as "unrestricted": a captain reading this
   // line is deciding whether to turn off the thing that makes work trackable,
   // and "gives Helm more tools" is not what they would be agreeing to.
-  L.push(`  ${dim('BLUESPACE_UNCLAMPED=1')}   ${dim('(bluespace) give Helm back Bash/Edit/subagents — it can then')}`);
-  L.push(`  ${' '.repeat(24)}${dim('do the work itself, with no worktree, no Sentinel, no token')}`);
+  L.push(`  ${dim('BLUESPACE_UNCLAMPED=1')}   ${dim('(bluespace) give Helm back Bash/Edit/Write — it can then do')}`);
+  L.push(`  ${' '.repeat(24)}${dim('the work itself, with no worktree, no Sentinel, no token')}`);
   L.push(`  ${' '.repeat(24)}${dim('ceiling, nothing in `blue ps` and no record in the Blackbox')}`);
+  L.push(`  ${' '.repeat(24)}${dim('(Helm has sub-agents either way; clamped, they inherit the')}`);
+  L.push(`  ${' '.repeat(24)}${dim('same denials and cannot write a file or run a command)')}`);
   L.push(`  ${dim('CLAUDE_CLI_PATH')}         ${dim('point at a `claude` that is not on PATH')}`);
   L.push('');
   L.push(bold('CONFIG KEYS'));
@@ -279,13 +291,16 @@ function usage(): string {
   L.push(`  -h, --help                  ${dim('this text')}`);
   L.push(`  -V, --version               ${dim('print the version')}`);
   L.push(`      --no-color              ${dim('never emit ANSI colour')}`);
+  L.push(`  -a, --all                   ${dim('(ps) every task ever, not just what is in flight or recent')}`);
   L.push(`  -f, --follow                ${dim('(log) keep streaming new events')}`);
   L.push(`      --limit <n>             ${dim('(log) show only the last n events')}`);
   L.push(`      --list                  ${dim('(inbox) render only, do not prompt')}`);
+  L.push(`      --scan <dir>            ${dim('(projects add) register every repo directly inside <dir>')}`);
   L.push(`      --port <n>              ${dim('(map) port to listen on')}`);
   L.push(`      --orchestrate           ${dim('(map) also run the dispatch loop')}`);
   L.push(`  -n, --dry-run               ${dim('(gc) report what would be reclaimed, change nothing')}`);
   L.push(`      --force                 ${dim('(gc) also take unmerged and dirty worktrees — asks first')}`);
+  L.push(`  ${' '.repeat(24)}${dim('(cancel) record it anyway when no Crew is held here')}`);
   L.push(`  -y, --yes                   ${dim('(gc) skip the --force confirmation')}`);
   L.push('');
   return L.join('\n');
@@ -494,7 +509,7 @@ async function printPendingDelivery(b: Boot): Promise<void> {
   out(dim('  BlueSpace never opens one — ask Helm for the `gh pr create` command.'));
 }
 
-async function cmdPs(b: Boot): Promise<number> {
+async function cmdPs(b: Boot, flags: Flags): Promise<number> {
   const tasks = b.orch.tasks();
   if (tasks.length === 0) {
     out('');
@@ -503,7 +518,21 @@ async function cmdPs(b: Boot): Promise<number> {
     return 0;
   }
 
-  const sorted = [...tasks].sort((x, y) => {
+  // The horizon lives in `./ps.ts` so it can be tested; this file cannot be
+  // imported without running the CLI.
+  const { shown, elided } = psView(tasks, { all: flagBool(flags, 'all', 'a') });
+
+  if (shown.length === 0) {
+    // Everything is over and none of it is recent. Say the state of the fleet
+    // first — that is the question — and then where the history went.
+    out('');
+    out(dim('Nothing in flight.'));
+    out(dim(`${plural(elided, 'finished task')} older than a day — \`blue ps --all\` to see them.`));
+    out('');
+    return 0;
+  }
+
+  const sorted = [...shown].sort((x, y) => {
     const ax = isTerminal(x.state) ? 1 : 0;
     const ay = isTerminal(y.state) ? 1 : 0;
     if (ax !== ay) return ax - ay;
@@ -544,12 +573,24 @@ async function cmdPs(b: Boot): Promise<number> {
     ),
   );
 
+  // THE ELISION IS VISIBLE, and it sits between the rows and the totals — which
+  // is exactly where a reader notices that the counts below cover more than the
+  // table above. A view that quietly dropped rows would be a worse bug than the
+  // one this horizon fixes.
+  if (elided > 0) {
+    out(dim(`… and ${plural(elided, 'older finished task')} — \`blue ps --all\``));
+  }
+
+  // THE TOTALS ARE THE WHOLE FLEET, always, over `tasks` rather than the rows on
+  // screen. `--all` changes what is printed and never what is counted: "what has
+  // this cost me" has one answer, and a number that moved when the captain
+  // passed a display flag would be worth less than no number.
   const counts = new Map<TaskState, number>();
   let fleetTokens: TokenCounts = noTokens();
   const fleetByModel: Record<string, TokenCounts> = {};
   let meteredUsd = 0;
   let unmeteredUsd = 0;
-  for (const t of sorted) {
+  for (const t of tasks) {
     counts.set(t.state, (counts.get(t.state) ?? 0) + 1);
     fleetTokens = addTokenCounts(fleetTokens, t.tokens.totals);
     for (const [model, c] of Object.entries(t.tokens.byModel)) {
@@ -822,98 +863,7 @@ async function cmdProjects(b: Boot, rest: string[], flags: Flags): Promise<numbe
     return 0;
   }
 
-  if (sub === 'add') {
-    const raw = rest[1];
-    if (raw === undefined) {
-      errOut(red('blue projects add needs a path.'));
-      return 1;
-    }
-    const abs = path.resolve(raw);
-    if (!fs.existsSync(abs) || !fs.statSync(abs).isDirectory()) {
-      errOut(red(`Not a directory: ${abs}`));
-      return 1;
-    }
-    // A hard refusal now, where it used to be a warning: registration creates
-    // the integration branch, so a directory git knows nothing about fails a
-    // few lines below with git's wording instead of ours. The registry refuses
-    // it too — this is just the message the captain can act on.
-    if (!fs.existsSync(path.join(abs, '.git'))) {
-      errOut(red(`Not a git repository root: ${abs}`));
-      errOut(
-        dim('BlueSpace works on repos in place — point it at the directory containing .git.'),
-      );
-      return 1;
-    }
-
-    const deliveryRaw = flagStr(flags, 'delivery');
-    if (deliveryRaw !== undefined && deliveryRaw !== 'pr' && deliveryRaw !== 'local') {
-      errOut(red(`delivery must be "pr" or "local", got "${deliveryRaw}".`));
-      return 1;
-    }
-
-    const name = flagStr(flags, 'name') ?? path.basename(abs);
-    const description = flagStr(flags, 'desc', 'description') ?? '';
-
-    // THE DEV BRANCH IS MADE BEFORE THE REGISTRY ENTRY, and a repository that
-    // cannot hold it is never registered at all. Doing it the other way round
-    // would leave a project in the registry that nothing can ever land, and the
-    // refusal would surface inside a merge weeks later instead of here.
-    //
-    // No prompt: `blue/dev` is namespaced precisely so that it cannot collide
-    // with a branch a human already has, which is what makes create-or-adopt
-    // safe to do silently.
-    let devBranch: string;
-    let devNote: string;
-    try {
-      const setup = await ensureIntegrationBranch(
-        new WorktreeManager(abs, { root: b.worktreeRoot }),
-        INTEGRATION_BRANCH,
-      );
-      devBranch = setup.branch;
-      devNote = setup.created
-        ? `created ${setup.branch} off ${setup.base}`
-        : `adopted the existing ${setup.branch}`;
-    } catch (e) {
-      errOut(red(`Could not register: ${errorMessage(e)}`));
-      if (e instanceof DevBranchConflictError) {
-        errOut(
-          dim(
-            'Every BlueSpace branch lives under blue/, so this repository cannot be managed until that name is free.',
-          ),
-        );
-      }
-      return 1;
-    }
-
-    const input: {
-      name: string;
-      path: string;
-      description: string;
-      delivery?: DeliveryMode;
-      devBranch: string;
-    } = { name, path: abs, description, devBranch };
-    if (deliveryRaw !== undefined) input.delivery = deliveryRaw;
-
-    try {
-      const project = b.registry.add(input);
-      out('');
-      out(`${green('✓')} registered ${bold(project.name)} ${dim(`(${shortId(project.id)})`)}`);
-      out(dim(`  ${project.path}  ·  delivery ${project.delivery}`));
-      out(dim(`  ${devNote} — landed work is merged there, never into your default branch`));
-      if (project.description.trim() === '') {
-        out(
-          dim(
-            '  No description — Helm routes ambiguous requests by description. Add one with --desc.',
-          ),
-        );
-      }
-      out('');
-      return 0;
-    } catch (e) {
-      errOut(red(`Could not register: ${errorMessage(e)}`));
-      return 1;
-    }
-  }
+  if (sub === 'add') return await cmdProjectsAdd(b, rest.slice(1), flags);
 
   if (sub === 'rm' || sub === 'remove') {
     const hint = rest[1];
@@ -947,8 +897,125 @@ async function cmdProjects(b: Boot, rest: string[], flags: Flags): Promise<numbe
   }
 
   errOut(red(`Unknown: blue projects ${sub}`));
-  errOut(dim('Try: list | add <path> | rm <id>'));
+  errOut(dim('Try: list | add <path…> [--scan <dir>] | rm <id>'));
   return 1;
+}
+
+/**
+ * `blue projects add <path…> [--scan <dir>]`.
+ *
+ * The same operation Helm's `add_projects` performs, through the same
+ * `registerProjects` (see `src/config/register.ts`) — the `blue/dev` rule and
+ * the bare-`blue` refusal are in there rather than duplicated at both call
+ * sites, which is how they used to drift.
+ *
+ * PARTIAL SUCCESS EXITS 0 WHEN ANYTHING REGISTERED. A directory of ten repos
+ * where one is already registered is a successful run with a note, not a
+ * failure; exit 1 is reserved for "nothing was registered", which is the only
+ * outcome a script should stop on. Every refusal is printed either way.
+ *
+ * `--name` and `--desc` are single-repository options and are refused for a
+ * batch rather than applied to all of them — one name for eight projects is
+ * never what was meant, and silently ignoring a flag the captain typed is worse
+ * than saying it does not fit.
+ */
+async function cmdProjectsAdd(b: Boot, rawPaths: string[], flags: Flags): Promise<number> {
+  const scanDir = flagStr(flags, 'scan');
+  if (rawPaths.length === 0 && scanDir === undefined) {
+    errOut(red('blue projects add needs a path.'));
+    errOut(dim('One repo: blue projects add ~/code/api'));
+    errOut(dim('Many:     blue projects add ~/code/api ~/code/web'));
+    errOut(dim('A folder: blue projects add --scan ~/code'));
+    return 1;
+  }
+
+  const deliveryRaw = flagStr(flags, 'delivery');
+  if (deliveryRaw !== undefined && deliveryRaw !== 'pr' && deliveryRaw !== 'local') {
+    errOut(red(`delivery must be "pr" or "local", got "${deliveryRaw}".`));
+    return 1;
+  }
+  const delivery: DeliveryMode | undefined = deliveryRaw;
+
+  const scanned = scanDir === undefined ? [] : findRepositories(scanDir);
+  if (scanDir !== undefined && scanned.length === 0) {
+    errOut(red(`No git repositories directly inside ${path.resolve(scanDir)}.`));
+    errOut(dim('The scan takes the subdirectories that are repo roots; it does not recurse.'));
+    if (rawPaths.length === 0) return 1;
+  }
+
+  const paths = [...rawPaths.map((p) => path.resolve(p)), ...scanned];
+  const name = flagStr(flags, 'name');
+  const description = flagStr(flags, 'desc', 'description');
+  if (paths.length > 1 && (name !== undefined || description !== undefined)) {
+    errOut(red('--name and --desc describe one project; this is registering ' + paths.length + '.'));
+    errOut(dim('Register them without, then `blue projects add <one>` or ask Helm to describe them.'));
+    return 1;
+  }
+
+  const outcomes = await registerProjects(
+    { registry: b.registry, worktreeFor: b.worktreeFor },
+    paths.map((p) => ({
+      path: p,
+      ...(name !== undefined ? { name } : {}),
+      ...(description !== undefined ? { description } : {}),
+      ...(delivery !== undefined ? { delivery } : {}),
+    })),
+  );
+
+  out('');
+  let registered = 0;
+  let undescribed = 0;
+  for (const outcome of outcomes) {
+    if (outcome.ok) {
+      registered += 1;
+      if (outcome.project.description.trim() === '') undescribed += 1;
+      out(
+        `${green('✓')} ${bold(outcome.project.name)} ${dim(`(${shortId(outcome.project.id)})`)}  ${dim(outcome.project.path)}`,
+      );
+      out(
+        dim(
+          `  ${
+            outcome.devBranchCreated
+              ? `created ${outcome.devBranch} off ${outcome.base}`
+              : `adopted the existing ${outcome.devBranch}`
+          } — landed work is merged there, never into your default branch`,
+        ),
+      );
+      continue;
+    }
+    // `already_registered` is dimmed rather than reddened: re-running a scan
+    // after adding one repo by hand is the normal way to use this, and eight
+    // red lines saying "you already did that" reads like eight failures.
+    const already = outcome.reason === 'already_registered';
+    out(
+      `${already ? dim('·') : red('✗')} ${dim(outcome.path)}  ${already ? dim(outcome.message) : yellow(outcome.message)}`,
+    );
+    if (outcome.reason === 'branch_conflict') {
+      out(
+        dim(
+          '  Every BlueSpace branch lives under blue/, so this repo cannot be managed until that name is free.',
+        ),
+      );
+    }
+  }
+
+  out('');
+  const refused = outcomes.length - registered;
+  out(
+    `${bold(plural(registered, 'project'))} registered${refused > 0 ? dim(` · ${refused} not`) : ''}`,
+  );
+  if (undescribed > 0) {
+    // Said once for the batch rather than once per project: the description is
+    // what `resolve_project` routes by, and this is the only moment the captain
+    // is looking at the list of things that lack one.
+    out(
+      dim(
+        `  ${plural(undescribed, 'project')} with no description — Helm routes ambiguous requests by it. Ask Helm to fill them in, or use --desc when adding one.`,
+      ),
+    );
+  }
+  out('');
+  return registered > 0 ? 0 : 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -1363,6 +1430,128 @@ async function cmdLand(b: Boot, hint: string | undefined): Promise<number> {
   }
 }
 
+// ---------------------------------------------------------------------------
+// blue cancel <taskId>
+// ---------------------------------------------------------------------------
+
+/**
+ * End a task from the terminal.
+ *
+ * The gap this fills, in the captain's words, looking at two dead tasks:
+ * *"这任务怎么结束啊，我们貌似没有结束任务的指令吗"*. There was `blue land` and
+ * `blue gc` and no way to stop anything — cancelling was reachable only through
+ * Helm's `cancel_task`, which means opening a window to end a task you can see
+ * in front of you.
+ *
+ * Same implementation as that tool: `Orchestrator.cancelTask`, which is where
+ * the state walk and the teardown live and where they stay.
+ *
+ * THE CROSS-PROCESS GAP IS THE WHOLE DESIGN OF THIS COMMAND. A Crew's session
+ * handle exists only inside the process that spawned it — `blue mcp`, or `blue
+ * map --orchestrate` — and this is neither. So the orchestrator refuses rather
+ * than writing `cancelled` over a Crew that keeps running, and this prints where
+ * to go instead. `blue inbox` has said the same thing about answering decisions
+ * since long before this command existed; it is the same handle and the same
+ * honesty.
+ *
+ * `--force` is for the case the refusal cannot distinguish: the fleet process
+ * died and took the handle with it, leaving a task nothing can ever cancel. It
+ * records the cancellation and does NOTHING else — it cannot stop a session it
+ * has no handle for, and it deliberately does not delete the worktree, which may
+ * be the only copy of work in progress. The output says exactly that rather than
+ * printing a tick that means less than it looks like.
+ *
+ * A QUEUED TASK IS THE COMMON CASE AND IS NOT A CROSS-PROCESS PROBLEM AT ALL:
+ * nothing was ever spawned for it, so cancelling is a pure log write that every
+ * process can do correctly, and the orchestrator exempts it from the refusal
+ * above. It gets its own line under the tick for the same reason `--force` does —
+ * a Crew that never existed was not stopped, and a worktree that was never made
+ * was not removed.
+ */
+async function cmdCancel(b: Boot, hint: string | undefined, flags: Flags): Promise<number> {
+  if (hint === undefined || hint === '') {
+    errOut(red('blue cancel needs a task id.'));
+    errOut(dim('Run `blue ps` to see them.'));
+    return 1;
+  }
+
+  const task = resolveTask(b, hint);
+  if (task === undefined) {
+    errOut(red(`No single task matches "${hint}".`));
+    errOut(dim('Run `blue ps` to see them.'));
+    return 1;
+  }
+
+  if (isTerminal(task.state)) {
+    out('');
+    out(
+      `${dim('·')} ${bold(task.title)} ${dim(`(${shortId(task.id)})`)} is already ${colourState(task.state)} ${dim('— nothing to end')}`,
+    );
+    // The likeliest reason they typed this: the row is still on the screen.
+    out(dim('  Finished tasks drop off `blue ps` after a day; the Blackbox keeps them forever.'));
+    out('');
+    return 0;
+  }
+
+  const force = flagBool(flags, 'force');
+
+  // BOTH READ BEFORE THE CANCEL, and that is not tidiness.
+  //
+  // `cancelTask` tears the session down, and teardown is what removes the task
+  // from the orchestrator's live map — so asking `holdsCrew` afterwards can only
+  // ever answer "no", including in the one case where a Crew really was stopped.
+  // `task` is the projection from before the walk, so its `crewId` still says
+  // whether anything was ever spawned at all.
+  const heldCrew = b.orch.holdsCrew(task.id);
+  const hadCrew = task.crewId !== undefined;
+
+  try {
+    await b.orch.cancelTask(task.id, { force });
+  } catch (e) {
+    if (e instanceof CrewNotHeldError) {
+      errOut('');
+      errOut(`${red('✗')} ${bold(task.title)} ${dim(`(${shortId(task.id)})`)} was not cancelled.`);
+      errOut(dim(`  Its Crew is running in another process, and only that process can stop it.`));
+      errOut(dim(`  Cancel it in the Helm window (\`bluespace\`), or wherever \`blue map --orchestrate\` is running.`));
+      errOut(
+        dim(
+          `  If that process is gone, \`blue cancel ${shortId(task.id)} --force\` records the cancellation — it cannot stop the Crew or remove the worktree.`,
+        ),
+      );
+      errOut('');
+      return 1;
+    }
+    errOut(red(`Could not cancel: ${errorMessage(e)}`));
+    return 1;
+  }
+
+  const after = b.orch.task(task.id);
+  out('');
+  out(
+    `${green('✓')} ${colourState(after?.state ?? 'cancelled')} ${bold(task.title)} ${dim(`(${shortId(task.id)})`)}`,
+  );
+  // THE LINE UNDER THE TICK NAMES WHAT ACTUALLY HAPPENED — see `./cancel.ts`,
+  // where the rule lives so that a test can hold it.
+  switch (cancelOutcome({ hadCrew, heldCrew })) {
+    case 'never_ran':
+      out(dim('  It never left the queue — nothing was running, and no worktree was ever made.'));
+      break;
+    case 'crew_stopped':
+      out(dim('  Crew stopped, worktree removed. Commits it made survive on the branch.'));
+      break;
+    case 'recorded_only':
+      // Only reachable under `--force`; without it the orchestrator refuses. Said
+      // in full, because a tick above a half-truth is how a captain ends up
+      // believing a session stopped that did not.
+      out(yellow('  Recorded only. This process held no Crew for it:'));
+      out(dim('  if the session is still alive it is still running — `blue ps` prints its attach command.'));
+      out(dim('  the worktree was left in place; `blue gc` decides what is safe to reclaim.'));
+      break;
+  }
+  out('');
+  return 0;
+}
+
 /** `3 commits` / `1 commit` — the CLI says numbers with their nouns. */
 function plural(n: number, one: string): string {
   return `${n} ${one}${n === 1 ? '' : 's'}`;
@@ -1509,7 +1698,7 @@ async function main(argv: string[]): Promise<number> {
     switch (command) {
       case 'ps':
       case 'status':
-        return await cmdPs(b);
+        return await cmdPs(b, flags);
 
       case 'inbox':
         return await runInbox(
@@ -1526,6 +1715,11 @@ async function main(argv: string[]): Promise<number> {
 
       case 'land':
         return await cmdLand(b, positionals[1]);
+
+      // No `stop` alias: `blue stop` reads like "stop the fleet", and this ends
+      // exactly one task.
+      case 'cancel':
+        return await cmdCancel(b, positionals[1], flags);
 
       case 'config':
         return cmdConfig(b, positionals.slice(1));
