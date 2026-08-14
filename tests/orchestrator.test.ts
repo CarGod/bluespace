@@ -239,6 +239,9 @@ function worktreePath(taskId: string): string {
 class FakeWorktrees {
   readonly created: Worktree[] = [];
 
+  /** Directories taken over by a resume: `[taskId, the path it inherited]`. */
+  readonly adopted: Array<{ taskId: string; from: string }> = [];
+
   readonly removed: Array<{ worktree: Worktree; force: boolean }> = [];
 
   diffText = 'diff --git a/src/auth.ts b/src/auth.ts\n+export function login() {}\n';
@@ -256,6 +259,19 @@ class FakeWorktrees {
     // one; a path that never existed would let a broken archive step pass.
     await fsp.mkdir(worktree.path, { recursive: true });
     this.created.push(worktree);
+    return worktree;
+  }
+
+  /** Same shape as the real one: the directory stays, the branch is this task's. */
+  async adopt(taskId: string, from: string): Promise<Worktree> {
+    this.adopted.push({ taskId, from });
+    const worktree: Worktree = {
+      path: from,
+      branch: `blue/${taskId.slice(0, 8)}`,
+      repoPath: this.repoPath,
+      taskId,
+    };
+    await fsp.mkdir(from, { recursive: true });
     return worktree;
   }
 
@@ -1377,6 +1393,48 @@ describe('captain controls', () => {
 
     expect(crew.closed, 'a failed interrupt left the crew running').toBe(true);
     expect(failureReason(h, task.id)).toContain('token_ceiling_exceeded');
+  });
+
+  it('resumes a dead task into the directory it died in', async () => {
+    // A failed task is never revived — `failed` has no outgoing edges, and the
+    // log has to say what actually happened. What carries on is a new task that
+    // inherits the one thing worth inheriting: the worktree, which on this
+    // fleet held four to nine modified files and zero commits every time a
+    // ceiling stopped a Crew.
+    const h = harness();
+    const dead = newTask(h);
+    await h.orch.tick();
+    const worktree = h.worktrees.created[0]!.path;
+    h.adapter.crewFor(dead.id).turn({ ok: false, reason: 'ran out of road' });
+    await until(() => stateOf(h, dead.id) === 'failed', 'the first attempt dies');
+
+    const next = h.orch.resumeTask(dead.id, 'Skip the migration this time.');
+    expect(next.id).not.toBe(dead.id);
+    expect(next.resumeOf).toBe(dead.id);
+    expect(stateOf(h, dead.id)).toBe('failed');
+    // The whole job, not the remainder: the diff will contain both runs' work.
+    expect(next.brief).toContain(dead.brief.trim());
+    expect(next.brief).toContain('This is a CONTINUATION');
+    expect(next.brief).toContain('Skip the migration this time.');
+
+    await h.orch.tick();
+    expect(h.worktrees.adopted).toEqual([{ taskId: next.id, from: worktree }]);
+    // And nothing new was cut for it.
+    expect(h.worktrees.created).toHaveLength(1);
+    expect(h.adapter.spawns[1]!.request.cwd).toBe(worktree);
+  });
+
+  it('refuses to resume work that is not over, or that never ran', async () => {
+    const h = harness();
+    const live = newTask(h);
+    await h.orch.tick();
+    expect(() => h.orch.resumeTask(live.id)).toThrow(/still in flight/);
+
+    const neverRan = newTask(h);
+    h.orch.cancelTask(neverRan.id);
+    await until(() => stateOf(h, neverRan.id) === 'cancelled', 'it cancels');
+    // Cancelled before dispatch: there is no directory to carry on from.
+    expect(() => h.orch.resumeTask(neverRan.id)).toThrow(/never got a worktree/);
   });
 
   it('amends the brief the Sentinel grades, and tells the running Crew', async () => {

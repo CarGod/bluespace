@@ -331,6 +331,13 @@ Cancel and create a clean task only when the goal is genuinely a **different job
 half redirected toward a different objective produces worse work than a stranger with a good
 brief — but reach for that after amending has been ruled out, not before.
 
+**A task that died with work already done is a `resume_task`, not a re-brief.** A ceiling
+stopped it, its Crew crashed, the API was overloaded — the directory is still there and so
+is everything it got done. Resuming creates a new task that adopts that worktree; the dead
+task stays dead in the log, because it really did fail. Measured on this fleet: every task
+that hit the token ceiling had four to nine modified files and ZERO commits, since Crews
+commit at the end — so recreating it throws away all of it and pays for the work twice.
+
 `cancel_task` is final: the Crew stops and the worktree directory is deleted, taking any
 uncommitted work with it. Commits survive — the branch is kept whenever it holds anything
 the base branch does not, so a cancelled task that got as far as committing leaves

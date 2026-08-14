@@ -173,6 +173,71 @@ describe('create', () => {
   });
 });
 
+describe('adopt — carrying on where a dead task stopped', () => {
+  it('keeps the uncommitted work, which is the whole point', async () => {
+    // MEASURED, and the reason a resume inherits the DIRECTORY and not the
+    // branch: every task on this fleet that died to a token ceiling had four to
+    // nine modified files and ZERO commits, because Crews commit at the end of
+    // the job. Branching off the dead branch would inherit an empty tree.
+    const dead = taskId();
+    const wt = await mgr.create(dead);
+    await fs.writeFile(path.join(wt.path, 'half-done.ts'), 'export const half = 1;\n');
+    await fs.writeFile(path.join(wt.path, 'README.md'), 'hello\nedited\n');
+    await git(['add', 'half-done.ts'], wt.path);
+
+    const next = taskId();
+    const adopted = await mgr.adopt(next, wt.path);
+
+    expect(adopted.path).toBe(wt.path);
+    expect(adopted.branch).toBe(`blue/${next}`);
+    expect(adopted.taskId).toBe(next);
+    // The work came with it: one staged file, one modified in place.
+    expect(await fs.readFile(path.join(wt.path, 'half-done.ts'), 'utf8')).toBe(
+      'export const half = 1;\n',
+    );
+    expect(await fs.readFile(path.join(wt.path, 'README.md'), 'utf8')).toBe('hello\nedited\n');
+    expect((await git(['status', '--porcelain'], wt.path)).trim().split('\n')).toHaveLength(2);
+    // And the checkout really is on the new task's branch now.
+    expect((await git(['rev-parse', '--abbrev-ref', 'HEAD'], wt.path)).trim()).toBe(
+      `blue/${next}`,
+    );
+    // The ancestor's branch is left exactly where it was: it is the record of
+    // what that run committed, which is nothing.
+    expect((await git(['branch', '--list', wt.branch], repoPath)).trim()).toContain(wt.branch);
+  });
+
+  it('carries commits across as well, when there were any', async () => {
+    const dead = taskId();
+    const wt = await mgr.create(dead);
+    await fs.writeFile(path.join(wt.path, 'done.ts'), 'export const done = true;\n');
+    await git(['add', '-A'], wt.path);
+    await git(['commit', '-qm', 'first half'], wt.path);
+
+    const next = taskId();
+    await mgr.adopt(next, wt.path);
+
+    expect((await git(['log', '--oneline', '-1'], wt.path)).trim()).toContain('first half');
+    expect(await pathExists(path.join(wt.path, 'done.ts'))).toBe(true);
+  });
+
+  it('refuses a directory that is not a worktree of this repository', async () => {
+    const stray = path.join(tmpBase, 'not-a-worktree');
+    await fs.mkdir(stray, { recursive: true });
+    await expect(mgr.adopt(taskId(), stray)).rejects.toThrow(/not a git worktree root/);
+    await expect(mgr.adopt(taskId(), path.join(tmpBase, 'nowhere'))).rejects.toThrow(/is gone/);
+  });
+
+  it('is idempotent enough to survive a second resume of the same task', async () => {
+    const dead = taskId();
+    const wt = await mgr.create(dead);
+    const next = taskId();
+    await mgr.adopt(next, wt.path);
+    // The branch already exists and is already checked out here.
+    const again = await mgr.adopt(next, wt.path);
+    expect(again.branch).toBe(`blue/${next}`);
+  });
+});
+
 describe('assertIsolated', () => {
   it('accepts a real worktree', async () => {
     const wt = await mgr.create(taskId());

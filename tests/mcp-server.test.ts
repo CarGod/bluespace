@@ -316,6 +316,7 @@ describe('tools/list', () => {
       'answer_decision',
       'steer_task',
       'amend_task',
+      'resume_task',
       'cancel_task',
       'land_task',
       'delivery_status',

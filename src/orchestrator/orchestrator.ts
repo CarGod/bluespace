@@ -254,6 +254,12 @@ export interface CreateTaskInput {
   title: string;
   brief: string;
   dependsOn?: TaskId[];
+  /**
+   * The task this one carries on from. Set by {@link Orchestrator.resumeTask};
+   * dispatch reads it to adopt that task's worktree instead of cutting a new
+   * one. See `task.created.resumeOf`.
+   */
+  resumeOf?: TaskId;
 }
 
 /**
@@ -383,10 +389,75 @@ export class Orchestrator {
       title: input.title,
       brief: input.brief,
       dependsOn: [...(input.dependsOn ?? [])],
+      ...(input.resumeOf !== undefined ? { resumeOf: input.resumeOf } : {}),
     });
     const task = this.task(taskId);
     if (!task) throw new Error(`blackbox did not project the task it just accepted (${taskId})`);
     return task;
+  }
+
+  /**
+   * Carry on from a task that stopped, in the same directory it stopped in.
+   *
+   * A dead task is NOT revived. `failed` and `cancelled` have no outgoing edges
+   * and never will: the log has to say what actually happened, and a run that
+   * ran out of tokens four fifths of the way through really did fail. What
+   * carries on is a NEW task that inherits the one thing worth inheriting — the
+   * worktree.
+   *
+   * WHY THE DIRECTORY AND NOT THE BRANCH, measured on this fleet: every task
+   * that died to the token ceiling had four to nine modified files and ZERO
+   * commits, because Crews commit at the end of the job rather than as they go.
+   * Branching off the dead branch would have inherited an empty tree and the
+   * captain would have paid for the same work twice.
+   *
+   * The new brief is the old one plus what happened, so the Sentinel grades the
+   * whole job rather than the remainder — the diff it eventually reads contains
+   * both runs' work and has to satisfy the original ask.
+   */
+  resumeTask(taskId: TaskId, addendum?: string): Task {
+    const dead = this.task(taskId);
+    if (!dead) throw new Error(`unknown task ${taskId}`);
+    if (dead.state !== 'failed' && dead.state !== 'cancelled') {
+      throw new Error(
+        `task ${taskId} is ${dead.state}: only a failed or cancelled task can be resumed. ` +
+          (dead.state === 'landed'
+            ? 'This one passed verification; amend it or create a new task.'
+            : 'It is still in flight — amend it or steer it instead.'),
+      );
+    }
+    if (dead.worktree === undefined) {
+      throw new Error(
+        `task ${taskId} never got a worktree, so there is nothing to carry on from. ` +
+          'Create a task instead — a resume with no directory is a new task with extra steps.',
+      );
+    }
+
+    const why = dead.summary?.trim() ?? '';
+    const continuation = [
+      '## Picking up from a previous run',
+      '',
+      'This is a CONTINUATION. The worktree you are in is the one the previous run left',
+      'behind — its work is already here, committed or not. Read what is there before you',
+      'change anything: `git status` and `git diff` are the first two commands of this job.',
+      '',
+      `Previous attempt: ${taskId}`,
+      why === '' ? 'It stopped without recording why.' : `It stopped: ${why}`,
+      '',
+      'Do not start over. Finish the brief above, keeping what is already correct.',
+      ...(addendum !== undefined && addendum.trim() !== ''
+        ? ['', '### What the captain added', '', addendum.trim()]
+        : []),
+    ].join('\n');
+
+    return this.createTask({
+      kind: dead.kind,
+      projectId: dead.projectId,
+      title: dead.title,
+      brief: `${dead.brief.trimEnd()}\n\n${continuation}`,
+      dependsOn: [...dead.dependsOn],
+      resumeOf: taskId,
+    });
   }
 
   // -- the engine ----------------------------------------------------------
@@ -684,7 +755,13 @@ export class Orchestrator {
 
     try {
       const worktrees = this.#deps.worktreeFor(project.path);
-      const worktree = await worktrees.create(task.id);
+      // A resume takes over the directory its ancestor left behind — that is
+      // the whole of what it inherits, and the reason it is worth resuming.
+      const inherited = task.resumeOf === undefined ? undefined : this.task(task.resumeOf)?.worktree;
+      const worktree =
+        inherited === undefined
+          ? await worktrees.create(task.id)
+          : await worktrees.adopt(task.id, inherited);
       const baseBranch = project.defaultBranch ?? (await worktrees.defaultBranch());
       const brief = buildBrief({ task, project, worktree, baseBranch });
 

@@ -372,6 +372,7 @@ export const HELM_TOOL_NAMES: readonly string[] = [
   'answer_decision',
   'steer_task',
   'amend_task',
+  'resume_task',
   'cancel_task',
   'land_task',
   'delivery_status',
@@ -650,6 +651,40 @@ export function helmTools(
         note: outcome.deliveredToCrew
           ? 'The brief now includes it and the running Crew has been told.'
           : 'The brief now includes it. No Crew is running, so it applies when the task dispatches.',
+      });
+    },
+  };
+
+  const resumeTask: ToolDef = {
+    name: 'resume_task',
+    description: [
+      'Carry on from a task that failed or was cancelled, in the same worktree it stopped in.',
+      'Call this when a task died with work already done — a ceiling stopped it, its Crew crashed, the API was overloaded — and the captain wants it finished rather than redone.',
+      'It creates a NEW task that adopts the dead one\'s directory: a failed task is never revived, because the log has to say what actually happened. The new brief is the old one plus what stopped it, so the verifier still grades the whole job.',
+      'This is usually far cheaper than recreating the task. Measured: every task that died to a token ceiling had four to nine modified files and ZERO commits, because Crews commit at the end — so a fresh task starts from nothing and pays for all of that again.',
+      'It refuses on a landed task (it already passed) and on one still in flight (amend or steer it), and on a task that never got a worktree — there is nothing to carry on from.',
+    ].join(' '),
+    inputSchema: object(
+      {
+        taskId: str('Task id of a failed or cancelled task.'),
+        addendum: str(
+          'Optional: anything the captain wants changed about the job as it is picked up. Written for the Crew.',
+        ),
+      },
+      ['taskId'],
+    ),
+    handler: async (input) => {
+      const taskId = requireString(input, 'taskId');
+      const addendum = typeof input['addendum'] === 'string' ? input['addendum'] : undefined;
+      const task = orch.resumeTask(taskId, addendum);
+      return ok({
+        taskId: task.id,
+        resumeOf: taskId,
+        state: task.state,
+        title: task.title,
+        note:
+          'Queued, not started. It adopts the previous run’s worktree when it dispatches, so the ' +
+          'work already in that directory comes with it.',
       });
     },
   };
@@ -966,6 +1001,7 @@ export function helmTools(
     answerDecision,
     steerTask,
     amendTask,
+    resumeTask,
     cancelTask,
     landTaskTool,
     deliveryStatus,
