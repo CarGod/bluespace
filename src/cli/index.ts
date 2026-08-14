@@ -70,6 +70,9 @@ import type {
 } from '../types/domain.js';
 import type { BlueEvent } from '../types/events.js';
 
+import { desktopNotifier } from '../notify/index.js';
+import type { FleetNotice } from '../notify/index.js';
+
 import { cancelOutcome } from './cancel.js';
 import { runGc } from './gc.js';
 import { decisionNudge, runInbox } from './inbox.js';
@@ -295,6 +298,9 @@ function usage(): string {
     `  ${dim('address')} <word>            ${dim('what Helm calls you; unset derives it from language (舰长 / Captain)')}`,
   );
   L.push(
+    `  ${dim('notify')} <true|false>       ${dim('desktop notification when a task lands, fails, or needs you')}`,
+  );
+  L.push(
     `  ${dim('maxConcurrentCrew')} <int>   ${dim('maxRework')} <int>   ${dim('maxTokensPerTask')} <int>   ${dim('maxBudgetUsdPerTask')} <number>`,
   );
   L.push('');
@@ -441,7 +447,22 @@ function boot(): Boot {
     return wm;
   };
 
-  const orch = new Orchestrator({ blackbox, adapter, config: configNow, registry, worktreeFor });
+  // A notifier if this machine has one and the captain has not turned it off.
+  // Resolved through `configNow` for the same reason everything else is: they
+  // can silence the fleet mid-flight without restarting it.
+  const notifier = (notice: FleetNotice): void => {
+    const made = desktopNotifier({ enabled: configNow().notify !== false });
+    if ('notify' in made) made.notify(notice);
+  };
+
+  const orch = new Orchestrator({
+    blackbox,
+    adapter,
+    config: configNow,
+    registry,
+    worktreeFor,
+    notify: notifier,
+  });
 
   let closed = false;
   return {
@@ -1202,6 +1223,12 @@ function printConfig(config: BlueConfig): void {
     ['maxRework', String(config.maxRework)],
     ['language', languageRow(config)],
     [
+      'notify',
+      config.notify === false
+        ? 'false — nothing is pushed when a task settles'
+        : `true ${dim('(default — a desktop notification when a task lands, fails, or needs you)')}`,
+    ],
+    [
       'address',
       config.address !== undefined
         ? config.address
@@ -1242,8 +1269,8 @@ function cmdConfig(b: Boot, rest: string[]): number {
     errOut(red('blue config set needs a key and a value.'));
     errOut(
       dim(
-        'Keys: permissionMode, model, effort, language, languageAsked, address, maxConcurrentCrew, maxRework,\n' +
-          '      maxTokensPerTask, maxBudgetUsdPerTask, helmUltracode, helmPermissionMode  (the `bluespace` window, not a crew)',
+        'Keys: permissionMode, model, effort, language, languageAsked, address, notify, maxConcurrentCrew,\n' +
+          '      maxRework, maxTokensPerTask, maxBudgetUsdPerTask, helmUltracode, helmPermissionMode  (the `bluespace` window)',
       ),
     );
     return 1;
@@ -1328,6 +1355,19 @@ function cmdConfig(b: Boot, rest: string[]): number {
         return 1;
       }
       patch.language = language;
+      break;
+    }
+    case 'notify': {
+      if (value === '-' || value === 'default') {
+        patch.notify = null;
+        break;
+      }
+      if (['true', 'on', '1', 'yes'].includes(value)) patch.notify = true;
+      else if (['false', 'off', '0', 'no'].includes(value)) patch.notify = false;
+      else {
+        errOut(red(`notify must be true or false (or "-" for the default), got "${value}".`));
+        return 1;
+      }
       break;
     }
     case 'address': {
@@ -1426,7 +1466,7 @@ function cmdConfig(b: Boot, rest: string[]): number {
       errOut(red(`Unknown config key "${key}".`));
       errOut(
         dim(
-          'Keys: permissionMode, model, effort, language, languageAsked, address, maxConcurrentCrew, maxRework, maxTokensPerTask, maxBudgetUsdPerTask',
+          'Keys: permissionMode, model, effort, language, languageAsked, address, notify, maxConcurrentCrew, maxRework, maxTokensPerTask, maxBudgetUsdPerTask',
         ),
       );
       return 1;

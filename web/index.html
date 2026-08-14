@@ -767,6 +767,11 @@ const ZH = {
 
   // settings
   'Settings': '设置',
+  'Tell me when a task settles': '任务有结果时通知我',
+  'A desktop notification when a task lands, fails, or stops on a question. Helm cannot do this itself — a Claude Code session only speaks when you speak to it, so this comes from the orchestrator.':
+    '任务靠岸、失败、或停下来等你回答时，弹一条系统通知。Helm 自己做不到这件事——Claude Code 会话只有你开口它才会说话，所以这条是 orchestrator 推的。',
+  'On': '开',
+  'Off': '关',
   'written to {0}': '写入 {0}',
   'Could not read the settings': '读不到设置',
   'Language': '语言',
@@ -1637,6 +1642,7 @@ function submitConfig() {
     address: val('cfg-address') || null,
     maxTokensPerTask: num(val('cfg-tokens')),
     maxConcurrentCrew: Number(val('cfg-crew') || 1),
+    notify: val('cfg-notify') !== 'off',
   };
   if (!Number.isFinite(patch.maxTokensPerTask) || patch.maxTokensPerTask < 0) {
     toast(tr('The token ceiling must be a whole number, or empty for none.'), 'err');
@@ -1679,6 +1685,12 @@ function renderConfig() {
       ${field(tr('Token ceiling per task'),
         tr('0 or empty means NO ceiling. On a Claude subscription this is the only thing that stops a runaway task — and it counts cache reads, which are most of any long task.'),
         `<input class="field" id="cfg-tokens" type="number" min="0" step="100000" value="${attr(c.maxTokensPerTask || '')}" placeholder="${attr(tr('no ceiling'))}" ${busy}>`)}
+      ${field(tr('Tell me when a task settles'),
+        tr('A desktop notification when a task lands, fails, or stops on a question. Helm cannot do this itself — a Claude Code session only speaks when you speak to it, so this comes from the orchestrator.'),
+        `<select class="field" id="cfg-notify" ${busy}>
+          <option value="on"${c.notify === false ? '' : ' selected'}>${esc(tr('On'))}</option>
+          <option value="off"${c.notify === false ? ' selected' : ''}>${esc(tr('Off'))}</option>
+        </select>`)}
       ${field(tr('Crews at once'),
         tr('How many tasks may run in parallel. Default {0}. Each one is a real Claude Code session on your login — see docs/compliance.md before raising it far.', d.maxConcurrentCrew ?? 10),
         `<input class="field" id="cfg-crew" type="number" min="1" step="1" value="${attr(String(c.maxConcurrentCrew ?? ''))}" ${busy}>`)}

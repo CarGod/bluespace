@@ -33,6 +33,7 @@ import type {
 import { UnsupportedCapabilityError } from '../src/adapters/types.js';
 import { Blackbox } from '../src/blackbox/index.js';
 import type { BlueConfig, ProjectRegistry } from '../src/config/index.js';
+import type { FleetNotice } from '../src/notify/index.js';
 import {
   CrewNotHeldError,
   Orchestrator,
@@ -306,6 +307,8 @@ interface Harness {
   verdicts: VerdictSpec[];
   sentinelRuns: Array<{ taskId: string; diff: string; cwd: string }>;
   errors: Array<{ scope: string; err: unknown }>;
+  /** Every notice the fleet pushed at the captain, in order. */
+  notices: FleetNotice[];
   /**
    * The live settings object the orchestrator reads through.
    *
@@ -365,6 +368,7 @@ function harness(
   const verdicts: VerdictSpec[] = [];
   const sentinelRuns: Harness['sentinelRuns'] = [];
   const errors: Harness['errors'] = [];
+  const notices: FleetNotice[] = [];
 
   const sentinel: SentinelRunner = async ({ task, diff, cwd }) => {
     sentinelRuns.push({ taskId: task.id, diff, cwd });
@@ -400,9 +404,10 @@ function harness(
     },
     sentinel,
     onError: (scope, err) => errors.push({ scope, err }),
+    notify: (notice) => notices.push(notice),
   });
 
-  open = { bb, orch, adapter, worktrees, project: merged, verdicts, sentinelRuns, errors, config: liveConfig };
+  open = { bb, orch, adapter, worktrees, project: merged, verdicts, sentinelRuns, errors, notices, config: liveConfig };
   return open;
 }
 
@@ -1372,6 +1377,42 @@ describe('captain controls', () => {
 
     expect(crew.closed, 'a failed interrupt left the crew running').toBe(true);
     expect(failureReason(h, task.id)).toContain('token_ceiling_exceeded');
+  });
+
+  it('tells the captain when a task lands, and when it dies', async () => {
+    // Helm cannot: an interactive session speaks only when spoken to, so "it
+    // landed twenty minutes ago" has no turn to be said in. This is the push
+    // that replaces waiting for the captain to come back and ask.
+    const h = harness();
+    const landed = newTask(h);
+    await h.orch.tick();
+    h.adapter.crewFor(landed.id).turn();
+    await until(() => stateOf(h, landed.id) === 'landed', 'the task lands');
+
+    const landing = h.notices.find((n) => n.title.startsWith('Landed'));
+    expect(landing, 'nothing was pushed when the task landed').toBeDefined();
+    // The project it belongs to, and the task's own title, verbatim.
+    expect(landing!.title).toContain('demo');
+    expect(landing!.body).toContain(landed.title);
+
+    const doomed = newTask(h);
+    await h.orch.tick();
+    h.adapter.crewFor(doomed.id).turn({ ok: false, reason: 'the worktree went away' });
+    await until(() => stateOf(h, doomed.id) === 'failed', 'the task fails');
+
+    expect(h.notices.some((n) => n.title.startsWith('Failed'))).toBe(true);
+  });
+
+  it('does not interrupt the captain for a hop they cannot act on', async () => {
+    // A fleet that notifies on `dispatched` and `working` is a fleet whose
+    // notifications get switched off — and then the one that mattered is missed
+    // with them.
+    const h = harness();
+    const task = newTask(h);
+    await h.orch.tick();
+
+    expect(stateOf(h, task.id)).toBe('working');
+    expect(h.notices).toEqual([]);
   });
 
   it('reads the ceiling that is set NOW, not the one set at boot', async () => {

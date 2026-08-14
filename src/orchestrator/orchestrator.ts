@@ -36,6 +36,7 @@ import { CREW_SYSTEM_PROMPT, NEEDS_DECISION_MARKER, buildBrief } from '../agents
 import { runSentinel } from '../agents/sentinel/index.js';
 import { projectOpenDecisions, projectTask, projectTasks, type Blackbox } from '../blackbox/index.js';
 import type { BlueConfig, ProjectRegistry } from '../config/index.js';
+import type { FleetNotice } from '../notify/index.js';
 import type { Worktree, WorktreeManager } from '../worktree/index.js';
 import {
   isTerminal,
@@ -231,6 +232,15 @@ export interface OrchestratorDeps {
   sentinel?: SentinelRunner;
   /** Optional diagnostics sink. Defaults to stderr. */
   onError?: (scope: string, err: unknown) => void;
+  /**
+   * Told when a task settles, so the captain can hear about it without being at
+   * the screen.
+   *
+   * ABSENT BY DEFAULT, which is why every test is silent: only `boot()` supplies
+   * one. It is called from inside the dispatch loop and must never throw or
+   * block — see `src/notify`.
+   */
+  notify?: (notice: FleetNotice) => void;
 }
 
 /** The settings as of RIGHT NOW. Never store the result. */
@@ -290,6 +300,49 @@ export class Orchestrator {
 
   constructor(deps: OrchestratorDeps) {
     this.#deps = deps;
+  }
+
+  /**
+   * Push one outcome at the captain, if this run has anywhere to push it.
+   *
+   * Only the three states that change what they would do next: work that is
+   * finished and waiting to be looked at, work that died, and work that has
+   * stopped dead until they answer something. Not `dispatched`, not
+   * `needs_rework` — a fleet that interrupts on every hop is a fleet whose
+   * notifications get turned off, and then the one that mattered is missed too.
+   *
+   * `cancelled` is deliberately absent: the captain is the only thing that
+   * cancels a task, so telling them is telling them what they just did.
+   */
+  #announce(taskId: TaskId, to: TaskState, detail?: string): void {
+    const notify = this.#deps.notify;
+    if (notify === undefined) return;
+    if (to !== 'landed' && to !== 'failed' && to !== 'awaiting_decision') return;
+    const task = this.task(taskId);
+    if (!task) return;
+
+    let project = task.projectId;
+    try {
+      project = this.#deps.registry.get(task.projectId)?.name ?? task.projectId;
+    } catch {
+      // A registry that cannot answer costs the notification its project name,
+      // never the notification.
+    }
+    const headline =
+      to === 'landed'
+        ? `Landed · ${project}`
+        : to === 'failed'
+          ? `Failed · ${project}`
+          : `Needs you · ${project}`;
+    // The title is DATA and goes in verbatim; `detail` is a reason string the
+    // engine wrote, and it is the difference between "a task failed" and "a task
+    // failed because it ran out of tokens".
+    const body = detail !== undefined && detail !== '' ? `${task.title} — ${detail}` : task.title;
+    try {
+      notify({ title: headline, body: body.length > 240 ? `${body.slice(0, 239)}…` : body });
+    } catch (err) {
+      this.#log('notify', err);
+    }
   }
 
   /**
@@ -1273,6 +1326,7 @@ export class Orchestrator {
       from = hop;
     }
     if (bodies.length > 0) this.#deps.blackbox.appendMany(bodies);
+    this.#announce(taskId, to, reason);
     return true;
   }
 
@@ -1291,6 +1345,7 @@ export class Orchestrator {
       },
       stateChange(taskId, 'ready', 'landed', input.reason),
     ]);
+    this.#announce(taskId, 'landed', input.summary);
   }
 
   #failTask(taskId: TaskId, reason: string): void {

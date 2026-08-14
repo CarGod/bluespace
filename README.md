@@ -404,6 +404,7 @@ directory (config, Blackbox, worktrees) — useful for keeping work projects sep
 | `maxRework` | `2` | How many times a failing verdict may send a task back before it escalates to you. |
 | `language` | *(unset)* | The language Helm writes to you in. Unset means "work it out". See below. |
 | `address` | *(unset)* | What Helm calls you. Unset derives it from `language` — 舰长 in Chinese, Captain otherwise. |
+| `notify` | `true` | Desktop notification when a task lands, fails, or needs you. `BLUESPACE_NO_NOTIFY=1` silences one shell. |
 | `languageAsked` | *(unset)* | Whether the first-launch language question has been put. `false` puts it back. |
 | `helmUltracode` | `true` | Open the `bluespace` window at **ultracode** — xhigh effort plus standing dynamic-workflow orchestration. See below. |
 | `helmPermissionMode` | `auto` | Permission posture for the `bluespace` window. Not the same key as `permissionMode`, which is for Crews. |

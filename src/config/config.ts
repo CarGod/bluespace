@@ -492,6 +492,18 @@ export interface BlueConfig {
    * the voice and reaches Helm through the launcher's system prompt.
    */
   address?: string;
+  /**
+   * Push a desktop notification when a task lands, fails, or stops on a
+   * question. Defaults to on.
+   *
+   * It exists because Helm CANNOT do this. An interactive Claude Code session
+   * speaks only when it is spoken to, so "your task finished twenty minutes ago"
+   * is a sentence that has no turn to be said in — the wake sweep delivers it
+   * the next time the captain types, which may be the next morning. The
+   * orchestrator is running at the moment the task settles, so the push comes
+   * from there. See `src/notify`.
+   */
+  notify?: boolean;
   /** Derived from BLUESPACE_HOME / ~/.bluespace. Not settable from the file. */
   dataDir: string;
 }
@@ -802,6 +814,16 @@ export function mergeConfig(base: BlueConfig, patch: Record<string, unknown>): B
     }
   }
 
+  if ('notify' in patch) {
+    if (patch.notify === null) {
+      out.notify = undefined;
+    } else if (typeof patch.notify === 'boolean') {
+      out.notify = patch.notify;
+    } else if (patch.notify !== undefined) {
+      warn(`ignoring invalid notify ${JSON.stringify(patch.notify)} — expected true or false`);
+    }
+  }
+
   if ('languageAsked' in patch) {
     if (patch.languageAsked === null) {
       out.languageAsked = undefined;
@@ -927,6 +949,7 @@ function serialize(cfg: BlueConfig): Record<string, unknown> {
     ...(cfg.effort !== undefined ? { effort: cfg.effort } : {}),
     ...(cfg.language !== undefined ? { language: cfg.language } : {}),
     ...(cfg.address !== undefined ? { address: cfg.address } : {}),
+    ...(cfg.notify !== undefined ? { notify: cfg.notify } : {}),
     // Persisted even though it is `false` half the time it is set, because
     // `false` here is not the default — it is "ask me again", which a captain
     // can only have got by typing it.

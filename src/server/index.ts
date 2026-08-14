@@ -349,6 +349,7 @@ export async function startServer(opts: StarmapOptions): Promise<StarmapHandle> 
           maxTokensPerTask: cfg.maxTokensPerTask,
           maxConcurrentCrew: cfg.maxConcurrentCrew,
           maxRework: cfg.maxRework,
+          notify: cfg.notify !== false,
         },
         // What the captain would get if they cleared the field — the placeholder
         // the form shows, so "unset" is never a blank nobody can interpret.
@@ -385,6 +386,13 @@ export async function startServer(opts: StarmapOptions): Promise<StarmapHandle> 
           patch.languageAsked = true;
         }
       }
+      if ('notify' in raw) {
+        if (typeof raw['notify'] !== 'boolean') {
+          sendJson(res, 400, { error: 'notify must be true or false' });
+          return;
+        }
+        patch.notify = raw['notify'];
+      }
       if ('address' in raw) {
         if (raw['address'] === null || raw['address'] === '') patch.address = null;
         else if (typeof raw['address'] === 'string' && raw['address'].trim() !== '') patch.address = raw['address'].trim();
@@ -418,6 +426,7 @@ export async function startServer(opts: StarmapOptions): Promise<StarmapHandle> 
             maxTokensPerTask: saved.maxTokensPerTask,
             maxConcurrentCrew: saved.maxConcurrentCrew,
             maxRework: saved.maxRework,
+            notify: saved.notify !== false,
           },
           resolved: { address: voice.address, language: voice.language ?? null },
         });
