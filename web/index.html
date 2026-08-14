@@ -202,6 +202,9 @@ button.chip { font: inherit; font-size: 11.5px; font-weight: 560; appearance: no
   appearance: none; cursor: pointer; border-radius: var(--radius-sm);
   border: 1px solid var(--border-strong); background: var(--surface); color: var(--text);
   padding: 7px 12px; font-size: 13px; font-weight: 540;
+  /* A label is one word or it is nothing: at 290px "Delete…" wrapped to
+     "Dele / te…", which is not a button, it is a puzzle. */
+  white-space: nowrap;
   transition: background .12s ease, border-color .12s ease, transform .06s ease;
 }
 .btn:hover { background: var(--surface-2); border-color: var(--text-3); }
@@ -448,8 +451,12 @@ button.chip { font: inherit; font-size: 11.5px; font-weight: 560; appearance: no
 .wt-line:hover { color: var(--text-1); }
 .merged { color: var(--s-landed); font-size: 11.5px; }
 .unmerged { color: var(--text-3); font-size: 11.5px; }
+.wt-groups { display: grid; gap: 22px; }
 .wt-list { padding: 0; }
-.wt-row { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 12px; align-items: center;
+/* Three columns, and only the FIRST one may shrink: the size and the buttons
+   have a width they need, and taking it from them is what turned the actions
+   into a two-character column. */
+.wt-row { display: grid; grid-template-columns: minmax(0, 1fr) max-content max-content; gap: 16px; align-items: center;
   padding: 11px 14px; border-bottom: 1px solid var(--border); }
 .wt-row:last-child { border-bottom: 0; }
 .wt-main { min-width: 0; display: grid; gap: 3px; }
@@ -458,7 +465,8 @@ button.chip { font: inherit; font-size: 11.5px; font-weight: 560; appearance: no
 .wt-title { font-size: 12.5px; color: var(--text-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .wt-meta { display: flex; align-items: center; gap: 10px; }
 .wt-act { display: flex; align-items: center; gap: 8px; justify-content: flex-end; }
-.wt-why { font-size: 11.5px; max-width: 34ch; text-align: right; }
+.wt-why { font-size: 11.5px; max-width: 40ch; text-align: right; }
+.wt-meta .num { min-width: 62px; text-align: right; }
 @media (max-width: 860px) { .wt-row { grid-template-columns: 1fr; } .wt-act, .wt-meta { justify-content: flex-start; } .wt-why { text-align: left; } }
 .board-foot { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 4px 2px 2px; font-size: 12px; color: var(--text-3); }
 
@@ -1591,7 +1599,7 @@ function renderWorktrees() {
   return `<div class="section-head"><h2>${esc(tr('Worktrees'))}</h2>
       <span class="count">${esc(nOf(count, 'worktree', 'worktrees', '个 worktree'))} · ${esc(bytes(total))}</span></div>
     <p class="hint" style="margin:-6px 0 14px">${esc(tr('A worktree is kept until its work is merged — that is what makes it safe to remove. Landing a task merges its branch into blue/dev; after that this panel will offer to reclaim it.'))}</p>
-    <div class="board">${groups}</div>`;
+    <div class="wt-groups">${groups}</div>`;
 }
 
 /* ---- 3. diff -------------------------------------------------------------- */
