@@ -528,6 +528,60 @@ export class WorktreeManager {
     return { path: real, branch, repoPath: repoRoot, taskId };
   }
 
+  /**
+   * Take over a directory another task left behind, and cut this task's branch
+   * at whatever is in it right now.
+   *
+   * WHY THE DIRECTORY AND NOT THE BRANCH. Measured across a fleet that died to a
+   * token ceiling: every dead task had four to nine modified files and ZERO
+   * commits, because Crews commit at the end of the job rather than as they go.
+   * A resume that branched off the dead branch would inherit an empty tree and
+   * the captain would pay for the same work twice. `git switch -c` carries the
+   * working tree across with it, which is the entire value being rescued.
+   *
+   * The ancestor's branch is left exactly where it was — it is the record of
+   * what that run committed, which is nothing, and rewriting history to say
+   * otherwise is not this function's business.
+   */
+  async adopt(taskId: string, from: string): Promise<Worktree> {
+    assertSafeTaskId(taskId);
+    const repoRoot = await this.repoRoot();
+    const branch = taskBranchName(taskId);
+    if (branch === INTEGRATION_BRANCH) {
+      throw new Error(
+        `taskId ${JSON.stringify(taskId)} would collide with the integration branch ${INTEGRATION_BRANCH}`,
+      );
+    }
+
+    let real: string;
+    try {
+      real = await fs.realpath(from);
+    } catch {
+      throw new Error(`cannot resume: the worktree ${from} is gone`);
+    }
+
+    // It must still be a worktree of THIS repository. A directory that merely
+    // exists at the recorded path is not evidence of anything.
+    const top = await git(['rev-parse', '--show-toplevel'], real, { allowFailure: true });
+    if (top.exitCode !== 0 || (await fs.realpath(top.stdout.trim())) !== real) {
+      throw new Error(`cannot resume: ${real} is not a git worktree root`);
+    }
+    await assertIsolated(real, repoRoot);
+
+    // `switch -c` keeps uncommitted changes; `-C` would be a reset. If the
+    // branch somehow exists already, switching to it is the right answer — a
+    // second resume of the same task should not invent a third name.
+    const cut = await git(['switch', '-c', branch], real, { allowFailure: true });
+    if (cut.exitCode !== 0) {
+      const swap = await git(['switch', branch], real, { allowFailure: true });
+      if (swap.exitCode !== 0) {
+        throw new Error(`cannot resume: could not put ${branch} on ${real} (${cut.stderr.trim()})`);
+      }
+    }
+
+    return { path: real, branch, repoPath: repoRoot, taskId };
+  }
+
   private async ensureRoot(): Promise<string> {
     await fs.mkdir(this.rootInput, { recursive: true });
     return fs.realpath(this.rootInput);

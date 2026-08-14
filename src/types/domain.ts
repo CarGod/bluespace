@@ -201,6 +201,14 @@ export interface Task {
   dependsOn: TaskId[];
   createdAt: number;
   updatedAt: number;
+  /**
+   * The task this one continues, if any. See `task.created.resumeOf`.
+   *
+   * Presentation and provenance only: nothing about dispatch reads it except
+   * the one branch that adopts the ancestor's worktree instead of cutting a
+   * fresh one.
+   */
+  resumeOf?: TaskId;
   /** Set once dispatched. */
   crewId?: CrewId;
   worktree?: string;

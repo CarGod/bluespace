@@ -46,6 +46,21 @@ export interface TaskCreated {
   title: string;
   brief: string;
   dependsOn: TaskId[];
+  /**
+   * The task this one is picking up from, if it is a resume.
+   *
+   * A dead task is NOT revived: `failed` and `cancelled` have no outgoing edges
+   * and never will, because the log has to say what actually happened. Carrying
+   * on is a new task that inherits the old one's WORKTREE — the directory with
+   * the work in it — and the lineage is recorded here so the two can be read as
+   * one piece of work.
+   *
+   * Measured, and the reason the worktree rather than the branch is what gets
+   * inherited: every task that died to the token ceiling had 4–9 modified files
+   * and ZERO commits. Crews commit at the end. A resume that branched off the
+   * dead branch would inherit nothing at all.
+   */
+  resumeOf?: TaskId;
 }
 
 export interface TaskDispatched {

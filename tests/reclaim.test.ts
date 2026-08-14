@@ -145,6 +145,34 @@ describe('reclaimWorktrees — the safe sweep', () => {
     );
   });
 
+  it('considers ONLY the paths it was given, and still applies every rule to them', async () => {
+    // For the Starmap's per-worktree Reclaim button: the captain points at one
+    // directory. Narrowing what is looked at must not widen what is allowed —
+    // and a targeted removal must never take a neighbour with it.
+    const keep = taskId();
+    const take = taskId();
+    const keepWt = await mgr.create(keep);
+    const takeWt = await mgr.create(take);
+    await commitIn(keepWt, 'kept.ts', 'export const kept = true;\n');
+    await commitIn(takeWt, 'taken.ts', 'export const taken = true;\n');
+    await land(takeWt);
+
+    const tasks = [task(keep, 'landed', keepWt.path), task(take, 'landed', takeWt.path)];
+    const result = await reclaimWorktrees(mgr, tasks, { only: [takeWt.path] });
+
+    expect(result.reclaimed.map((r) => r.path)).toEqual([takeWt.path]);
+    // The other worktree was not removed, and was not even reported on: it was
+    // not asked about.
+    expect(result.kept).toEqual([]);
+    expect(await pathExists(keepWt.path)).toBe(true);
+
+    // And the rule still binds inside the narrowing: this one is unlanded.
+    const refused = await reclaimWorktrees(mgr, tasks, { only: [keepWt.path] });
+    expect(refused.reclaimed).toEqual([]);
+    expect(refused.kept[0]?.reason.kind).toBe('unlanded');
+    expect(await pathExists(keepWt.path)).toBe(true);
+  });
+
   it('KEEPS a landed worktree whose commits are not in the base branch', async () => {
     const id = taskId();
     const wt = await mgr.create(id);

@@ -53,6 +53,7 @@ import type { ConfigPatch } from '../config/index.js';
 import { readHelmWindows } from '../helm/index.js';
 import { helmWindowsInView } from '../cli/ps.js';
 import type { Orchestrator } from '../orchestrator/index.js';
+import { WorktreeManager, reclaimWorktrees } from '../worktree/index.js';
 import { isTerminal } from '../types/domain.js';
 import type { Decision, Project, Task, TaskId } from '../types/domain.js';
 import type { BlueEvent } from '../types/events.js';
@@ -436,6 +437,48 @@ export async function startServer(opts: StarmapOptions): Promise<StarmapHandle> 
       return;
     }
 
+    /**
+     * Every worktree BlueSpace cut, per project, with the one thing a captain
+     * cannot see from the board: whether the work in it exists anywhere else.
+     *
+     * The answer comes from the same sweep `blue gc` runs, in `dryRun` — so the
+     * panel and the garbage collector can never disagree about what is safe to
+     * remove, and the reason a directory is being kept is the sweep's own words
+     * rather than a second opinion written for a screen.
+     *
+     * NOT on the live tick: this walks directories and asks git questions per
+     * worktree. It is asked for when the panel is opened.
+     */
+    if (method === 'GET' && a === 'worktrees' && segs.length === 2) {
+      mirror.refresh();
+      sendJson(res, 200, await worktreeReport());
+      return;
+    }
+
+    /**
+     * Remove ONE worktree the captain pointed at.
+     *
+     * Every rule of the sweep still applies — the path is a narrowing, not a
+     * permission. `force` is the captain overriding a refusal, which is exactly
+     * what `blue gc --force` is, and the response says what it cost.
+     */
+    if (method === 'POST' && a === 'worktrees' && b === 'reclaim' && segs.length === 3) {
+      const body = await readJsonBody(req, res);
+      if (!body.ok) return;
+      const target = stringField(body.value, 'path');
+      if (!target) {
+        sendJson(res, 400, { error: 'body must be {"path": "<worktree path>"}' });
+        return;
+      }
+      const force = (body.value as Record<string, unknown>)['force'] === true;
+      try {
+        sendJson(res, 200, await reclaimOne(target, force));
+      } catch (err) {
+        sendJson(res, 409, { error: messageOf(err) });
+      }
+      return;
+    }
+
     if (method === 'GET' && a === 'stream' && segs.length === 2) {
       openStream(req, res, url);
       return;
@@ -607,6 +650,115 @@ export async function startServer(opts: StarmapOptions): Promise<StarmapHandle> 
   }
 
   // ---- helpers bound to this server instance -----------------------------
+
+  /** The manager for one project's repository, built on demand and reused. */
+  const managers = new Map<string, WorktreeManager>();
+  function managerFor(repoPath: string): WorktreeManager {
+    let m = managers.get(repoPath);
+    if (m === undefined) {
+      m = new WorktreeManager(repoPath, { root: join(dataDir(), 'worktrees') });
+      managers.set(repoPath, m);
+    }
+    return m;
+  }
+
+  /** Projects with a repository on disk, and the tasks projected right now. */
+  function projectsAndTasks(): { projects: Project[]; tasks: Task[] } {
+    const events = mirror.all() as BlueEvent[];
+    let tasks: Task[] = [];
+    try {
+      tasks = orch.tasks();
+    } catch {
+      tasks = [];
+    }
+    return { projects: projects.list(events), tasks };
+  }
+
+  async function worktreeReport(): Promise<{
+    projects: Array<{
+      id: string;
+      name: string;
+      path: string;
+      worktrees: Array<Record<string, unknown>>;
+      bytes: number;
+      error?: string;
+    }>;
+    now: number;
+  }> {
+    const { projects: list, tasks } = projectsAndTasks();
+    const byTask = new Map(tasks.map((t) => [t.id, t]));
+    const out = [];
+    for (const project of list) {
+      const entry: {
+        id: string;
+        name: string;
+        path: string;
+        worktrees: Array<Record<string, unknown>>;
+        bytes: number;
+        error?: string;
+      } = { id: project.id, name: project.name, path: project.path, worktrees: [], bytes: 0 };
+      try {
+        const sweep = await reclaimWorktrees(managerFor(project.path), tasks, {
+          dryRun: true,
+          ...(project.devBranch !== undefined ? { integrationBranches: [project.devBranch] } : {}),
+        });
+        const row = (
+          e: { path: string; bytes: number; branch?: string; taskId?: string },
+          reclaimable: boolean,
+          reason?: unknown,
+        ): Record<string, unknown> => {
+          const task = e.taskId ? byTask.get(e.taskId) : undefined;
+          return {
+            path: e.path,
+            bytes: e.bytes,
+            branch: e.branch ?? null,
+            taskId: e.taskId ?? null,
+            title: task?.title ?? null,
+            state: task?.state ?? null,
+            mergedInto: task?.mergedInto ?? null,
+            mergedAt: task?.mergedAt ?? null,
+            reclaimable,
+            ...(reason !== undefined ? { reason } : {}),
+          };
+        };
+        entry.worktrees = [
+          ...sweep.reclaimed.map((e) => row(e, true)),
+          ...sweep.kept.map((e) => row(e, false, e.reason)),
+        ].sort((x, y) => Number(y['bytes']) - Number(x['bytes']));
+        entry.bytes = entry.worktrees.reduce((n, w) => n + Number(w['bytes'] ?? 0), 0);
+        if (sweep.errors.length > 0) entry.error = sweep.errors[0]?.message;
+      } catch (err) {
+        entry.error = messageOf(err);
+      }
+      out.push(entry);
+    }
+    return { projects: out, now: Date.now() };
+  }
+
+  async function reclaimOne(target: string, force: boolean): Promise<Record<string, unknown>> {
+    const { projects: list, tasks } = projectsAndTasks();
+    const resolved = resolve(target);
+    // The path has to belong to a registered project, so a stray POST cannot
+    // point this at an arbitrary directory.
+    for (const project of list) {
+      const sweep = await reclaimWorktrees(managerFor(project.path), tasks, {
+        only: [resolved],
+        force,
+        ...(project.devBranch !== undefined ? { integrationBranches: [project.devBranch] } : {}),
+      });
+      if (sweep.reclaimed.length === 0 && sweep.kept.length === 0 && sweep.errors.length === 0) {
+        continue;
+      }
+      return {
+        ok: sweep.reclaimed.length > 0,
+        reclaimed: sweep.reclaimed,
+        kept: sweep.kept,
+        bytesFreed: sweep.bytesFreed,
+        errors: sweep.errors,
+      };
+    }
+    throw new Error(`${resolved} is not a worktree of any registered project`);
+  }
 
   function buildState(): {
     tasks: Task[];

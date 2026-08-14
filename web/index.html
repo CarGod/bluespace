@@ -444,6 +444,22 @@ button.chip { font: inherit; font-size: 11.5px; font-weight: 560; appearance: no
   color: var(--text-3); font-size: 12px;
 }
 .held-note { font-size: 11.5px; }
+.wt-line { font-size: 11px; color: var(--text-3); cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wt-line:hover { color: var(--text-1); }
+.merged { color: var(--s-landed); font-size: 11.5px; }
+.unmerged { color: var(--text-3); font-size: 11.5px; }
+.wt-list { padding: 0; }
+.wt-row { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 12px; align-items: center;
+  padding: 11px 14px; border-bottom: 1px solid var(--border); }
+.wt-row:last-child { border-bottom: 0; }
+.wt-main { min-width: 0; display: grid; gap: 3px; }
+.wt-branch { font-size: 12px; cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wt-branch:hover { color: var(--accent); }
+.wt-title { font-size: 12.5px; color: var(--text-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wt-meta { display: flex; align-items: center; gap: 10px; }
+.wt-act { display: flex; align-items: center; gap: 8px; justify-content: flex-end; }
+.wt-why { font-size: 11.5px; max-width: 34ch; text-align: right; }
+@media (max-width: 860px) { .wt-row { grid-template-columns: 1fr; } .wt-act, .wt-meta { justify-content: flex-start; } .wt-why { text-align: left; } }
 .board-foot { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 4px 2px 2px; font-size: 12px; color: var(--text-3); }
 
 .cfg { display: grid; gap: 0; padding: 0; max-width: 720px; }
@@ -495,6 +511,7 @@ button.chip { font: inherit; font-size: 11.5px; font-weight: 560; appearance: no
   <button class="tab" role="tab" data-act="tab" data-view="fleet" aria-selected="false">Fleet <span class="num" id="tab-fleet">0</span></button>
   <button class="tab" role="tab" data-act="tab" data-view="diff" aria-selected="false">Diff</button>
   <button class="tab" role="tab" data-act="tab" data-view="timeline" aria-selected="false">Timeline</button>
+  <button class="tab" role="tab" data-act="tab" data-view="worktrees" aria-selected="false">Worktrees</button>
   <button class="tab" role="tab" data-act="tab" data-view="config" aria-selected="false">Settings</button>
 </nav>
 </div>
@@ -504,6 +521,7 @@ button.chip { font: inherit; font-size: 11.5px; font-weight: 560; appearance: no
   <section class="view" id="view-fleet" role="tabpanel" hidden></section>
   <section class="view" id="view-diff" role="tabpanel" hidden></section>
   <section class="view" id="view-timeline" role="tabpanel" hidden></section>
+  <section class="view" id="view-worktrees" role="tabpanel" hidden></section>
   <section class="view" id="view-config" role="tabpanel" hidden></section>
 </main>
 
@@ -589,6 +607,7 @@ const app = {
   helm: { windows: [], observedAt: 0 },
   lang: 'en',            // replaced by detectLang() before the first paint
   cfg: { data: null, loading: false, error: null, saving: false, saved: 0 },
+  wt: { data: null, loading: false, error: null, busy: null, confirm: null },
 };
 
 /* ---- language ------------------------------------------------------------
@@ -772,6 +791,34 @@ const ZH = {
   'another process holds this Crew': '这个 Crew 属于另一个进程',
   'A live Crew belongs to the process that spawned it. This Starmap is view-only — run it with --orchestrate, or steer from the Helm window.':
     '活着的 Crew 归派遣它的那个进程所有。这个 Starmap 是只读的——用 --orchestrate 启动它，或者回 Helm 窗口里干预。',
+
+  // worktrees
+  'Worktrees': 'Worktree',
+  'Reading the worktrees…': '正在读取 worktree…',
+  'Could not read the worktrees': '读不到 worktree',
+  'No worktrees': '没有 worktree',
+  'A worktree appears when a task is dispatched, and stays until its work is merged.':
+    '任务一被派遣就会出现一个 worktree，一直留到它的成果被合并为止。',
+  'A worktree is kept until its work is merged — that is what makes it safe to remove. Landing a task merges its branch into blue/dev; after that this panel will offer to reclaim it.':
+    'worktree 会一直留着，直到里面的成果被合并——合并了才谈得上安全删除。让任务靠岸就是把它的分支并进 blue/dev；并完之后，这个面板才会给你回收按钮。',
+  'merged → {0}': '已并入 {0}',
+  'not merged': '未合并',
+  'Merged into {0}. The worktree can be reclaimed.': '已并入 {0}，这个 worktree 可以回收了。',
+  'Verified, but the branch is still only in its worktree. Landing it merges it into blue/dev.':
+    '核验通过了，但分支还只存在于它自己的 worktree 里。让它靠岸才会并进 blue/dev。',
+  'Reclaim': '回收',
+  'Reclaimed {0}': '已回收 {0}',
+  'Kept': '保留',
+  'Delete…': '删除…',
+  'Delete anyway': '仍然删除',
+  'Keep': '不删',
+  'no task — left by a crash between cutting and recording': '没有对应任务——切目录和记录之间崩了一次留下的',
+  'a Crew is still working here': '还有 Crew 在这里干活',
+  'uncommitted changes — this work exists nowhere else': '有未提交的改动——这些东西别处没有第二份',
+  '{0} commits not in {1} — land it first': '有 {0} 个 commit 不在 {1} 里——先让它靠岸',
+  'git knows this worktree, BlueSpace does not': 'git 认得这个 worktree，BlueSpace 不认',
+  'this is the integration branch': '这是集成分支',
+  'git does not know this directory': 'git 不认识这个目录',
 
   // settings
   'Settings': '设置',
@@ -1122,7 +1169,7 @@ function renderChrome() {
     lang.textContent = app.lang === 'zh' ? 'EN' : '中';
     lang.title = tr('Switch to Chinese');
   }
-  const labels = { inbox: tr('Inbox'), fleet: tr('Fleet'), diff: tr('Diff'), timeline: tr('Timeline'), config: tr('Settings') };
+  const labels = { inbox: tr('Inbox'), fleet: tr('Fleet'), diff: tr('Diff'), timeline: tr('Timeline'), worktrees: tr('Worktrees'), config: tr('Settings') };
   for (const tab of document.querySelectorAll('.tab')) {
     const badge = tab.querySelector('.badge, .num');
     tab.textContent = labels[tab.dataset.view] || tab.dataset.view;
@@ -1162,7 +1209,7 @@ function render() {
   const feedY = feedNode ? feedNode.scrollTop : 0;
   const feedBottom = feedNode ? feedNode.scrollHeight - feedNode.clientHeight - feedY < 40 : true;
 
-  for (const v of ['inbox','fleet','diff','timeline','config']) {
+  for (const v of ['inbox','fleet','diff','timeline','worktrees','config']) {
     const node = el('view-' + v);
     const on = app.view === v;
     node.hidden = !on;
@@ -1171,6 +1218,7 @@ function render() {
     else if (v === 'fleet') node.innerHTML = renderFleet();
     else if (v === 'diff') node.innerHTML = renderDiff();
     else if (v === 'timeline') node.innerHTML = renderTimeline();
+    else if (v === 'worktrees') node.innerHTML = renderWorktrees();
     else node.innerHTML = renderConfig();
   }
   for (const t of document.querySelectorAll('.tab')) {
@@ -1388,7 +1436,10 @@ function taskCard(t, map, dependents, activity) {
       <span title="${attr(tr('Tokens this task consumed — what a Crew actually spends. Dollars only exist for a metered (API-key) run.'))}">${esc(tr('tokens'))} <b>${tokens(taskTokens(t.id))}</b></span>
       <span title="${attr(TERMINAL.has(t.state) ? tr('Total lifetime') : tr('Since created'))}">${esc(elapsed)}</span>
       ${rework}
+      ${mergeFact(t)}
     </div>
+    ${t.worktree ? `<div class="wt-line mono" data-act="copy" data-copy="${attr(t.worktree)}"
+      title="${attr(t.worktree + ' — ' + tr('Click to copy'))}">${esc(taskBranch(t))}</div>` : ''}
     ${deps || blocks.length ? `<div class="deps">
       ${deps}
       ${blocks.length ? `<span class="dep" title="${attr(blocks.map((b) => b.title).join(', '))}">↓ ${esc(tr('blocks {0}', blocks.length))}</span>` : ''}
@@ -1414,6 +1465,133 @@ function taskCard(t, map, dependents, activity) {
       <div><button class="btn primary sm" data-act="steer-send" data-id="${attr(t.id)}">${esc(tr('Send to Crew'))}</button></div>
     </div>` : ''}
   </article>`;
+}
+
+/** `blue/<taskId>` — what `WorktreeManager` names a task's branch. */
+function taskBranch(t) { return 'blue/' + t.id; }
+
+/**
+ * Whether this task's work exists anywhere but its own worktree.
+ *
+ * The distinction the board could not previously show, and the one that decides
+ * whether a directory can be reclaimed: `landed` means the Sentinel passed, and
+ * NOTHING MORE — the branch is still sitting in a worktree until the captain
+ * lands it into the integration branch.
+ */
+function mergeFact(t) {
+  if (t.mergedInto) {
+    return `<span class="merged" title="${attr(tr('Merged into {0}. The worktree can be reclaimed.', t.mergedInto))}">${esc(tr('merged → {0}', t.mergedInto))}</span>`;
+  }
+  if (t.state !== 'landed') return '';
+  return `<span class="unmerged" title="${attr(tr('Verified, but the branch is still only in its worktree. Landing it merges it into blue/dev.'))}">${esc(tr('not merged'))}</span>`;
+}
+
+/* ---- 6. worktrees ----------------------------------------------------------
+ *
+ * WHAT IS ON DISK, and whether the work in it exists anywhere else. The verdict
+ * for each directory comes from the same sweep `blue gc` runs, in dry-run — so
+ * this panel and the garbage collector cannot disagree, and the reason a
+ * directory is being kept is the sweep's own words rather than a second opinion
+ * written for a screen.
+ */
+async function loadWorktrees() {
+  app.wt = { ...app.wt, loading: true, error: null };
+  try {
+    app.wt = { ...app.wt, data: await api('/api/worktrees'), loading: false };
+  } catch (err) {
+    app.wt = { ...app.wt, loading: false, error: err.message };
+  }
+  paint();
+}
+
+async function reclaimWorktree(path, force) {
+  app.wt = { ...app.wt, busy: path, confirm: null };
+  paint();
+  try {
+    const out = await api('/api/worktrees/reclaim', {
+      method: 'POST', body: JSON.stringify({ path, force: force === true }),
+    });
+    if (out.ok) toast(tr('Reclaimed {0}', bytes(out.bytesFreed)));
+    else toast((out.kept && out.kept[0] && keepReason(out.kept[0].reason)) || tr('Kept'), 'err');
+  } catch (err) {
+    toast(err.message, 'err');
+  }
+  app.wt = { ...app.wt, busy: null };
+  await loadWorktrees();
+}
+
+function bytes(n) {
+  const v = Number(n) || 0;
+  if (v >= 1e9) return (v / 1e9).toFixed(1) + ' GB';
+  if (v >= 1e6) return Math.round(v / 1e6) + ' MB';
+  if (v >= 1e3) return Math.round(v / 1e3) + ' KB';
+  return v + ' B';
+}
+
+/** The sweep's own reason, in the reader's language. */
+function keepReason(r) {
+  if (!r || !r.kind) return '';
+  if (r.kind === 'live') return tr('a Crew is still working here');
+  if (r.kind === 'uncommitted') return tr('uncommitted changes — this work exists nowhere else');
+  if (r.kind === 'unlanded') return tr('{0} commits not in {1} — land it first', r.commits, r.baseBranch);
+  if (r.kind === 'not-ours') return tr('git knows this worktree, BlueSpace does not');
+  if (r.kind === 'integration') return tr('this is the integration branch');
+  if (r.kind === 'debris') return tr('git does not know this directory');
+  return r.kind;
+}
+
+function renderWorktrees() {
+  if (app.wt.data === null) {
+    if (!app.wt.loading && !app.wt.error) loadWorktrees();
+    if (app.wt.error) return `<div class="empty"><h3>${esc(tr('Could not read the worktrees'))}</h3><p>${esc(app.wt.error)}</p></div>`;
+    return `<div class="skeleton">${esc(tr('Reading the worktrees…'))}</div>`;
+  }
+  const projects = (app.wt.data.projects || []).filter((p) => p.worktrees.length > 0 || p.error);
+  const total = projects.reduce((n, p) => n + (p.bytes || 0), 0);
+  const count = projects.reduce((n, p) => n + p.worktrees.length, 0);
+  if (!projects.length) {
+    return `<div class="empty"><div class="ring" aria-hidden="true"></div><h3>${esc(tr('No worktrees'))}</h3>
+      <p>${esc(tr('A worktree appears when a task is dispatched, and stays until its work is merged.'))}</p></div>`;
+  }
+
+  const groups = projects.map((p) => {
+    const rows = p.worktrees.map((w) => {
+      const armed = app.wt.confirm === w.path;
+      const busy = app.wt.busy === w.path;
+      const why = w.reclaimable ? '' : keepReason(w.reason);
+      return `<div class="wt-row">
+        <div class="wt-main">
+          <div class="wt-branch mono" data-act="copy" data-copy="${attr(w.path)}" title="${attr(w.path + ' — ' + tr('Click to copy'))}">${esc(w.branch || w.path)}</div>
+          <div class="wt-title">${esc(w.title || tr('no task — left by a crash between cutting and recording'))}</div>
+        </div>
+        <div class="wt-meta">
+          ${w.state ? `<span class="chip" style="${sc(w.state)}" data-state><span class="dot"></span>${esc(stateLabel(w.state))}</span>` : ''}
+          ${w.mergedInto ? `<span class="merged">${esc(tr('merged → {0}', w.mergedInto))}</span>` : ''}
+          <span class="num dim">${esc(bytes(w.bytes))}</span>
+        </div>
+        <div class="wt-act">
+          ${w.reclaimable
+            ? `<button class="btn ghost sm" data-act="wt-reclaim" data-path="${attr(w.path)}" ${busy ? 'disabled' : ''}>${busy ? '…' : esc(tr('Reclaim'))}</button>`
+            : armed
+              ? `<button class="btn ghost sm danger" data-act="wt-force" data-path="${attr(w.path)}" ${busy ? 'disabled' : ''}>${esc(tr('Delete anyway'))}</button>
+                 <button class="btn ghost sm" data-act="wt-cancel">${esc(tr('Keep'))}</button>`
+              : `<span class="dim wt-why">${esc(why)}</span>
+                 <button class="btn ghost sm" data-act="wt-arm" data-path="${attr(w.path)}">${esc(tr('Delete…'))}</button>`}
+        </div>
+      </div>`;
+    }).join('');
+    return `<section class="group">
+      <div class="section-head"><h2>${esc(p.name)}</h2>
+        <span class="count">${esc(nOf(p.worktrees.length, 'worktree', 'worktrees', '个 worktree'))} · ${esc(bytes(p.bytes))}</span></div>
+      ${p.error ? `<div class="cfg-err">${esc(p.error)}</div>` : ''}
+      <div class="card wt-list">${rows}</div>
+    </section>`;
+  }).join('');
+
+  return `<div class="section-head"><h2>${esc(tr('Worktrees'))}</h2>
+      <span class="count">${esc(nOf(count, 'worktree', 'worktrees', '个 worktree'))} · ${esc(bytes(total))}</span></div>
+    <p class="hint" style="margin:-6px 0 14px">${esc(tr('A worktree is kept until its work is merged — that is what makes it safe to remove. Landing a task merges its branch into blue/dev; after that this panel will offer to reclaim it.'))}</p>
+    <div class="board">${groups}</div>`;
 }
 
 /* ---- 3. diff -------------------------------------------------------------- */
@@ -1880,7 +2058,7 @@ async function steer(id) {
 }
 
 function setView(v) {
-  if (!['inbox','fleet','diff','timeline','config'].includes(v)) v = 'inbox';
+  if (!['inbox','fleet','diff','timeline','worktrees','config'].includes(v)) v = 'inbox';
   app.view = v;
   const hash = v === 'diff' && app.selected ? '#diff/' + app.selected : '#' + v;
   if (location.hash !== hash) history.replaceState(null, '', hash);
@@ -1895,6 +2073,10 @@ document.addEventListener('click', (ev) => {
   if (act === 'tab') { setView(view); return; }
   if (act === 'lang') { setLang(app.lang === 'zh' ? 'en' : 'zh'); return; }
   if (act === 'cfg-save') { submitConfig(); return; }
+  if (act === 'wt-reclaim') { reclaimWorktree(node.dataset.path, false); return; }
+  if (act === 'wt-arm') { app.wt = { ...app.wt, confirm: node.dataset.path }; paint(); return; }
+  if (act === 'wt-cancel') { app.wt = { ...app.wt, confirm: null }; paint(); return; }
+  if (act === 'wt-force') { reclaimWorktree(node.dataset.path, true); return; }
   if (act === 'answer') { answer(id, ans); return; }
   if (act === 'answer-free') { answer(id, (app.drafts.get('d:' + id) || '').trim()); return; }
   if (act === 'ctx') { app.expandedContext.has(id) ? app.expandedContext.delete(id) : app.expandedContext.add(id); paint(); return; }
@@ -2136,7 +2318,7 @@ document.addEventListener('keydown', (ev) => {
     return;
   }
   if (ev.key === 'Escape' && app.detail.id) { closeDetail(); return; }
-  const map = { '1': 'inbox', '2': 'fleet', '3': 'diff', '4': 'timeline', '5': 'config' };
+  const map = { '1': 'inbox', '2': 'fleet', '3': 'diff', '4': 'timeline', '5': 'worktrees', '6': 'config' };
   if (map[ev.key]) setView(map[ev.key]);
 });
 
@@ -2144,7 +2326,7 @@ window.addEventListener('hashchange', applyHash);
 function applyHash() {
   const h = location.hash.replace(/^#/, '');
   if (h.startsWith('diff/')) { app.selected = decodeURIComponent(h.slice(5)); app.view = 'diff'; }
-  else if (['inbox','fleet','diff','timeline','config'].includes(h)) app.view = h;
+  else if (['inbox','fleet','diff','timeline','worktrees','config'].includes(h)) app.view = h;
   paint();
 }
 

@@ -172,6 +172,16 @@ export interface ReclaimOptions {
    * into. A worktree on one of these is kept at every force level.
    */
   integrationBranches?: Iterable<string>;
+  /**
+   * Consider ONLY these worktree paths, if given.
+   *
+   * For reclaiming one directory the captain pointed at, rather than sweeping a
+   * repository. It narrows what is looked at and changes NO rule: a path listed
+   * here still has to pass every test below, and still shows up in `kept` with
+   * a reason when it does not. Anything not listed is not examined at all — a
+   * targeted removal must not quietly take a neighbour with it.
+   */
+  only?: Iterable<string>;
 }
 
 // ---------------------------------------------------------------------------
@@ -209,7 +219,9 @@ export async function reclaimWorktrees(
     return result;
   }
 
+  const only = opts.only === undefined ? undefined : new Set([...opts.only].map(normalizePath));
   for (const wt of listed) {
+    if (only !== undefined && !only.has(normalizePath(wt.path))) continue;
     try {
       await considerWorktree(worktrees, wt, byTask.get(wt.taskId), live, integration, opts, result);
     } catch (err) {
@@ -500,6 +512,11 @@ export async function sweepOrphanDirectories(
  * its apparent size. Approximate by design — it exists so growth is visible,
  * not to agree with `du` to the block.
  */
+/** Trailing slashes and `..` are not a difference between two paths. */
+function normalizePath(p: string): string {
+  return path.resolve(p);
+}
+
 export async function directorySize(target: string): Promise<number> {
   let total = 0;
   const stack: string[] = [target];

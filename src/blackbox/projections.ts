@@ -141,6 +141,7 @@ export function projectTasks(events: BlueEvent[]): Map<TaskId, Task> {
           brief: e.brief,
           state: 'queued',
           dependsOn: [...e.dependsOn],
+          ...(e.resumeOf !== undefined ? { resumeOf: e.resumeOf } : {}),
           createdAt: e.at,
           updatedAt: e.at,
           tokens: noTokenUsage(),
