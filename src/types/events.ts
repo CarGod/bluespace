@@ -359,6 +359,28 @@ export interface TaskDismissed {
   dismissed: boolean;
 }
 
+/**
+ * The captain changed the job while it was in flight.
+ *
+ * WHY THIS IS NOT `steer_task`. Steering pushes a sentence into a running Crew:
+ * it changes what the worker does and NOTHING ELSE. The Sentinel grades the diff
+ * against `task.brief`, so a steered Crew that did exactly what it was told was
+ * then failed for not doing what the brief still said — and the captain's only
+ * remaining move was a new task and another forty minutes. Steering was half a
+ * feature.
+ *
+ * An amendment is the other half: it becomes part of the brief, so the goal that
+ * is graded is the goal that was asked for. It is appended rather than replacing
+ * anything, because the original brief and the order the changes arrived in are
+ * exactly what a verdict has to be read against six months later.
+ */
+export interface TaskAmended {
+  type: 'task.amended';
+  taskId: TaskId;
+  /** What changed, written for the Crew. */
+  addendum: string;
+}
+
 export type BlueEventBody =
   | TaskCreated
   | TaskDispatched
@@ -367,6 +389,7 @@ export type BlueEventBody =
   | TaskFailed
   | TaskMerged
   | TaskDismissed
+  | TaskAmended
   | CrewSpawned
   | CrewText
   | CrewThinking

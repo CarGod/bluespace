@@ -60,6 +60,7 @@ const TASK: Task = {
   metered: false,
   listPriceUsd: 0.5,
   reworkCount: 0,
+    amendments: 0,
 };
 
 const DECISION: Decision = {
@@ -314,6 +315,7 @@ describe('tools/list', () => {
       'open_decisions',
       'answer_decision',
       'steer_task',
+      'amend_task',
       'cancel_task',
       'land_task',
       'delivery_status',

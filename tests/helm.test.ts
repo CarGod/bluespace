@@ -47,6 +47,7 @@ function makeTask(over: Partial<Task> = {}): Task {
     brief: 'Retry failed uploads three times with backoff.',
     state: 'working',
     dependsOn: [],
+    amendments: 0,
     createdAt: 1_700_000_000_000,
     updatedAt: 1_700_000_000_100,
     tokens: addTokenUsage(noTokenUsage(), 'claude-opus-5', {
@@ -180,6 +181,7 @@ describe('helmTools — shape', () => {
       'open_decisions',
       'answer_decision',
       'steer_task',
+      'amend_task',
       'cancel_task',
       'land_task',
       'delivery_status',

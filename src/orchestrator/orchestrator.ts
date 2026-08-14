@@ -522,6 +522,51 @@ export class Orchestrator {
     await this.#deliver(taskId, message, 'decision_answer');
   }
 
+  /**
+   * Change the job, and tell whoever is doing it.
+   *
+   * THE OTHER HALF OF `steer`. Steering pushes a sentence at a running Crew and
+   * changes nothing else — so a Crew that did exactly what it was told was then
+   * graded by the Sentinel against a brief that still said something else, and
+   * the captain's only remaining move was a new task and another forty minutes.
+   *
+   * An amendment lands in the brief, which is the single document the Crew is
+   * briefed from and the Sentinel grades against. If a Crew is running it also
+   * hears about it immediately; if the task has not dispatched yet there is
+   * nobody to tell and the amended brief is simply what it starts with.
+   *
+   * Refused on a terminal task: `failed` and `cancelled` have no outgoing edges
+   * and a landed task has already been graded. Changing the brief of work that
+   * is over would rewrite the question after the answer was marked.
+   */
+  async amendTask(taskId: TaskId, addendum: string): Promise<{ deliveredToCrew: boolean }> {
+    const text = addendum.trim();
+    if (text === '') throw new Error('an amendment needs something in it');
+    const task = this.task(taskId);
+    if (!task) throw new Error(`unknown task ${taskId}`);
+    if (isTerminal(task.state)) {
+      throw new Error(
+        `task ${taskId} is ${task.state}: its brief is the question a verdict was already ` +
+          'measured against. Create a task, or resume this one, rather than amending it.',
+      );
+    }
+
+    this.#deps.blackbox.append({ type: 'task.amended', taskId, addendum: text });
+
+    const live = this.#live.get(taskId);
+    if (!live || live.closed || !this.#deps.adapter.capabilities.steer) {
+      return { deliveredToCrew: false };
+    }
+    // Framed, so the Crew can tell an amendment from a passing remark: this is
+    // now part of what it will be graded on.
+    await live.session.send(
+      `The captain has amended your brief. This is now part of the job and the verifier ` +
+        `will check it:\n\n${text}`,
+    );
+    this.#pump(live);
+    return { deliveredToCrew: true };
+  }
+
   /** Push a message into a live Crew session. */
   async steer(taskId: TaskId, message: string): Promise<void> {
     const live = this.#live.get(taskId);

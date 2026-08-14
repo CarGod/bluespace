@@ -566,7 +566,7 @@ export const HELM_DENIED_TOOLS: readonly string[] = [
  * it would clear it for `WebFetch`, for the captain's own MCP servers, and for
  * everything else in the window — a posture BlueSpace would be choosing on their
  * behalf over tools it did not install. That is precisely the line the flag list
- * at the top of this file draws. Naming our own thirteen tools changes nothing
+ * at the top of this file draws. Naming our own tools changes nothing
  * about how the captain's own tools behave, and it is deterministic where a
  * classifier is not (`docs/compliance.md`: "auto usually does not prompt —
  * usually"). `bypassPermissions` is worse again: a modal only a human can
@@ -734,7 +734,7 @@ export function ultracodeNotice(blockers: readonly string[]): string | undefined
  *   --allowedTools (what this launcher already does)
  *       Deterministic and narrow, and it is KEPT — see `HELM_ALLOWED_TOOLS`. It
  *       just does not answer the ask on its own: it names BlueSpace's own
- *       thirteen tools, so the captain's own MCP servers and the web tools can
+ *       tools by name, so the captain's own MCP servers and the web tools can
  *       still stop a turn to ask.
  *
  * `auto` wins on the only axis that separates them: it is the one that costs the
@@ -1179,7 +1179,7 @@ export async function runLauncher(
     strictMcp: strictMcpRequested(env),
     deniedTools: deniedTools(env),
     // Not conditioned on the clamp. An unclamped window still has the same
-    // thirteen tools from the same server, and still should not open on a dialog.
+    // tools from the same server, and still should not open on a dialog.
     allowedTools: HELM_ALLOWED_TOOLS,
     settingsJson: helmSettingsJson(posture.ultracode),
     permissionMode: posture.permissionMode,

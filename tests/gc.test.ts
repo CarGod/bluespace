@@ -80,6 +80,7 @@ function task(id: string, state: TaskState, worktree: string): Task {
     metered: false,
     listPriceUsd: 0,
     reworkCount: 0,
+    amendments: 0,
     worktree,
   };
 }

@@ -573,6 +573,54 @@ const STATE_HELP = {
   failed: 'It ended without a deliverable: the Crew died, the Sentinel refused it, or a ceiling stopped it. The worktree is still there.',
   cancelled: 'You stopped it.',
 };
+/**
+ * THE LANES THE BOARD IS DRAWN IN — the captain's lifecycle, not the engine's.
+ *
+ * The engine needs ten states because it has to tell `dispatched` from `working`
+ * (one is a worktree being cut, the other is a Crew that has started) and
+ * `needs_rework` from `working` (one counts against maxRework). None of that is
+ * a distinction the captain acts on, and ten columns of it read as noise.
+ *
+ * Two of these lanes are not engine states at all, and they are the point:
+ * `landed` means the Sentinel passed and NOTHING MORE, so it splits by whether
+ * the branch has actually been merged. "Waiting to merge" is a thing to do;
+ * "done" is a thing that is over. The board could not previously tell them
+ * apart, which is exactly what the captain could not see.
+ *
+ * `states` is matched in order and the first lane that claims a task wins.
+ */
+const LANES = [
+  { key: 'waiting', label: 'Waiting', v: '--s-queued', states: ['queued', 'dispatched'] },
+  { key: 'working', label: 'Working', v: '--s-working', states: ['working', 'needs_rework'] },
+  { key: 'verifying', label: 'Verifying', v: '--s-verifying', states: ['verifying'] },
+  { key: 'suspended', label: 'Suspended', v: '--s-awaiting', states: ['awaiting_decision'] },
+  { key: 'to-merge', label: 'To merge', v: '--s-ready', states: ['ready', 'landed'], unmergedOnly: true },
+  { key: 'done', label: 'Done', v: '--s-landed', states: ['landed'] },
+  { key: 'failed', label: 'Failed', v: '--s-failed', states: ['failed'] },
+  { key: 'cancelled', label: 'Cancelled', v: '--s-cancelled', states: ['cancelled'] },
+];
+
+const LANE_HELP = {
+  waiting: 'Created, and waiting — for a dependency to finish, for a free Crew slot, or for its worktree to be cut. Nothing has run yet.',
+  working: 'A Crew is in its worktree right now. This includes a task the Sentinel sent back: rework is the same Crew, working again.',
+  verifying: 'The Crew has finished. An independent Sentinel is reading the diff against the brief — it sees the brief and the diff, never the Crew’s reasoning.',
+  suspended: 'Stopped on a question only you can answer. Nothing moves until you answer it, in the Inbox.',
+  'to-merge': 'Verified, and the branch is still only in its worktree. Landing it merges it into blue/dev — until then this work exists in exactly one place.',
+  done: 'Merged into blue/dev. Its worktree can be reclaimed, and reaching main is a pull request you open by hand.',
+  failed: 'It ended without a deliverable: the Crew died, the Sentinel refused it, or a ceiling stopped it. The worktree is still there, with whatever it got done.',
+  cancelled: 'You stopped it.',
+};
+
+/** Which lane a task is drawn in. Merge status decides between the last two. */
+function laneOf(t) {
+  for (const lane of LANES) {
+    if (!lane.states.includes(t.state)) continue;
+    if (lane.unmergedOnly && t.mergedInto) continue;
+    return lane.key;
+  }
+  return 'waiting';
+}
+
 const STATE_VAR = {
   queued: '--s-queued', dispatched: '--s-dispatched', working: '--s-working',
   awaiting_decision: '--s-awaiting', verifying: '--s-verifying', needs_rework: '--s-rework',
@@ -663,14 +711,14 @@ const ZH = {
   // states
   'Queued': '排队中',
   'Dispatched': '已派遣',
-  'Working': '在飞',
+  'Working': '执行中',
   'Awaiting you': '等你决定',
-  'Verifying': '核验中',
+  'Verifying': '验证',
   'Needs rework': '需返工',
   'Ready': '待合并',
   'Landed': '靠岸',
   'Failed': '失败',
-  'Cancelled': '已取消',
+  'Cancelled': '取消',
   'Created and waiting — for its dependencies to land, or for a free crew slot. Nothing has run yet.':
     '已创建，在等——等依赖靠岸，或等一个空闲的 Crew 席位。还没有跑过任何东西。',
   'Its worktree is cut and a Claude Code session is starting. No work done yet.':
@@ -827,6 +875,26 @@ const ZH = {
   'git knows this worktree, BlueSpace does not': 'git 认得这个 worktree，BlueSpace 不认',
   'this is the integration branch': '这是集成分支',
   'git does not know this directory': 'git 不认识这个目录',
+
+  // the board's lanes
+  'Waiting': '等待',
+  'Suspended': '挂起',
+  'To merge': '等待合并',
+  'Done': '上线完成',
+  'Created, and waiting — for a dependency to finish, for a free Crew slot, or for its worktree to be cut. Nothing has run yet.':
+    '已创建，在等——等依赖跑完、等一个空闲的 Crew 席位、或者等它的 worktree 被切出来。还没跑过任何东西。',
+  'A Crew is in its worktree right now. This includes a task the Sentinel sent back: rework is the same Crew, working again.':
+    '有 Crew 正在它的 worktree 里干活。被 Sentinel 打回来返工的也算在这里——返工是同一个 Crew 接着干。',
+  'The Crew has finished. An independent Sentinel is reading the diff against the brief — it sees the brief and the diff, never the Crew’s reasoning.':
+    'Crew 已收工，独立的 Sentinel 正在对着任务书读这份 diff——它只看得到任务书和 diff，看不到 Crew 的推理过程。',
+  'Stopped on a question only you can answer. Nothing moves until you answer it, in the Inbox.':
+    '卡在一个只有你能回答的问题上。你不在「待决」里答，它就不动。',
+  'Verified, and the branch is still only in its worktree. Landing it merges it into blue/dev — until then this work exists in exactly one place.':
+    '核验通过了，但分支还只存在于它自己的 worktree 里。让它靠岸才会并进 blue/dev——在那之前，这份成果全世界只有一份。',
+  'Merged into blue/dev. Its worktree can be reclaimed, and reaching main is a pull request you open by hand.':
+    '已并入 blue/dev。它的 worktree 可以回收了；要进 main 还得你手动开一个 pull request。',
+  'It ended without a deliverable: the Crew died, the Sentinel refused it, or a ceiling stopped it. The worktree is still there, with whatever it got done.':
+    '它结束了但没有交付物：Crew died、Sentinel 否了、或者撞了上限。worktree 还在，里面是它已经做出来的东西。',
 
   // settings
   'Settings': '设置',
@@ -1368,20 +1436,19 @@ function renderFleet() {
   }
 
   const shown = boardTasks();
-  // EVERY state, every time. An absent column reads as "this cannot happen
-  // here"; a column showing 0 reads as "nothing is here right now", which is the
-  // true statement and the one that makes the lifecycle legible — the captain
-  // can see that `needs_rework` and `awaiting_decision` exist before the first
-  // time one of them is holding up their work.
-  const groups = STATES.map((state) => {
-    const list = shown.filter((t) => t.state === state)
+  // EVERY lane, every time. An absent column reads as "this cannot happen here";
+  // a column showing 0 reads as "nothing is here right now", which is the true
+  // statement and the one that makes the lifecycle legible — the captain can see
+  // that `Suspended` exists before the first time something is stuck in it.
+  const groups = LANES.map((lane) => {
+    const list = shown.filter((t) => laneOf(t) === lane.key)
       .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
     const cards = list.length
       ? list.map((t) => taskCard(t, map, dependents, activity)).join('')
       : `<div class="slot-empty">${esc(tr('none'))}</div>`;
     return `<section class="group${list.length ? '' : ' quiet'}">
-      <div class="section-head" title="${attr(tr(STATE_HELP[state] || ''))}">
-        <h2 style="${sc(state)};color:var(--sc)">${esc(stateLabel(state))}</h2>
+      <div class="section-head" title="${attr(tr(LANE_HELP[lane.key] || ''))}">
+        <h2 style="--sc: var(${lane.v});color:var(--sc)">${esc(tr(lane.label))}</h2>
         <span class="count">${list.length}</span>
       </div>
       <div class="grid">${cards}</div>

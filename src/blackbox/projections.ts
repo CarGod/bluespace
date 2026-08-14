@@ -148,6 +148,7 @@ export function projectTasks(events: BlueEvent[]): Map<TaskId, Task> {
           metered: false,
           listPriceUsd: 0,
           reworkCount: 0,
+          amendments: 0,
         });
         break;
       }
@@ -213,6 +214,18 @@ export function projectTasks(events: BlueEvent[]): Map<TaskId, Task> {
         task.mergedInto = e.into;
         task.mergeCommit = e.commit;
         task.mergedAt = e.at;
+        break;
+      }
+
+      case 'task.amended': {
+        // Folded INTO the brief, which is the one string the Crew is briefed
+        // from and the Sentinel grades against. Anything else would leave the
+        // two reading different documents, which is the bug this event exists
+        // to end.
+        const task = touch(e.taskId, e.at);
+        if (!task) break;
+        task.amendments += 1;
+        task.brief = `${task.brief.trimEnd()}\n\n## Amendment ${task.amendments}\n\n${e.addendum.trim()}`;
         break;
       }
 

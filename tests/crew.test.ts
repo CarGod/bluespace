@@ -38,6 +38,7 @@ function makeTask(overrides: Partial<Task> = {}): Task {
     title: 'Add retry to the uploader',
     brief: 'Retry failed uploads three times with backoff, log each attempt, and add a test.',
     state: 'dispatched',
+    amendments: 0,
     dependsOn: [],
     createdAt: 0,
     updatedAt: 0,

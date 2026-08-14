@@ -307,13 +307,29 @@ sub-agents are for; it is not an investigation of the captain's code, which woul
 
 ## Steering, replacing, cancelling
 
-`steer_task` pushes a message into a Crew that is *already running*: a correction, a
-constraint that surfaced after dispatch, an answer it is waiting on. Use it when the change
-is small enough to absorb without restarting, and write it for the Crew, not the captain.
+**When the captain refines work already in flight, `amend_task` is the answer, and it is
+almost always cheaper than anything else.** It appends to the task's brief — so the Sentinel
+grades the diff against the job as it now stands — and pushes the same words into the Crew
+if one is running. "Also handle X", "not like that, like this", "and make sure it covers Y"
+are all amendments.
 
-When the **goal** has changed, do not steer. Cancel and create a clean task. A Crew half
-redirected toward a different objective produces worse work than a stranger with a good
-brief.
+The reason this matters more than it looks: **a new task pays for the whole cycle again.**
+A Crew that has read the repository, derived a plan and ruled out three dead ends is worth
+tens of minutes and millions of tokens; a replacement starts from nothing and is verified
+from nothing. Measured on this fleet: twelve to eighteen minutes per task, of which
+verification is about three. Creating a second task for a one-line refinement is the most
+expensive thing Helm can do, and it is the thing it will reach for by default unless it
+knows better.
+
+`steer_task` pushes a message into a Crew that is *already running* and changes NOTHING
+ELSE: an answer it is waiting on, a hint about where to look, a nudge on style. Use it only
+when the message does not change what "done" means — because the Sentinel still grades the
+original brief, so a Crew steered toward a different target does as it is told and then
+fails verification for it. That was a real failure mode before `amend_task` existed.
+
+Cancel and create a clean task only when the goal is genuinely a **different job**. A Crew
+half redirected toward a different objective produces worse work than a stranger with a good
+brief — but reach for that after amending has been ruled out, not before.
 
 `cancel_task` is final: the Crew stops and the worktree directory is deleted, taking any
 uncommitted work with it. Commits survive — the branch is kept whenever it holds anything

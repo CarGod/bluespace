@@ -341,6 +341,7 @@ describe('end-to-end: real blackbox + real worktrees + real registry', () => {
         metered: false,
         listPriceUsd: 0,
         reworkCount: 0,
+    amendments: 0,
       },
       project,
       worktree: wt,

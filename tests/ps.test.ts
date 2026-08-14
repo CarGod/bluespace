@@ -35,6 +35,7 @@ function task(state: TaskState, finishedAgoMs: number): Task {
     metered: false,
     listPriceUsd: 0,
     reworkCount: 0,
+    amendments: 0,
   };
 }
 

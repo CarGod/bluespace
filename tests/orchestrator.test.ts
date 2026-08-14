@@ -1379,6 +1379,66 @@ describe('captain controls', () => {
     expect(failureReason(h, task.id)).toContain('token_ceiling_exceeded');
   });
 
+  it('amends the brief the Sentinel grades, and tells the running Crew', async () => {
+    // THE HALF `steer` WAS MISSING. Steering moved the Crew and left the
+    // Sentinel grading the original brief, so a Crew that did exactly what it
+    // was told was failed for it — and the captain's only move was a new task
+    // and the whole cycle again.
+    const h = harness();
+    const task = newTask(h);
+    await h.orch.tick();
+
+    const outcome = await h.orch.amendTask(task.id, 'Also cover the empty-input case.');
+    expect(outcome.deliveredToCrew).toBe(true);
+
+    const after = h.orch.task(task.id)!;
+    expect(after.amendments).toBe(1);
+    expect(after.brief).toContain('Also cover the empty-input case.');
+    expect(after.brief).toContain('## Amendment 1');
+    // The Crew heard it too, framed so it knows this is now part of the job.
+    expect(h.adapter.crewFor(task.id).sent.join('\n')).toContain('Also cover the empty-input case.');
+
+    // And it is the amended brief the verifier is handed.
+    h.adapter.crewFor(task.id).turn();
+    await until(() => stateOf(h, task.id) === 'landed', 'it lands');
+    expect(h.sentinelRuns).toHaveLength(1);
+  });
+
+  it('amends a task that has not dispatched, with nobody to tell', async () => {
+    // Blocked on a dependency rather than on a crew slot: a slot can free up
+    // inside a tick, and this test is about the task NOT being live, not about
+    // concurrency.
+    const h = harness();
+    const blocker = newTask(h);
+    const queued = newTask(h, { dependsOn: [blocker.id] });
+    await h.orch.tick();
+    expect(stateOf(h, queued.id)).toBe('queued');
+
+    const outcome = await h.orch.amendTask(queued.id, 'Use the new endpoint.');
+    expect(outcome.deliveredToCrew).toBe(false);
+    expect(h.orch.task(queued.id)!.brief).toContain('Use the new endpoint.');
+    expect(h.orch.task(queued.id)!.amendments).toBe(1);
+  });
+
+  it('refuses to amend work that is already over', async () => {
+    // The brief is the question a verdict was measured against. Changing it
+    // afterwards rewrites the question after the answer was marked.
+    const h = harness();
+    const task = newTask(h);
+    await h.orch.tick();
+    h.adapter.crewFor(task.id).turn();
+    await until(() => stateOf(h, task.id) === 'landed', 'it lands');
+
+    await expect(h.orch.amendTask(task.id, 'one more thing')).rejects.toThrow(/landed/);
+    expect(h.orch.task(task.id)!.amendments).toBe(0);
+  });
+
+  it('refuses an empty amendment', async () => {
+    const h = harness();
+    const task = newTask(h);
+    await expect(h.orch.amendTask(task.id, '   ')).rejects.toThrow(/needs something/);
+  });
+
   it('tells the captain when a task lands, and when it dies', async () => {
     // Helm cannot: an interactive session speaks only when spoken to, so "it
     // landed twenty minutes ago" has no turn to be said in. This is the push

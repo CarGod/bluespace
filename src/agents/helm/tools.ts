@@ -371,6 +371,7 @@ export const HELM_TOOL_NAMES: readonly string[] = [
   'open_decisions',
   'answer_decision',
   'steer_task',
+  'amend_task',
   'cancel_task',
   'land_task',
   'delivery_status',
@@ -597,7 +598,8 @@ export function helmTools(
     description: [
       'Push a message into a Crew that is already running: a correction, a constraint that surfaced after dispatch, or an answer the Crew is waiting on.',
       'Call this when the captain changes their mind about work in flight and the change is small enough for the Crew to absorb without restarting.',
-      'When the goal itself has changed, cancel the task and create a new one instead — steering a Crew toward a different objective produces worse work than a clean brief.',
+      'When the change alters what "done" means — an extra requirement, a different target, a constraint the diff must satisfy — use `amend_task` instead: steering moves the Crew but leaves the Sentinel grading the old brief, so the Crew does as it is told and then fails verification for it.',
+      'Cancel and start again only when the goal is genuinely a different job; a Crew half redirected produces worse work than a stranger with a clean brief, but a NEW TASK COSTS THE WHOLE CYCLE AGAIN.',
       'Only works while the task is actually running.',
     ].join(' '),
     inputSchema: object(
@@ -612,6 +614,43 @@ export function helmTools(
       const message = requireString(input, 'message');
       await orch.steer(taskId, message);
       return ok({ taskId, steered: true, message });
+    },
+  };
+
+  const amendTask: ToolDef = {
+    name: 'amend_task',
+    description: [
+      'Change what a task is FOR, while it is still in flight: an extra requirement, a constraint that surfaced after dispatch, a correction to the goal.',
+      'Call this when the captain refines work they already asked for: "actually, also do X", "no, not like that", "and make sure it handles Y".',
+      'It appends to the task\'s brief, so the Sentinel grades the diff against the job as it now stands, and it pushes the same words into the Crew if one is running.',
+      'PREFER THIS OVER A NEW TASK. A fresh task pays for the whole cycle again — a Crew that re-reads the repository, re-derives the plan, and re-verifies from nothing, which is tens of minutes and millions of tokens. Amending costs one turn of a Crew that already has all of that in its head.',
+      'Use `steer_task` instead only when the message changes nothing about what "done" means — an answer to a question, a hint about where to look, a nudge on style.',
+      'It refuses on a landed, failed or cancelled task: their briefs are the question a verdict was already measured against. Create a task for genuinely new work.',
+    ].join(' '),
+    inputSchema: object(
+      {
+        taskId: str('Task id of a task that has not finished.'),
+        addendum: str(
+          'What changed, written for the Crew and specific enough for the Sentinel to check. Not a summary of the conversation.',
+        ),
+      },
+      ['taskId', 'addendum'],
+    ),
+    handler: async (input) => {
+      const taskId = requireString(input, 'taskId');
+      const addendum = requireString(input, 'addendum');
+      const outcome = await orch.amendTask(taskId, addendum);
+      const task = orch.task(taskId);
+      return ok({
+        taskId,
+        amended: true,
+        amendments: task?.amendments ?? 1,
+        deliveredToCrew: outcome.deliveredToCrew,
+        state: task?.state ?? 'unknown',
+        note: outcome.deliveredToCrew
+          ? 'The brief now includes it and the running Crew has been told.'
+          : 'The brief now includes it. No Crew is running, so it applies when the task dispatches.',
+      });
     },
   };
 
@@ -926,6 +965,7 @@ export function helmTools(
     openDecisions,
     answerDecision,
     steerTask,
+    amendTask,
     cancelTask,
     landTaskTool,
     deliveryStatus,

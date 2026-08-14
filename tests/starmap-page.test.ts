@@ -70,6 +70,37 @@ describe('the Starmap page and the domain agree about states', () => {
     expect(needed.filter((k) => !zh.has(k))).toEqual([]);
   });
 
+  it('draws every state in exactly one lane', () => {
+    // The board is drawn in the captain's lifecycle, not the engine's — but a
+    // state that no lane claims is a task that is simply not on the board, and
+    // nothing would say so. `laneOf` falls back to `waiting`, which would put a
+    // finished task in with the queue.
+    const lanes = [...page.matchAll(/\{ key: '([a-z-]+)'.*?states: \[([^\]]*)\]/g)].map((m) => ({
+      key: m[1]!,
+      states: [...m[2]!.matchAll(/'([a-z_]+)'/g)].map((x) => x[1]!),
+    }));
+    expect(lanes.length).toBeGreaterThan(0);
+
+    for (const state of TASK_STATES) {
+      const claimed = lanes.filter((l) => l.states.includes(state));
+      expect(claimed.length, `${state} is claimed by ${claimed.length} lanes`).toBeGreaterThan(0);
+    }
+    // `landed` is deliberately in two: merged and not merged are different
+    // things to a captain, and telling them apart is the whole point.
+    const twice = TASK_STATES.filter((s) => lanes.filter((l) => l.states.includes(s)).length > 1);
+    expect(twice).toEqual(['landed']);
+  });
+
+  it('gives every lane a name and an explanation, in both languages', () => {
+    const zh = new Set([...page.matchAll(/^  '((?:[^'\\]|\\.)*)':/gm)].map((m) => m[1]!));
+    const labels = [...page.matchAll(/\{ key: '[a-z-]+', label: '([^']+)'/g)].map((m) => m[1]!);
+    expect(labels.length).toBe(8);
+    expect(labels.filter((l) => !zh.has(l))).toEqual([]);
+    const help = declaredValues('LANE_HELP');
+    expect(help.length).toBe(labels.length);
+    expect(help.filter((h) => !zh.has(h))).toEqual([]);
+  });
+
   it('never drops a state group for being empty', () => {
     // The old board did `if (!list.length) return ''`. That is the line this
     // test exists to stop coming back.

@@ -202,6 +202,15 @@ export interface Task {
   createdAt: number;
   updatedAt: number;
   /**
+   * How many times the brief has been amended since dispatch.
+   *
+   * The amendments themselves are folded into {@link brief}, which is what both
+   * the Crew and the Sentinel read — the count is here so a reader can see at a
+   * glance that the goal moved, and so each amendment can be numbered in the
+   * text rather than run together.
+   */
+  amendments: number;
+  /**
    * The task this one continues, if any. See `task.created.resumeOf`.
    *
    * Presentation and provenance only: nothing about dispatch reads it except
