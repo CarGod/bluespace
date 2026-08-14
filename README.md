@@ -401,6 +401,7 @@ directory (config, Blackbox, worktrees) — useful for keeping work projects sep
 | `maxConcurrentCrew` | `4` | How many Crew may be in flight at once. |
 | `maxRework` | `2` | How many times a failing verdict may send a task back before it escalates to you. |
 | `language` | *(unset)* | The language Helm writes to you in. Unset means "work it out". See below. |
+| `languageAsked` | *(unset)* | Whether the first-launch language question has been put. `false` puts it back. |
 | `helmUltracode` | `true` | Open the `bluespace` window at **ultracode** — xhigh effort plus standing dynamic-workflow orchestration. See below. |
 | `helmPermissionMode` | `auto` | Permission posture for the `bluespace` window. Not the same key as `permissionMode`, which is for Crews. |
 | `dataDir` | `~/.bluespace` | Derived from `BLUESPACE_HOME`. Read-only; not settable. |
@@ -439,25 +440,58 @@ config — for nothing, since there is no dangerous tool in this window to unloc
 
 ### The language Helm talks to you in
 
+**The first time you run `bluespace`, it asks — once.**
+
+```
+BlueSpace — one question, once.
+
+Which language should Helm write to you in?
+
+  1  en-AU    detected from LANG
+  2  中文     zh-CN
+  3  English  en
+
+  Enter    skip — Helm follows whatever language you write to it in
+  or type a language: ja, Español, 中文, Simplified Chinese, …
+```
+
+Answer it and it is saved; skip it and that is saved too. Either way you are never asked
+again, and either way you can change your mind:
+
 ```bash
 blue config set language zh-CN     # a tag, or a name: "中文", "Simplified Chinese"
 blue config set language -         # unset it again
+blue config set languageAsked false   # put the question back on the next launch
 ```
 
-Leaving it unset is a real setting, not a missing one. `bluespace` reads `LC_ALL`, then
-`LC_MESSAGES`, then `LANG`, and opens the window in whatever they name — so a captain
-whose shell is `zh_CN.UTF-8` gets a Chinese wake sweep without configuring anything. A
-locale that names no language (`C`, `POSIX`, or nothing at all) resolves to **unknown, not
-to English**: Helm opens in English, then follows whatever language you write to it in and
-stays there. Set the key when the guess is wrong or when there is nothing to guess from.
+The menu is short on purpose: what this machine detected, 中文, English, and a line to type
+anything else into. It is what we actually know rather than a list of eight plausible
+languages nobody checked.
+
+**Pressing Enter is always safe.** It means "follow whatever I write" — never "accept the
+guess". That matters because the guess is wrong more often than it looks: the case this
+question was added for was a captain who reads Chinese, on a machine whose macOS locale is
+`en_US`, in a terminal whose profile pinned `LANG=en_AU.UTF-8`. Helm wrote English at them,
+correctly, because that is the value it was handed.
+
+Skip the question and the locale is dropped with it — you were shown `en-AU` by name and
+said no, so BlueSpace does not go on to use it anyway.
+
+Until you have been asked (a launch with no terminal to ask in — a pipe, a cron job — never
+asks), `bluespace` still reads `LC_ALL`, then `LC_MESSAGES`, then `LANG`, and opens in
+whatever they name. A locale that names no language (`C`, `POSIX`, or nothing at all)
+resolves to **unknown, not to English**: Helm opens in English, then follows whatever
+language you write to it in and stays there.
 
 Whatever the language, **you are the captain and Helm addresses you as one** — 舰长 in
 Chinese, Captain in English. That is where the immersion stops by design: the fleet's own
 vocabulary for what is happening to your work, and no roleplay around it.
 
-Helm never writes this setting for you. If it worked out your language from something you
-typed, it may mention the command once, in a clause — it has no tool that edits your config,
-and it will not ask you the same question every morning.
+Helm never writes this setting for you — the first-run question does, and only with the
+answer you gave it. If Helm worked out your language from something you typed, it may
+mention the command once, in a clause; if you were asked and skipped, it will not mention it
+at all. It has no tool that edits your config, and it will not ask you the same question
+every morning.
 
 ### What a task costs, and which ceiling stops it
 

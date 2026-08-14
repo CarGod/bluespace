@@ -121,6 +121,7 @@ import { HELM_TOOL_NAMES } from '../agents/helm/index.js';
 import {
   LOCALE_ENV_VARS,
   MIRROR_VOICE,
+  captainVoice,
   loadConfig,
   localeVarInEffect,
   resolveCaptainVoice,
@@ -128,6 +129,8 @@ import {
 } from '../config/index.js';
 import type { BlueConfig, CaptainVoice } from '../config/index.js';
 import { MCP_SERVER_NAME } from '../mcp/server.js';
+import { askLanguage } from './first-run.js';
+import type { FirstRunIO } from './first-run.js';
 
 // ---------------------------------------------------------------------------
 // Where the installed package is
@@ -211,6 +214,27 @@ export function helmMcpConfig(entry: string, nodePath: string = process.execPath
  */
 function languageSection(voice: CaptainVoice, env: NodeJS.ProcessEnv): string {
   const heading = '## The captain’s language';
+
+  // Asked at first launch, and they chose to be followed. Same silence as the
+  // branch below, one difference: the offer has already been made and turned
+  // down, so making it again is asking the same question twice.
+  if (voice.language === undefined && voice.declined === true) {
+    return `${heading}
+
+BlueSpace asked this captain, at first launch, which language to write to them in, and they
+chose to be followed rather than to pin one. So: open in English because that is what this
+contract is written in, then take their first message as the answer and write in that
+language for the rest of the session. Address them as **Captain**, or the natural equivalent
+in whatever language you end up writing.
+
+Whichever it is, it covers **every line that reaches their screen** — including anything you
+type on the way to a tool call, which is the first thing in the window and reads to them as
+the answer.
+
+**Do not mention \`blue config set language\`.** They have been asked once and answered; the
+setting is theirs to change when they want it, and raising it again is putting a question
+they have already closed.`;
+  }
 
   if (voice.language === undefined) {
     const vars = LOCALE_ENV_VARS.join(', ');
@@ -1098,6 +1122,13 @@ export async function runLauncher(
     stdio?: 'inherit' | 'ignore';
     /** The captain's pinned language. Read from config when not supplied. */
     voice?: CaptainVoice;
+    /**
+     * Where to put the first-run language question. Absent means DO NOT ASK —
+     * the default, so that importing this function can never block on a prompt.
+     * The entry point at the bottom of this file opts in; a test hands it
+     * streams it controls.
+     */
+    firstRun?: FirstRunIO;
     /** The whole config, injectable so a test never touches the real one. */
     config?: BlueConfig;
   } = {},
@@ -1109,8 +1140,17 @@ export async function runLauncher(
   // which here means the captain's ask (ultracode, `auto`) and an undetected
   // language, which means Helm mirrors them: the same benign end state as an
   // empty `LANG`.
-  const config = options.config ?? loadConfig();
-  const voice = options.voice ?? resolveCaptainVoice(config.language, env);
+  const loaded = options.config ?? loadConfig();
+
+  // Before anything is printed and long before Claude Code owns the screen: the
+  // one question, and only on the launch where it has never been put. A captain
+  // who has answered — or declined — never sees it again. See `first-run.ts`.
+  const config =
+    options.firstRun !== undefined && options.voice === undefined
+      ? await askLanguage(loaded, options.firstRun, env)
+      : loaded;
+
+  const voice = options.voice ?? captainVoice(config, env);
 
   let claudePath: string;
   let systemPromptAppend: string;
@@ -1188,5 +1228,8 @@ function isEntryPoint(): boolean {
 }
 
 if (isEntryPoint()) {
-  process.exitCode = await runLauncher(process.argv.slice(2));
+  // `firstRun: {}` = ask, using this terminal, if it is one and if nobody has
+  // been asked before. It is passed HERE and nowhere else: a prompt that fires
+  // on import would hang every test that touches this module.
+  process.exitCode = await runLauncher(process.argv.slice(2), { firstRun: {} });
 }

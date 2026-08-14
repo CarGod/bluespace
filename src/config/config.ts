@@ -268,10 +268,30 @@ export interface CaptainVoice {
   address: string;
   /** True when the captain pinned it in config; false when it was detected. */
   pinned: boolean;
+  /**
+   * True when the captain was asked at first launch and chose to be followed
+   * rather than to pin anything.
+   *
+   * It is not the same silence as a key nobody has touched. "Nothing here says"
+   * is a gap Helm may offer to fill — `CLAUDE.md` lets it name
+   * `blue config set language` once, in a clause. "I was asked, and I said
+   * follow me" is an answer, and offering the command again is putting the same
+   * question a second time.
+   */
+  declined?: boolean;
 }
 
 /** What a window knows about its captain when nothing at all resolved. */
 export const MIRROR_VOICE: CaptainVoice = { address: DEFAULT_ADDRESS, pinned: false };
+
+/**
+ * The same silence, chosen rather than inherited.
+ *
+ * Reads identically to {@link MIRROR_VOICE} everywhere that only asks "which
+ * language" — and differently in the one place it has to: the launcher does not
+ * offer a setting to a captain who has already turned it down.
+ */
+export const DECLINED_VOICE: CaptainVoice = { address: DEFAULT_ADDRESS, pinned: false, declined: true };
 
 /**
  * The pin wins; failing that, the environment; failing that, nothing.
@@ -283,10 +303,31 @@ export const MIRROR_VOICE: CaptainVoice = { address: DEFAULT_ADDRESS, pinned: fa
 export function resolveCaptainVoice(
   pinned: string | undefined,
   env: NodeJS.ProcessEnv = process.env,
+  options: { declined?: boolean } = {},
 ): CaptainVoice {
+  // A decline outranks the locale, and only the locale. The first-run question
+  // shows the detected language as an option BY NAME — declining it is a
+  // captain looking at `en-AU` and saying no, so carrying on and using `en-AU`
+  // anyway would answer for them. A pin still wins over both: it is the newer
+  // instruction, and the only way to get one is to have said it.
+  if (pinned === undefined && options.declined === true) return DECLINED_VOICE;
   const language = pinned ?? detectLanguage(env);
   if (language === undefined) return MIRROR_VOICE;
   return { language, address: addressTerm(language), pinned: pinned !== undefined };
+}
+
+/**
+ * The voice a whole config implies — the pin, then the decline, then the shell.
+ *
+ * One function so that the three-way rule lives in one place: every caller that
+ * reached for `resolveCaptainVoice(config.language, env)` was one edit away from
+ * silently dropping the decline and reinstating the guess.
+ */
+export function captainVoice(
+  config: Pick<BlueConfig, 'language' | 'languageAsked'>,
+  env: NodeJS.ProcessEnv = process.env,
+): CaptainVoice {
+  return resolveCaptainVoice(config.language, env, { declined: config.languageAsked === true });
 }
 
 // ---------------------------------------------------------------------------
@@ -384,6 +425,19 @@ export interface BlueConfig {
    * language, and the address term travels with this value (`addressTerm`).
    */
   language?: string;
+  /**
+   * Has the captain been put the language question, once, at first launch?
+   *
+   * Written by answering it and equally by declining it, because what it records
+   * is that they were ASKED. `language` alone cannot carry that: "nobody has
+   * ever said" and "they were shown the guess and passed on it" are both an
+   * absent key, and the two must not behave the same. A decline turns the locale
+   * guess off (see {@link resolveCaptainVoice}) and stops Helm mentioning the
+   * setting at all.
+   *
+   * `blue config set languageAsked false` puts the question back.
+   */
+  languageAsked?: boolean;
   /** Derived from BLUESPACE_HOME / ~/.bluespace. Not settable from the file. */
   dataDir: string;
 }
@@ -676,6 +730,18 @@ export function mergeConfig(base: BlueConfig, patch: Record<string, unknown>): B
     }
   }
 
+  if ('languageAsked' in patch) {
+    if (patch.languageAsked === null) {
+      out.languageAsked = undefined;
+    } else if (typeof patch.languageAsked === 'boolean') {
+      out.languageAsked = patch.languageAsked;
+    } else if (patch.languageAsked !== undefined) {
+      warn(
+        `ignoring invalid languageAsked ${JSON.stringify(patch.languageAsked)} — expected true or false`,
+      );
+    }
+  }
+
   if (patch.maxTokensPerTask !== undefined) {
     const got = pickNumber(patch.maxTokensPerTask, 'maxTokensPerTask', { min: 0, integer: true });
     if (got.ok) out.maxTokensPerTask = got.value;
@@ -764,6 +830,10 @@ function serialize(cfg: BlueConfig): Record<string, unknown> {
     ...(cfg.model !== undefined ? { model: cfg.model } : {}),
     ...(cfg.effort !== undefined ? { effort: cfg.effort } : {}),
     ...(cfg.language !== undefined ? { language: cfg.language } : {}),
+    // Persisted even though it is `false` half the time it is set, because
+    // `false` here is not the default — it is "ask me again", which a captain
+    // can only have got by typing it.
+    ...(cfg.languageAsked !== undefined ? { languageAsked: cfg.languageAsked } : {}),
     maxTokensPerTask: cfg.maxTokensPerTask,
     maxBudgetUsdPerTask: cfg.maxBudgetUsdPerTask,
     maxConcurrentCrew: cfg.maxConcurrentCrew,

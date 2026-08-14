@@ -8,6 +8,7 @@
 
 export type { BlueConfig, CaptainVoice, ConfigPatch } from './config.js';
 export {
+  DECLINED_VOICE,
   DEFAULT_ADDRESS,
   DEFAULT_HELM_POSTURE,
   DEFAULT_MAX_TOKENS_PER_TASK,
@@ -17,6 +18,7 @@ export {
   PERMISSION_MODES,
   addressTerm,
   canonicalLanguageTag,
+  captainVoice,
   configPath,
   dataDir,
   defaultConfig,

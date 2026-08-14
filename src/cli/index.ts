@@ -255,6 +255,7 @@ function usage(): string {
   L.push(bold('TALKING TO HELM'));
   L.push(`  ${cyan(LAUNCH_COMMAND)}${dim('  — opens a Claude Code window that IS Helm. Nothing to register.')}`);
   L.push(`  ${dim('run it in any repo; it takes claude’s own flags: bluespace --model opus, bluespace "…"')}`);
+  L.push(`  ${dim('first launch asks one question — which language Helm writes to you in — and never again')}`);
   L.push(`  ${dim('plain `claude` stays plain. `blue mcp` is not for typing into: stdout is the protocol.')}`);
   L.push(`  ${dim(`ran \`claude mcp add\` for BlueSpace before? undo it: ${REMOVE_COMMAND}`)}`);
   L.push('');
@@ -283,6 +284,11 @@ function usage(): string {
   // real answer rather than a missing one.
   L.push(
     `  ${dim('language')} <zh-CN|en|…>       ${dim('what Helm writes to you in; unset = follow what you write')}`,
+  );
+  // Says what the key is FOR rather than what it holds. Nobody sets a boolean
+  // called languageAsked on purpose; they set it to be asked again.
+  L.push(
+    `  ${dim('languageAsked')} <true|false>  ${dim('false = put the first-launch language question back')}`,
   );
   L.push(
     `  ${dim('maxConcurrentCrew')} <int>   ${dim('maxRework')} <int>   ${dim('maxTokensPerTask')} <int>   ${dim('maxBudgetUsdPerTask')} <number>`,
@@ -1134,6 +1140,12 @@ function languageRow(config: BlueConfig): string {
   if (config.language !== undefined) {
     return `${config.language} ${dim(`(Helm writes to you in this, and calls you ${addressTerm(config.language)})`)}`;
   }
+  // Asked once, and turned down. The locale is deliberately not mentioned:
+  // declining the question turns that guess off, so naming it here would
+  // describe behaviour this config no longer has.
+  if (config.languageAsked === true) {
+    return dim('(unset) you chose to be followed — Helm writes in whatever language you do');
+  }
   const detected = detectLanguage();
   if (detected === undefined) {
     return dim('(unset) no language in this shell — Helm follows whatever you write to it');
@@ -1211,8 +1223,8 @@ function cmdConfig(b: Boot, rest: string[]): number {
     errOut(red('blue config set needs a key and a value.'));
     errOut(
       dim(
-        'Keys: permissionMode, model, effort, language, maxConcurrentCrew, maxRework, maxTokensPerTask, maxBudgetUsdPerTask,\n' +
-          '      helmUltracode, helmPermissionMode  (the `bluespace` window, not a crew)',
+        'Keys: permissionMode, model, effort, language, languageAsked, maxConcurrentCrew, maxRework, maxTokensPerTask,\n' +
+          '      maxBudgetUsdPerTask, helmUltracode, helmPermissionMode  (the `bluespace` window, not a crew)',
       ),
     );
     return 1;
@@ -1299,6 +1311,22 @@ function cmdConfig(b: Boot, rest: string[]): number {
       patch.language = language;
       break;
     }
+    case 'languageAsked': {
+      // The one key whose useful value is `false`: it puts the first-run
+      // question back, for a captain who skipped it and changed their mind.
+      if (value === '-' || value === 'default') {
+        patch.languageAsked = null;
+        break;
+      }
+      if (['true', 'on', '1', 'yes'].includes(value)) patch.languageAsked = true;
+      else if (['false', 'off', '0', 'no'].includes(value)) patch.languageAsked = false;
+      else {
+        errOut(red(`languageAsked must be true or false (or "-" to clear), got "${value}".`));
+        errOut(dim('`blue config set languageAsked false` asks you the language question again next launch.'));
+        return 1;
+      }
+      break;
+    }
     case 'effort': {
       if (value === '-' || value === 'default') {
         patch.effort = null;
@@ -1367,7 +1395,7 @@ function cmdConfig(b: Boot, rest: string[]): number {
       errOut(red(`Unknown config key "${key}".`));
       errOut(
         dim(
-          'Keys: permissionMode, model, effort, language, maxConcurrentCrew, maxRework, maxTokensPerTask, maxBudgetUsdPerTask',
+          'Keys: permissionMode, model, effort, language, languageAsked, maxConcurrentCrew, maxRework, maxTokensPerTask, maxBudgetUsdPerTask',
         ),
       );
       return 1;

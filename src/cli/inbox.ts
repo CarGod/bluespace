@@ -36,6 +36,7 @@ import {
   shortId,
   yellow,
 } from './format.js';
+import { LineReader } from './line-reader.js';
 
 export interface InboxDeps {
   orch: Orchestrator;
@@ -210,42 +211,6 @@ function renderDecision(
 // Input
 // ---------------------------------------------------------------------------
 
-/**
- * Buffers every line readline emits.
- *
- * `rl.question` registers a *one-shot* listener, so on a non-TTY stdin — where
- * the whole pipe flushes in a single tick — any line after the first is
- * dropped on the floor. Queueing lines as they arrive makes `blue inbox`
- * scriptable (`printf '1\n2\n' | blue inbox`) as well as interactive.
- */
-class LineReader {
-  private readonly buffered: string[] = [];
-  private readonly waiters: Array<(line: string | null) => void> = [];
-  private closed = false;
-
-  constructor(rl: readline.Interface) {
-    rl.on('line', (line: string) => {
-      const waiter = this.waiters.shift();
-      if (waiter) waiter(line);
-      else this.buffered.push(line);
-    });
-    rl.on('close', () => {
-      this.closed = true;
-      while (this.waiters.length > 0) this.waiters.shift()?.(null);
-    });
-  }
-
-  /** Next line, or `null` once the input is exhausted. */
-  next(): Promise<string | null> {
-    const buffered = this.buffered.shift();
-    if (buffered !== undefined) return Promise.resolve(buffered);
-    if (this.closed) return Promise.resolve(null);
-    return new Promise((resolve) => {
-      this.waiters.push(resolve);
-    });
-  }
-}
-
 async function promptFor(
   reader: LineReader,
   rl: readline.Interface,
@@ -260,8 +225,14 @@ async function promptFor(
 
   for (;;) {
     out.write(`${hint}\n`);
-    rl.setPrompt('› ');
-    rl.prompt();
+    // Same guard as the first-run question: a piped stdin closes as soon as it
+    // has flushed, and prompting a closed interface throws — with lines still
+    // queued behind it, which is exactly the scripted case this reader exists
+    // to support.
+    if (!reader.ended) {
+      rl.setPrompt('› ');
+      rl.prompt();
+    }
     const raw = await reader.next();
     if (raw === null) return { kind: 'eof' };
 

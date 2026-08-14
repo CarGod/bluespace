@@ -19,6 +19,7 @@
  */
 
 import { promises as fs } from 'node:fs';
+import { Readable, Writable } from 'node:stream';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
@@ -1030,5 +1031,115 @@ describe('workspace trust', () => {
     expect(said).toMatch(/\/x/);
     expect(said).toMatch(/trust/i);
     expect(said).toMatch(/wake sweep/i);
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// The first-run question, from the launcher's side
+// ---------------------------------------------------------------------------
+
+describe('runLauncher: the one question', () => {
+  /** A terminal that types one line and records what was printed at it. */
+  function terminal(line: string): {
+    io: { input: NodeJS.ReadableStream; output: NodeJS.WritableStream; interactive: true };
+    printed(): string;
+  } {
+    const chunks: string[] = [];
+    return {
+      io: {
+        input: Readable.from([`${line}\n`]),
+        output: new Writable({
+          write(chunk, _enc, cb) {
+            chunks.push(String(chunk));
+            cb();
+          },
+        }),
+        interactive: true,
+      },
+      printed: () => chunks.join(''),
+    };
+  }
+
+  it('asks before the window opens, and launches in what the captain picked', async () => {
+    const h = await harness({ persona: '# Helm', env: { LANG: 'en_AU.UTF-8' } });
+    const t = terminal('2');
+
+    await runLauncher([], {
+      root: h.root,
+      entry: h.entry,
+      env: h.env,
+      stdio: 'ignore',
+      firstRun: t.io,
+    });
+
+    expect(t.printed()).toContain('Which language should Helm write to you in?');
+    const prompt = valueOf(await h.argv(), '--append-system-prompt');
+    expect(prompt).toContain('Write to the captain in **zh-CN**');
+    expect(prompt).toContain('舰长');
+    // Pinned, not guessed — the provenance changes what Helm does when the
+    // captain then writes in a third language.
+    expect(prompt).toContain('pinned this themselves');
+  });
+
+  it('drops the locale guess when the captain declines it by name', async () => {
+    // THE REGRESSION. The menu showed `en-AU` and they said no. A launcher that
+    // falls back to detection here has just answered for them, which is the
+    // whole failure the question was added to end.
+    const h = await harness({ persona: '# Helm', env: { LANG: 'en_AU.UTF-8' } });
+    const t = terminal('');
+
+    await runLauncher([], {
+      root: h.root,
+      entry: h.entry,
+      env: h.env,
+      stdio: 'ignore',
+      firstRun: t.io,
+    });
+
+    const prompt = valueOf(await h.argv(), '--append-system-prompt');
+    expect(prompt).not.toContain('en-AU');
+    expect(prompt).not.toContain('Write to the captain in **');
+    expect(prompt).toMatch(/chose to be followed/i);
+    // And it does not go on to offer the setting: they have been asked once and
+    // they answered.
+    expect(prompt).toMatch(/Do not mention/i);
+  });
+
+  it('asks nothing at all unless the caller opts in', async () => {
+    // The default for the exported function is silence: importing it must never
+    // block on a prompt. Only the entry point at the bottom of bluespace.ts asks.
+    const h = await harness({ persona: '# Helm', env: { LANG: 'en_AU.UTF-8' } });
+
+    await runLauncher([], { root: h.root, entry: h.entry, env: h.env, stdio: 'ignore' });
+
+    // Nobody was asked, so the guess still stands — the behaviour every launch
+    // after the first one has.
+    expect(valueOf(await h.argv(), '--append-system-prompt')).toContain(
+      'Write to the captain in **en-AU**',
+    );
+  });
+
+  it('does not ask a captain who has already answered', async () => {
+    const h = await harness({ persona: '# Helm', env: { LANG: 'en_AU.UTF-8' } });
+    await fs.writeFile(
+      path.join(sandboxHome, 'config.json'),
+      JSON.stringify({ language: 'ja', languageAsked: true }),
+      'utf8',
+    );
+    const t = terminal('2');
+
+    await runLauncher([], {
+      root: h.root,
+      entry: h.entry,
+      env: h.env,
+      stdio: 'ignore',
+      firstRun: t.io,
+    });
+
+    expect(t.printed()).toBe('');
+    expect(valueOf(await h.argv(), '--append-system-prompt')).toContain(
+      'Write to the captain in **ja**',
+    );
   });
 });
