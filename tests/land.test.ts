@@ -529,7 +529,13 @@ describe('landing a verified task', () => {
     await landTask(deps, taskId);
 
     const message = await git(['log', '-1', '--pretty=%B', 'blue/dev'], repoPath);
-    expect(message).toContain('Land Add retries');
+    // THE FIRST WORD IS `Merge`, and it is not a style choice. A captain's
+    // `commit-msg` hook enforced a house format on every commit and exempted
+    // git's own merges by matching `Merge *` on the first line; a message
+    // opening with `Land …` was rejected twice, and landing was impossible
+    // until the merge commit looked like the merge commit it is.
+    expect(message.split('\n')[0]).toMatch(/^Merge blue\/[\w-]+ into blue\/dev — Add retries$/);
+    expect(message).toContain('Add retries');
     expect(message).toContain(`Task: ${taskId}`);
     expect(message).toContain('Sentinel: Retries are bounded');
     // --no-ff: the merge is visible as a merge, which is what makes the pull

@@ -202,9 +202,22 @@ function resolveProject(deps: LandDeps, task: Task): Project {
  * what landed, which task it was, and what the verifier said about it. The
  * summary comes from the Sentinel's own verdict (it is recorded as the task's
  * summary when the diff passes), so the merge carries its justification.
+ *
+ * IT STARTS WITH THE WORD `Merge`, AND THAT IS LOAD-BEARING. It used to open
+ * with `Land <title>`, which read better and cost a captain two failed landings:
+ * their repository's `commit-msg` hook enforces a house format on every commit
+ * and exempts git's own merge messages by matching `Merge *` on the first line.
+ * A merge commit that does not look like one is a merge commit that hooks,
+ * tooling and `git log --oneline` all have to be taught about individually.
+ *
+ * BlueSpace does NOT pass `--no-verify` here, and should not: the captain's
+ * hooks are the captain's, every commit that contains actual work is the Crew's
+ * and goes through them inside the worktree, and a fleet that silently disarmed
+ * a repository's checks would be a worse neighbour than one that occasionally
+ * cannot land. Conforming is the fix; bypassing was not.
  */
 function mergeMessage(task: Task, branch: string, into: string): string {
-  const lines = [`Land ${task.title}`, '', `Merge ${branch} into ${into}.`, `Task: ${task.id}`];
+  const lines = [`Merge ${branch} into ${into} — ${task.title}`, '', `Task: ${task.id}`];
   const summary = task.summary?.trim();
   if (summary !== undefined && summary !== '') {
     lines.push('', `Sentinel: ${firstLine(summary, 400)}`);
