@@ -225,11 +225,34 @@ each is a worker that hangs, and a hang looks the same as a worker thinking.
 **A fresh directory blocks everything until it is trusted.** No hook fires — not
 even `SessionStart` — while Claude Code is asking whether this is a project you
 trust. Every Crew worktree is a brand-new directory, so this is the *default*
-first-run experience, not an edge case. Trust is inherited from a trusted
-ancestor, so trusting the worktree root once covers every worktree beneath it;
-`SessionNotReadyError` says so and prints the command. Measured: a first launch
-in a new git repo never reached `SessionStart`; subsequent launches in the same
-directory did.
+first-run experience, not an edge case. Measured: a first launch in a new git
+repo never reached `SessionStart`; subsequent launches in the same directory did.
+
+**The inheritance that made that survivable was bounded in 2.1.232, and BlueSpace
+now writes the answer itself.** Up to **2.1.231** the trust walk ran from the
+working directory to `/`, so a captain whose home directory was trusted had every
+worktree trusted for free and never saw this gate. **2.1.232** stops the walk at
+the repository root — read out of the binary, then confirmed on this machine: a
+fresh `git init` under a trusted ancestor prompts, a plain directory in the same
+place does not. A git worktree *is* a repository root, so an ancestor's trust is
+never consulted for one, and every Crew died on the dialog at the 90-second
+readiness timeout.
+
+The remedy this document used to give — trust the directory worktrees are created
+under, once — names the one directory the walk now refuses to look at. It is
+gone, and so is the copy of it in `SessionNotReadyError`.
+
+What replaces it: `src/adapters/workspace-trust.ts` records
+`hasTrustDialogAccepted: true` for each worktree, in the captain's own
+`~/.claude.json`, immediately before the launch. **This is the only thing
+BlueSpace writes to the captain's global Claude Code config**, it is one boolean
+for one directory BlueSpace itself created, and it is skipped entirely when the
+directory is already trusted. The alternatives were weighed and rejected in that
+file's header: `-p` (not an interactive session, so not a Crew),
+`CLAUDE_CODE_SANDBOXED=1` (asserts something untrue to get one answer), and
+auto-answering the dialog in the pane (answering a safety prompt on the captain's
+behalf, in a race). Verified end to end on 2.1.232: the worktree that had failed
+twice reached `SessionStart` in about a second with no dialog.
 
 **A positional prompt submits itself.** The first draft claimed it only fills the
 composer and that submission needs an explicit Enter. Re-measured in a trusted

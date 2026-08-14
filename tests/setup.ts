@@ -10,3 +10,7 @@
 
 delete process.env['ANTHROPIC_API_KEY'];
 delete process.env['CLAUDE_CLI_PATH'];
+// Same reason, third variable: it relocates `.claude.json`, and the workspace
+// trust check reads that file. A developer who has it set would otherwise be
+// asking a different question from the one CI asks.
+delete process.env['CLAUDE_CONFIG_DIR'];

@@ -250,6 +250,7 @@ async function setup(opts: {
   turnTimeoutMs?: number;
   blockedGraceMs?: number;
   structuredRetries?: number;
+  trustWorkspaces?: boolean;
 } = {}): Promise<Harness> {
   // realpath because macOS hands out /var/folders/... which is a symlink to
   // /private/var/...: the fake touches one spelling and we would stat the other.
@@ -295,6 +296,10 @@ async function setup(opts: {
     transcriptTimeoutMs: 20_000,
     blockedGraceMs: opts.blockedGraceMs ?? 60_000,
     ...(opts.structuredRetries === undefined ? {} : { structuredRetries: opts.structuredRetries }),
+    // Off unless a test asks, and a test that asks must also point
+    // CLAUDE_CONFIG_DIR somewhere disposable — otherwise this writes the
+    // suite's temp directories into the config of whoever ran it.
+    ...(opts.trustWorkspaces === undefined ? {} : { trustWorkspaces: opts.trustWorkspaces }),
   });
 
   return {
@@ -826,6 +831,64 @@ describe('spawn', () => {
 // ---------------------------------------------------------------------------
 // The event stream
 // ---------------------------------------------------------------------------
+
+describe('workspace trust', () => {
+  it('answers the trust dialog in advance, for the directory it is about to open', async () => {
+    // Since Claude Code 2.1.232 a git worktree — its own repository root — is
+    // never covered by an ancestor's trust, and an unanswered trust dialog stops
+    // the SessionStart hook, which is the readiness signal. Every crew died at
+    // the 90-second timeout. See src/adapters/workspace-trust.ts.
+    const configDir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'blue-cfg-')));
+    tmpDirs.push(configDir);
+    await fs.writeFile(path.join(configDir, '.claude.json'), JSON.stringify({ projects: {} }));
+
+    const h = await setup({ trustWorkspaces: true, env: { CLAUDE_CONFIG_DIR: configDir } });
+    const worktree = path.join(h.root, 'worktree');
+    await fs.mkdir(worktree, { recursive: true });
+    await fs.writeFile(path.join(worktree, '.git'), 'gitdir: /elsewhere\n');
+
+    const session = await h.adapter.spawn({
+      cwd: worktree,
+      prompt: 'go',
+      profile: { permissionMode: 'auto' },
+      settingScopes: [],
+      systemPromptAppend: 'SYS',
+    });
+
+    const cfg = JSON.parse(
+      await fs.readFile(path.join(configDir, '.claude.json'), 'utf8'),
+    ) as { projects: Record<string, Record<string, unknown>> };
+    expect(cfg.projects[worktree]).toEqual({ hasTrustDialogAccepted: true });
+
+    await session.close();
+  }, 60_000);
+
+  it('does not touch the captain’s config unless it was asked to', async () => {
+    const configDir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'blue-cfg-')));
+    tmpDirs.push(configDir);
+    await fs.writeFile(path.join(configDir, '.claude.json'), JSON.stringify({ projects: {} }));
+
+    const h = await setup({ env: { CLAUDE_CONFIG_DIR: configDir } });
+    const worktree = path.join(h.root, 'worktree');
+    await fs.mkdir(worktree, { recursive: true });
+    await fs.writeFile(path.join(worktree, '.git'), 'gitdir: /elsewhere\n');
+
+    const session = await h.adapter.spawn({
+      cwd: worktree,
+      prompt: 'go',
+      profile: { permissionMode: 'auto' },
+      settingScopes: [],
+      systemPromptAppend: 'SYS',
+    });
+
+    const cfg = JSON.parse(
+      await fs.readFile(path.join(configDir, '.claude.json'), 'utf8'),
+    ) as { projects: Record<string, unknown> };
+    expect(cfg.projects).toEqual({});
+
+    await session.close();
+  }, 60_000);
+});
 
 describe('events', () => {
   it(

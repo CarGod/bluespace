@@ -157,6 +157,7 @@ import {
   type SessionEndpoint,
 } from '../session/types.js';
 import { createStats, findTranscript, readTranscript, transcriptRoot } from '../transcript/reader.js';
+import { trustWorkspace } from './workspace-trust.js';
 import type { DispatchProfile } from '../types/domain.js';
 import {
   UnsupportedCapabilityError,
@@ -290,10 +291,17 @@ export class SessionNotReadyError extends Error {
         `run within ${waitedMs}ms, and the worker was killed rather than left to sit.\n\n` +
         `The likeliest cause is the workspace-trust prompt. Claude Code asks "Is this a project ` +
         `you trust?" the first time it opens a directory, no hook runs until it is answered, and ` +
-        `a fresh git worktree is always a new directory. Verified on 2.1.222: trust is inherited ` +
-        `from a trusted ancestor, so answering it once for the directory worktrees are created ` +
-        `under fixes it for every worktree afterwards:\n\n` +
-        `    cd ${path.dirname(cwd)} && claude    # answer "Yes, I trust this folder", then /exit\n\n` +
+        `a fresh git worktree is always a new directory. BlueSpace records the answer for every ` +
+        `worktree it cuts (see workspace-trust.ts); this run got past that, so either the ` +
+        `recording failed or something else is holding the window.\n\n` +
+        `Answering it by hand for THIS worktree unblocks a retry:\n\n` +
+        `    cd ${cwd} && claude    # answer "Yes, I trust this folder", then /exit\n\n` +
+        // The old text sent captains to the PARENT directory, which was correct
+        // until Claude Code 2.1.232 bounded the inheritance walk at the
+        // repository root. A git worktree is its own root, so an ancestor's
+        // trust is now never consulted and that advice cost 90 seconds a task.
+        `Trusting the directory worktrees live in does NOT cover them: since 2.1.232 the walk ` +
+        `stops at the repository root, and a worktree is one.\n\n` +
         `Other candidates: \`claude\` is not on PATH inside the session backend, or the inline ` +
         `--settings JSON was rejected.`,
     );
@@ -1587,6 +1595,17 @@ export interface ClaudeCliAdapterOptions {
   blockedGraceMs?: number;
   /** Corrections typed into a live session when structured output fails. */
   structuredRetries?: number;
+  /**
+   * Record workspace trust for a worker's directory before launching it.
+   *
+   * DEFAULT OFF, and the default is the whole reason this is a flag: it writes
+   * to the captain's `~/.claude.json`, and a test suite that did that would be
+   * writing every temporary worktree it ever made into the config of whoever
+   * ran it. Production turns it on at the one place the adapter is constructed
+   * for real (`boot()` in `src/cli/index.ts`); a test turns it on with
+   * `env.CLAUDE_CONFIG_DIR` pointed somewhere disposable.
+   */
+  trustWorkspaces?: boolean;
 }
 
 export class ClaudeCliAdapter implements HarnessAdapter {
@@ -1752,6 +1771,13 @@ export class ClaudeCliAdapter implements HarnessAdapter {
       throw err;
     }
 
+    // Before the window exists, because the dialog it prevents fires before the
+    // first hook does — and a worker stuck on that dialog is indistinguishable
+    // from a hang for 90 seconds and then dies. Failure here is not fatal: the
+    // run proceeds, and `SessionNotReadyError` says what it means if it comes
+    // to that.
+    this.#recordTrust(req.cwd);
+
     let endpoint: SessionEndpoint;
     try {
       endpoint = await this.#backend.launch({
@@ -1830,6 +1856,26 @@ export class ClaudeCliAdapter implements HarnessAdapter {
   #launchEnv(): Readonly<Record<string, string | undefined>> | undefined {
     const env = this.#opts.env;
     return env === undefined || Object.keys(env).length === 0 ? undefined : env;
+  }
+
+  /**
+   * Answer Claude Code's workspace-trust dialog in advance, for this directory.
+   *
+   * Silent when it works and when there is nothing to do, which is every launch
+   * after the first in a given worktree. A failure is reported once, at warn,
+   * and never raised: being unable to write a captain's config is a reason to
+   * let them see the dialog, not a reason to refuse them a crew.
+   */
+  #recordTrust(cwd: string): void {
+    if (this.#opts.trustWorkspaces !== true) return;
+    const env = { ...process.env, ...this.#opts.env };
+    const outcome = trustWorkspace(cwd, env);
+    if (outcome.kind === 'unavailable') {
+      console.warn(
+        `[bluespace:adapter] could not record workspace trust for ${cwd} (${outcome.why}) — ` +
+          'the worker may stop on the trust dialog',
+      );
+    }
   }
 
   async #createRunDir(sessionId: string): Promise<RunMarkers> {

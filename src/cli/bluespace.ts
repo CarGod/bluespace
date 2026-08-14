@@ -128,6 +128,7 @@ import {
   resolveHelmPosture,
 } from '../config/index.js';
 import type { BlueConfig, CaptainVoice } from '../config/index.js';
+import { workspaceTrusted as trustedIn } from '../adapters/workspace-trust.js';
 import { MCP_SERVER_NAME } from '../mcp/server.js';
 import { askLanguage } from './first-run.js';
 import type { FirstRunIO } from './first-run.js';
@@ -985,32 +986,17 @@ export function strictMcpRequested(env: NodeJS.ProcessEnv = process.env): boolea
  * would put a warning about a modal in front of every captain whose config lives
  * somewhere unusual, which is worse than the modal.
  *
- * Trust is INHERITED from a trusted ancestor (measured on 2.1.222, and the whole
- * reason `docs/compliance.md` tells you to trust the worktree root once), so an
- * ancestor entry counts. The check is a plain path-prefix walk rather than a
- * lookup, because that is what inheritance actually is.
+ * The rule itself lives in `adapters/workspace-trust.ts`, with one caller on
+ * each side of it: this window, which only WARNS, and the crew launcher, which
+ * records an answer in advance because nobody is sitting in front of a crew.
+ * They must agree, and the way to guarantee that is to have one of them.
  */
 export function workspaceTrusted(cwd: string, home: string | undefined): boolean | undefined {
   if (home === undefined || home === '') return undefined;
-  let projects: unknown;
-  try {
-    const raw = fs.readFileSync(path.join(home, '.claude.json'), 'utf8');
-    const parsed: unknown = JSON.parse(raw);
-    if (typeof parsed !== 'object' || parsed === null) return undefined;
-    projects = (parsed as Record<string, unknown>)['projects'];
-  } catch {
-    return undefined;
-  }
-  if (typeof projects !== 'object' || projects === null) return undefined;
-
-  const target = path.resolve(cwd);
-  for (const [dir, entry] of Object.entries(projects as Record<string, unknown>)) {
-    if (typeof entry !== 'object' || entry === null) continue;
-    if ((entry as Record<string, unknown>)['hasTrustDialogAccepted'] !== true) continue;
-    const trusted = path.resolve(dir);
-    if (target === trusted || target.startsWith(`${trusted}${path.sep}`)) return true;
-  }
-  return false;
+  // The home is passed in rather than read, so the question can be asked about a
+  // config that is not this process's — which is what the tests do, and what a
+  // captain with CLAUDE_CONFIG_DIR set needs.
+  return trustedIn(cwd, { ...process.env, HOME: home });
 }
 
 /**

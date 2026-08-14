@@ -411,7 +411,11 @@ function boot(): Boot {
 
   const blackbox = Blackbox.open(path.join(config.dataDir, 'blackbox.db'));
   const registry = ProjectRegistry.open(config.dataDir);
-  const adapter = createClaudeCliAdapter();
+  // `trustWorkspaces` is on HERE and only here. Every worktree a crew opens is a
+  // fresh git repository root, and since Claude Code 2.1.232 that means its own
+  // trust dialog — which no crew can answer, and which stops the SessionStart
+  // hook that signals readiness. See `src/adapters/workspace-trust.ts`.
+  const adapter = createClaudeCliAdapter({ trustWorkspaces: true });
 
   // Worktrees live under the data directory, NOT the manager's tmpdir default: a
   // landed task keeps its worktree because the branch it built is the deliverable,

@@ -78,13 +78,15 @@ export CLAUDE_CLI_PATH=/full/path/to/claude   # only if `claude` is off your PAT
 
 Claude Code asks *"Is this a project you trust?"* the first time it opens a directory, and
 no hook runs until it is answered — so a fresh worktree would sit there forever with
-nobody to press Enter. Trust is inherited from a parent, so answer it once for the
-directory worktrees are created under:
+nobody to press Enter. **BlueSpace answers it for you**, per worktree, immediately before
+each launch: one `hasTrustDialogAccepted: true` in your own `~/.claude.json`, for a
+directory BlueSpace just created out of a repository you registered. It is the only thing
+BlueSpace ever writes to your global Claude Code config, and it is skipped when the
+directory is already trusted.
 
-```bash
-mkdir -p ~/.bluespace/worktrees && cd ~/.bluespace/worktrees && claude
-# answer "Yes, I trust this folder", then /exit
-```
+Answering it by hand for the parent directory does *not* work, and used to: up to Claude
+Code 2.1.231 trust was inherited all the way up, and since 2.1.232 the walk stops at the
+repository root — which a git worktree is. See `docs/compliance.md`.
 
 Reading the Blackbox needs neither — `blue ps`, `blue log`, `blue inbox`, `blue config`
 and `blue map` without `--orchestrate` all run on a machine with no `claude` and no tmux.
