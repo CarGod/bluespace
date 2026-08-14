@@ -41,6 +41,7 @@ import {
   configPath,
   detectLanguage,
   findRepositories,
+  configReader,
   loadConfig,
   localeVarInEffect,
   normalizeLanguage,
@@ -291,6 +292,9 @@ function usage(): string {
     `  ${dim('languageAsked')} <true|false>  ${dim('false = put the first-launch language question back')}`,
   );
   L.push(
+    `  ${dim('address')} <word>            ${dim('what Helm calls you; unset derives it from language (舰长 / Captain)')}`,
+  );
+  L.push(
     `  ${dim('maxConcurrentCrew')} <int>   ${dim('maxRework')} <int>   ${dim('maxTokensPerTask')} <int>   ${dim('maxBudgetUsdPerTask')} <number>`,
   );
   L.push('');
@@ -407,6 +411,11 @@ interface Boot {
 
 function boot(): Boot {
   const config = loadConfig();
+  // The ORCHESTRATOR gets a reader rather than this snapshot. Everything else
+  // here — the paths, the printed rows — is a one-shot read and correct as one;
+  // the dispatch loop is the thing that has to notice an edit made while it is
+  // running. See `configReader` and OrchestratorDeps.config.
+  const configNow = configReader();
   fs.mkdirSync(config.dataDir, { recursive: true });
 
   const blackbox = Blackbox.open(path.join(config.dataDir, 'blackbox.db'));
@@ -432,7 +441,7 @@ function boot(): Boot {
     return wm;
   };
 
-  const orch = new Orchestrator({ blackbox, adapter, config, registry, worktreeFor });
+  const orch = new Orchestrator({ blackbox, adapter, config: configNow, registry, worktreeFor });
 
   let closed = false;
   return {
@@ -1192,6 +1201,12 @@ function printConfig(config: BlueConfig): void {
     ['maxConcurrentCrew', String(config.maxConcurrentCrew)],
     ['maxRework', String(config.maxRework)],
     ['language', languageRow(config)],
+    [
+      'address',
+      config.address !== undefined
+        ? config.address
+        : dim(`(unset) ${addressTerm(config.language)} — derived from language`),
+    ],
     // The Helm window, not a Crew. Printed with the resolved value AND the
     // provenance, because unset and off look identical on a screen that shows
     // only the value — and only one of them tracks the default if it changes.
@@ -1227,8 +1242,8 @@ function cmdConfig(b: Boot, rest: string[]): number {
     errOut(red('blue config set needs a key and a value.'));
     errOut(
       dim(
-        'Keys: permissionMode, model, effort, language, languageAsked, maxConcurrentCrew, maxRework, maxTokensPerTask,\n' +
-          '      maxBudgetUsdPerTask, helmUltracode, helmPermissionMode  (the `bluespace` window, not a crew)',
+        'Keys: permissionMode, model, effort, language, languageAsked, address, maxConcurrentCrew, maxRework,\n' +
+          '      maxTokensPerTask, maxBudgetUsdPerTask, helmUltracode, helmPermissionMode  (the `bluespace` window, not a crew)',
       ),
     );
     return 1;
@@ -1315,6 +1330,18 @@ function cmdConfig(b: Boot, rest: string[]): number {
       patch.language = language;
       break;
     }
+    case 'address': {
+      if (value === '-' || value === 'default') {
+        patch.address = null;
+        break;
+      }
+      if (value.trim() === '') {
+        errOut(red('address must not be empty. Use "-" to go back to the default.'));
+        return 1;
+      }
+      patch.address = value.trim();
+      break;
+    }
     case 'languageAsked': {
       // The one key whose useful value is `false`: it puts the first-run
       // question back, for a captain who skipped it and changed their mind.
@@ -1399,7 +1426,7 @@ function cmdConfig(b: Boot, rest: string[]): number {
       errOut(red(`Unknown config key "${key}".`));
       errOut(
         dim(
-          'Keys: permissionMode, model, effort, language, languageAsked, maxConcurrentCrew, maxRework, maxTokensPerTask, maxBudgetUsdPerTask',
+          'Keys: permissionMode, model, effort, language, languageAsked, address, maxConcurrentCrew, maxRework, maxTokensPerTask, maxBudgetUsdPerTask',
         ),
       );
       return 1;

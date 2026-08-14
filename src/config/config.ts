@@ -72,7 +72,22 @@ const RETIRED_PERMISSION_MODES: Readonly<Record<string, { to: PermissionMode; wh
  * work while still stopping a Crew that has started looping. Named because the
  * migration warning quotes it.
  */
-export const DEFAULT_MAX_TOKENS_PER_TASK = 5_000_000;
+/**
+ * No per-task token ceiling by default. The captain's decision, and it is a real
+ * one: on a subscription this was the ONLY thing that stopped a runaway task.
+ *
+ * What made the old 5,000,000 indefensible as a DEFAULT was what the number
+ * actually counts. Measured on a task that died to it: 41 turns, 4.91M of the
+ * 5.16M total being CACHE READS — the same conversation prefix re-read every
+ * turn — against 42k of output. The ceiling therefore fires on `turns × context
+ * size` and is nearly blind to whether the work was any good, so it killed three
+ * rounds of perfectly healthy tasks, each about four fifths of the way through.
+ * A limit that cannot tell a runaway from a long job is not a safety net.
+ *
+ * `blue config set maxTokensPerTask <n>` puts one back, and `blue config` says
+ * out loud when there is none.
+ */
+export const DEFAULT_MAX_TOKENS_PER_TASK = 0;
 
 export const EFFORT_LEVELS: readonly Effort[] = [
   'low',
@@ -135,6 +150,18 @@ export const LOCALE_ENV_VARS = ['LC_ALL', 'LC_MESSAGES', 'LANG'] as const;
 
 /** How Helm addresses the captain when nothing better is known. */
 export const DEFAULT_ADDRESS = 'Captain';
+
+/**
+ * How many Crews may run at once.
+ *
+ * Raised from 4 to 10 on the captain's word. `docs/compliance.md` is explicit
+ * that this is a decision about the VOLUME paragraph — a fleet running
+ * unattended for hours against advertised limits that "assume ordinary,
+ * individual usage" — and not a performance knob. It is theirs to make; it is
+ * recorded here and there so the next reader knows it was made rather than
+ * drifted into.
+ */
+export const DEFAULT_MAX_CONCURRENT_CREW = 10;
 
 /**
  * The address term, by language. Deliberately short.
@@ -303,17 +330,31 @@ export const DECLINED_VOICE: CaptainVoice = { address: DEFAULT_ADDRESS, pinned: 
 export function resolveCaptainVoice(
   pinned: string | undefined,
   env: NodeJS.ProcessEnv = process.env,
-  options: { declined?: boolean } = {},
+  options: { declined?: boolean; address?: string } = {},
 ): CaptainVoice {
+  // The captain's own word for themselves outranks anything derived from a
+  // language, in every branch below — including the ones where no language
+  // resolved at all. Somebody who typed 舰长 has said so.
+  const pinnedAddress = options.address !== undefined && options.address.trim() !== ''
+    ? options.address.trim()
+    : undefined;
   // A decline outranks the locale, and only the locale. The first-run question
   // shows the detected language as an option BY NAME — declining it is a
   // captain looking at `en-AU` and saying no, so carrying on and using `en-AU`
   // anyway would answer for them. A pin still wins over both: it is the newer
   // instruction, and the only way to get one is to have said it.
-  if (pinned === undefined && options.declined === true) return DECLINED_VOICE;
+  if (pinned === undefined && options.declined === true) {
+    return pinnedAddress === undefined ? DECLINED_VOICE : { ...DECLINED_VOICE, address: pinnedAddress };
+  }
   const language = pinned ?? detectLanguage(env);
-  if (language === undefined) return MIRROR_VOICE;
-  return { language, address: addressTerm(language), pinned: pinned !== undefined };
+  if (language === undefined) {
+    return pinnedAddress === undefined ? MIRROR_VOICE : { ...MIRROR_VOICE, address: pinnedAddress };
+  }
+  return {
+    language,
+    address: pinnedAddress ?? addressTerm(language),
+    pinned: pinned !== undefined,
+  };
 }
 
 /**
@@ -324,10 +365,13 @@ export function resolveCaptainVoice(
  * silently dropping the decline and reinstating the guess.
  */
 export function captainVoice(
-  config: Pick<BlueConfig, 'language' | 'languageAsked'>,
+  config: Pick<BlueConfig, 'language' | 'languageAsked' | 'address'>,
   env: NodeJS.ProcessEnv = process.env,
 ): CaptainVoice {
-  return resolveCaptainVoice(config.language, env, { declined: config.languageAsked === true });
+  return resolveCaptainVoice(config.language, env, {
+    declined: config.languageAsked === true,
+    ...(config.address !== undefined ? { address: config.address } : {}),
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -438,6 +482,16 @@ export interface BlueConfig {
    * `blue config set languageAsked false` puts the question back.
    */
   languageAsked?: boolean;
+  /**
+   * What Helm calls the captain. Unset derives it from `language` — 舰长 in
+   * Chinese, Captain everywhere else.
+   *
+   * A pin exists because the derivation is a lookup table with one checked row
+   * in it (see {@link ADDRESS_TERMS}), and a captain who wants 船长, 老板, or
+   * their own name should not have to file a patch to get it. It travels with
+   * the voice and reaches Helm through the launcher's system prompt.
+   */
+  address?: string;
   /** Derived from BLUESPACE_HOME / ~/.bluespace. Not settable from the file. */
   dataDir: string;
 }
@@ -491,7 +545,7 @@ export function defaultConfig(): BlueConfig {
     effort: 'high',
     maxTokensPerTask: DEFAULT_MAX_TOKENS_PER_TASK,
     maxBudgetUsdPerTask: 5,
-    maxConcurrentCrew: 4,
+    maxConcurrentCrew: DEFAULT_MAX_CONCURRENT_CREW,
     maxRework: 2,
     dataDir: dataDir(),
   };
@@ -730,6 +784,24 @@ export function mergeConfig(base: BlueConfig, patch: Record<string, unknown>): B
     }
   }
 
+  if ('address' in patch) {
+    if (patch.address === null) {
+      out.address = undefined;
+    } else if (typeof patch.address === 'string' && patch.address.trim() !== '') {
+      // Same ceiling as `language`, and for the same reason: this string is
+      // pasted into a system prompt, so it is an input to a model rather than a
+      // label. A term of address is short.
+      const trimmed = patch.address.trim();
+      if (trimmed.length > MAX_LANGUAGE_LENGTH) {
+        warn(`ignoring address longer than ${MAX_LANGUAGE_LENGTH} characters`);
+      } else {
+        out.address = trimmed;
+      }
+    } else if (patch.address !== undefined) {
+      warn(`ignoring invalid address ${JSON.stringify(patch.address)} — expected a non-empty string`);
+    }
+  }
+
   if ('languageAsked' in patch) {
     if (patch.languageAsked === null) {
       out.languageAsked = undefined;
@@ -764,8 +836,9 @@ export function mergeConfig(base: BlueConfig, patch: Record<string, unknown>): B
         `maxBudgetUsdPerTask ${JSON.stringify(got.value)} now applies ONLY to metered runs ` +
           '(ANTHROPIC_API_KEY set) — on a Claude subscription those tokens draw down a quota ' +
           'and cost no dollars, so there was never any spend for it to bound. The ceiling that ' +
-          `stops a task now is maxTokensPerTask, defaulting to ${DEFAULT_MAX_TOKENS_PER_TASK.toLocaleString('en-US')} ` +
-          'tokens. Set it explicitly (`blue config set maxTokensPerTask <n>`) to silence this.',
+          'stops a task now is maxTokensPerTask, and it is UNSET by default — there is no ' +
+          'consumption ceiling at all until you give it one. Set it explicitly ' +
+          '(`blue config set maxTokensPerTask <n>`) to silence this.',
       );
     }
   }
@@ -808,6 +881,29 @@ export function loadConfig(): BlueConfig {
   }
 }
 
+/**
+ * A `loadConfig` that a hot loop can call.
+ *
+ * The orchestrator asks for the ceiling on every poll of every crew, so it
+ * cannot read and parse the file each time — and it must not cache it forever
+ * either, which is precisely the bug this exists to end: a captain who raised a
+ * ceiling had to close the window running their work for the new number to
+ * apply. One second is short enough that an edit lands before the next check and
+ * long enough that the file is read once a second rather than fifty times.
+ */
+export function configReader(ttlMs = 1000): () => BlueConfig {
+  let readAt = 0;
+  let cached: BlueConfig | undefined;
+  return () => {
+    const now = Date.now();
+    if (cached === undefined || now - readAt >= ttlMs) {
+      cached = loadConfig();
+      readAt = now;
+    }
+    return cached;
+  };
+}
+
 /** Merge `patch` over the current config, persist atomically, return the result. */
 export function saveConfig(patch: ConfigPatch): BlueConfig {
   const merged = mergeConfig(loadConfig(), patch as Record<string, unknown>);
@@ -830,6 +926,7 @@ function serialize(cfg: BlueConfig): Record<string, unknown> {
     ...(cfg.model !== undefined ? { model: cfg.model } : {}),
     ...(cfg.effort !== undefined ? { effort: cfg.effort } : {}),
     ...(cfg.language !== undefined ? { language: cfg.language } : {}),
+    ...(cfg.address !== undefined ? { address: cfg.address } : {}),
     // Persisted even though it is `false` half the time it is set, because
     // `false` here is not the default — it is "ask me again", which a captain
     // can only have got by typing it.

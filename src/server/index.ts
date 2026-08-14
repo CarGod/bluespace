@@ -38,7 +38,18 @@ import {
   taskIdOf,
   type Blackbox,
 } from '../blackbox/index.js';
-import { dataDir, ProjectRegistry } from '../config/index.js';
+import {
+  DEFAULT_MAX_CONCURRENT_CREW,
+  DEFAULT_MAX_TOKENS_PER_TASK,
+  ProjectRegistry,
+  captainVoice,
+  configPath,
+  dataDir,
+  loadConfig,
+  normalizeLanguage,
+  saveConfig,
+} from '../config/index.js';
+import type { ConfigPatch } from '../config/index.js';
 import { readHelmWindows } from '../helm/index.js';
 import { helmWindowsInView } from '../cli/ps.js';
 import type { Orchestrator } from '../orchestrator/index.js';
@@ -311,6 +322,108 @@ export async function startServer(opts: StarmapOptions): Promise<StarmapHandle> 
       const limit = clamp(intParam(url.searchParams.get('limit'), MAX_EVENT_PAGE), 1, MAX_EVENT_PAGE);
       const events = mirror.since(since, limit);
       sendJson(res, 200, { events, seq: mirror.latestSeq(), now: Date.now() });
+      return;
+    }
+
+    /**
+     * The captain's settings, read and written from the map.
+     *
+     * WHY THE MAP MAY WRITE THESE. It is the same file `blue config set` writes
+     * and the same validation, reached from the surface the captain is already
+     * looking at when the setting turns out to be wrong — which is the moment
+     * they learn it is wrong. Nothing here touches a running task: the
+     * orchestrator re-reads the file (see `configReader`), so a raised ceiling
+     * applies to the next check rather than to the next process.
+     *
+     * Deliberately NOT every key. Permission posture and the model belong to the
+     * launcher and to a decision made once; these four are the ones a captain
+     * changes because of something they just watched happen.
+     */
+    if (method === 'GET' && a === 'config' && segs.length === 2) {
+      const cfg = loadConfig();
+      const voice = captainVoice(cfg);
+      sendJson(res, 200, {
+        config: {
+          language: cfg.language ?? null,
+          address: cfg.address ?? null,
+          maxTokensPerTask: cfg.maxTokensPerTask,
+          maxConcurrentCrew: cfg.maxConcurrentCrew,
+          maxRework: cfg.maxRework,
+        },
+        // What the captain would get if they cleared the field — the placeholder
+        // the form shows, so "unset" is never a blank nobody can interpret.
+        resolved: { address: voice.address, language: voice.language ?? null },
+        defaults: {
+          maxTokensPerTask: DEFAULT_MAX_TOKENS_PER_TASK,
+          maxConcurrentCrew: DEFAULT_MAX_CONCURRENT_CREW,
+        },
+        configPath: configPath(),
+        now: Date.now(),
+      });
+      return;
+    }
+
+    if (method === 'POST' && a === 'config' && segs.length === 2) {
+      const body = await readJsonBody(req, res);
+      if (!body.ok) return;
+      const patch: ConfigPatch = {};
+      const raw = body.value as Record<string, unknown>;
+
+      // `null` clears a field; an absent key leaves it alone. Same contract as
+      // `saveConfig`, and the reason the form can offer "back to the default".
+      if ('language' in raw) {
+        if (raw['language'] === null || raw['language'] === '') patch.language = null;
+        else {
+          const lang = typeof raw['language'] === 'string' ? normalizeLanguage(raw['language']) : undefined;
+          if (lang === undefined) {
+            sendJson(res, 400, { error: 'language must name a language — a tag like zh-CN, or a name like 中文. "C" and "POSIX" name none.' });
+            return;
+          }
+          patch.language = lang;
+          // Answering it here answers it everywhere: the launcher must not put
+          // its first-run question to a captain who has just set the value.
+          patch.languageAsked = true;
+        }
+      }
+      if ('address' in raw) {
+        if (raw['address'] === null || raw['address'] === '') patch.address = null;
+        else if (typeof raw['address'] === 'string' && raw['address'].trim() !== '') patch.address = raw['address'].trim();
+        else {
+          sendJson(res, 400, { error: 'address must be a word, or null to derive it from the language' });
+          return;
+        }
+      }
+      for (const key of ['maxTokensPerTask', 'maxConcurrentCrew', 'maxRework'] as const) {
+        if (!(key in raw)) continue;
+        const n = Number(raw[key]);
+        if (!Number.isInteger(n) || n < 0) {
+          sendJson(res, 400, { error: `${key} must be a non-negative whole number` });
+          return;
+        }
+        if (key === 'maxConcurrentCrew' && n < 1) {
+          sendJson(res, 400, { error: 'maxConcurrentCrew must be at least 1 — otherwise nothing ever dispatches' });
+          return;
+        }
+        patch[key] = n;
+      }
+
+      try {
+        const saved = saveConfig(patch);
+        const voice = captainVoice(saved);
+        sendJson(res, 200, {
+          ok: true,
+          config: {
+            language: saved.language ?? null,
+            address: saved.address ?? null,
+            maxTokensPerTask: saved.maxTokensPerTask,
+            maxConcurrentCrew: saved.maxConcurrentCrew,
+            maxRework: saved.maxRework,
+          },
+          resolved: { address: voice.address, language: voice.language ?? null },
+        });
+      } catch (err) {
+        sendJson(res, 500, { error: messageOf(err) });
+      }
       return;
     }
 

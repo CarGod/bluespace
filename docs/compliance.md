@@ -96,8 +96,11 @@ Be honest with yourself about three things.
 and only the first is settled above. "Advertised usage limits assume ordinary,
 individual usage" is a real constraint, and a fleet of workers running unattended
 for hours is not obviously ordinary individual usage no matter how legitimate
-each session is. `maxConcurrentCrew` defaults low on purpose. Raising it is a
-decision about this paragraph, not a performance tuning knob.
+each session is. Raising `maxConcurrentCrew` is a
+decision about this paragraph, not a performance tuning knob. **The default is
+10, raised from 4 by the captain, knowing that.** It is written down here as well
+as in `DEFAULT_MAX_CONCURRENT_CREW` so the next reader can tell a decision from a
+drift.
 
 **2. Distribution.** Everything above concerns *you* running BlueSpace on *your*
 machine with *your* subscription. Shipping BlueSpace to other people as a thing

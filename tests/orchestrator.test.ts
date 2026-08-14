@@ -306,6 +306,14 @@ interface Harness {
   verdicts: VerdictSpec[];
   sentinelRuns: Array<{ taskId: string; diff: string; cwd: string }>;
   errors: Array<{ scope: string; err: unknown }>;
+  /**
+   * The live settings object the orchestrator reads through.
+   *
+   * MUTABLE ON PURPOSE. The orchestrator takes a reader rather than a snapshot
+   * so a captain's edit reaches the loop that is already running; a test that
+   * could only pass settings at construction could not tell the two apart.
+   */
+  config: BlueConfig;
 }
 
 const PROJECT: Project = {
@@ -337,6 +345,19 @@ function harness(
   config: Partial<BlueConfig> = {},
   project: Partial<Project> = {},
 ): Harness {
+  const liveConfig: BlueConfig = {
+    // `auto` is the default posture now: it edits and runs commands unattended
+    // with no dialog and no machine-wide config write. See types/domain.ts.
+    permissionMode: 'auto',
+    // High enough to be out of the way of every test that is not about a
+    // ceiling; the ceiling tests set their own.
+    maxTokensPerTask: 100_000_000,
+    maxBudgetUsdPerTask: 25,
+    maxConcurrentCrew: 4,
+    maxRework: 2,
+    dataDir: DATA_DIR,
+    ...config,
+  };
   const bb = Blackbox.open(':memory:');
   const adapter = new FakeAdapter();
   const merged: Project = { ...PROJECT, ...project };
@@ -369,19 +390,9 @@ function harness(
   const orch = new Orchestrator({
     blackbox: bb,
     adapter,
-    config: {
-      // `auto` is the default posture now: it edits and runs commands unattended
-      // with no dialog and no machine-wide config write. See types/domain.ts.
-      permissionMode: 'auto',
-      // High enough to be out of the way of every test that is not about a
-      // ceiling; the ceiling tests set their own.
-      maxTokensPerTask: 100_000_000,
-      maxBudgetUsdPerTask: 25,
-      maxConcurrentCrew: 4,
-      maxRework: 2,
-      dataDir: DATA_DIR,
-      ...config,
-    },
+    // A reader over a mutable object, which is what the real one is: `boot()`
+    // hands over `configReader()`, and a test hands over this.
+    config: () => liveConfig,
     registry: fakeRegistry([merged]),
     worktreeFor: (repoPath: string) => {
       expect(repoPath).toBe(merged.path);
@@ -391,7 +402,7 @@ function harness(
     onError: (scope, err) => errors.push({ scope, err }),
   });
 
-  open = { bb, orch, adapter, worktrees, project: merged, verdicts, sentinelRuns, errors };
+  open = { bb, orch, adapter, worktrees, project: merged, verdicts, sentinelRuns, errors, config: liveConfig };
   return open;
 }
 
@@ -1361,6 +1372,44 @@ describe('captain controls', () => {
 
     expect(crew.closed, 'a failed interrupt left the crew running').toBe(true);
     expect(failureReason(h, task.id)).toContain('token_ceiling_exceeded');
+  });
+
+  it('reads the ceiling that is set NOW, not the one set at boot', async () => {
+    // THREE ROUNDS OF TASKS DIED TO THIS. The orchestrator held a snapshot taken
+    // when the process started, so a captain who raised `maxTokensPerTask` after
+    // watching a task hit it changed nothing at all — the check that killed the
+    // next task still read the old number, and the only delivery mechanism for a
+    // setting was closing the window running the work.
+    const h = harness({ maxTokensPerTask: 0 });
+    const task = newTask(h);
+
+    await h.orch.tick();
+    h.adapter.crewFor(task.id).turn({ inputTokens: 5000, outputTokens: 10 });
+    await h.orch.whenIdle();
+    expect(stateOf(h, task.id)).not.toBe('failed');
+
+    // The captain lowers it, mid-flight, from another process.
+    const second = newTask(h);
+    h.config.maxTokensPerTask = 1000;
+    await h.orch.tick();
+    h.adapter.crewFor(second.id).turn({ inputTokens: 5000, outputTokens: 10 });
+    await h.orch.whenIdle();
+
+    expect(failureReason(h, second.id)).toContain('token_ceiling_exceeded');
+  });
+
+  it('admits crews against the concurrency cap as it stands now', async () => {
+    const h = harness({ maxConcurrentCrew: 1 });
+    const tasks = [newTask(h), newTask(h)];
+    await h.orch.tick();
+    expect(h.adapter.spawns).toHaveLength(1);
+
+    // Raised from the Starmap, or from `blue config set`, while these are queued.
+    h.config.maxConcurrentCrew = 2;
+    await h.orch.tick();
+
+    expect(h.adapter.spawns).toHaveLength(2);
+    expect(tasks.every((t) => stateOf(h, t.id) === 'working')).toBe(true);
   });
 
   it('disables the ceiling at 0 rather than treating it as "no tokens allowed"', async () => {

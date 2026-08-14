@@ -205,7 +205,21 @@ export type SentinelRunner = (input: {
 export interface OrchestratorDeps {
   blackbox: Blackbox;
   adapter: HarnessAdapter;
-  config: BlueConfig;
+  /**
+   * The captain's settings, read fresh on every use.
+   *
+   * A FUNCTION, NOT A VALUE, and the difference cost three rounds of tasks. The
+   * orchestrator used to be handed a snapshot taken when the process started, so
+   * a captain who raised `maxTokensPerTask` after watching a task die to it
+   * changed nothing at all: the loop that killed the next one was still reading
+   * the number from before their edit, and the only way to deliver a setting was
+   * to close the window that was running the work. Every read below is a fresh
+   * one; `boot()` supplies a reader that re-reads the file, cheaply.
+   *
+   * A plain object is still accepted — every test passes one — and is simply a
+   * setting that never changes.
+   */
+  config: BlueConfig | (() => BlueConfig);
   registry: ProjectRegistry;
   worktreeFor(projectPath: string): WorktreeManager;
   /**
@@ -217,6 +231,11 @@ export interface OrchestratorDeps {
   sentinel?: SentinelRunner;
   /** Optional diagnostics sink. Defaults to stderr. */
   onError?: (scope: string, err: unknown) => void;
+}
+
+/** The settings as of RIGHT NOW. Never store the result. */
+function readConfig(source: BlueConfig | (() => BlueConfig)): BlueConfig {
+  return typeof source === 'function' ? source() : source;
 }
 
 export interface CreateTaskInput {
@@ -271,6 +290,17 @@ export class Orchestrator {
 
   constructor(deps: OrchestratorDeps) {
     this.#deps = deps;
+  }
+
+  /**
+   * The captain's settings as of right now.
+   *
+   * Every read goes through here and none of them keep the result. A ceiling
+   * they raised at 22:20 has to bite the check that runs at 22:21, not the one
+   * that ran when the process started.
+   */
+  #config(): BlueConfig {
+    return readConfig(this.#deps.config);
   }
 
   // -- reads ---------------------------------------------------------------
@@ -508,7 +538,7 @@ export class Orchestrator {
     // and a worktree is already being cut. Not counting it would let a slow
     // spawn blow straight through the concurrency cap.
     let inFlight = all.filter((t) => t.state === 'dispatched' || t.state === 'working').length;
-    const cap = this.#deps.config.maxConcurrentCrew;
+    const cap = this.#config().maxConcurrentCrew;
 
     for (const task of all.filter((t) => t.state === 'queued').sort(byCreation)) {
       const deps = this.#dependencyStatus(task, tasks);
@@ -654,7 +684,7 @@ export class Orchestrator {
 
   /** Project override beats global config; the rest comes straight from config. */
   #profileFor(project: Project): DispatchProfile {
-    const cfg = this.#deps.config;
+    const cfg = this.#config();
     const profile: DispatchProfile = {
       permissionMode: project.permissionMode ?? cfg.permissionMode,
     };
@@ -922,7 +952,7 @@ export class Orchestrator {
     const taskId = live.taskId;
     const attempts = this.#failedAttempts(taskId);
 
-    if (attempts > this.#deps.config.maxRework) {
+    if (attempts > this.#config().maxRework) {
       // Out of retries. Failing here would throw away a mostly-working diff and
       // tell the captain nothing; the honest move is to put it in the inbox.
       // There is no verifying -> awaiting_decision edge, so this walks the legal
@@ -1164,7 +1194,7 @@ export class Orchestrator {
    */
   #enforceCeilings(live: LiveCrew): void {
     if (live.ceilingBreach !== undefined) return;
-    const cfg = this.#deps.config;
+    const cfg = this.#config();
     const task = this.task(live.taskId);
     if (!task) return;
 
@@ -1296,7 +1326,7 @@ export class Orchestrator {
     worktreePath: string,
   ): Promise<{ summary: string; artifact?: string }> {
     const source = reportPath(worktreePath);
-    const target = path.join(this.#deps.config.dataDir, 'reports', reportFileName(taskId));
+    const target = path.join(this.#config().dataDir, 'reports', reportFileName(taskId));
 
     try {
       const body = await fs.readFile(source);

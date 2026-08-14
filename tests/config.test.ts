@@ -13,12 +13,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
   DEFAULT_ADDRESS,
+  DEFAULT_MAX_CONCURRENT_CREW,
   DEFAULT_MAX_TOKENS_PER_TASK,
   MIRROR_VOICE,
   ProjectRegistry,
   ProjectRegistryError,
   addressTerm,
   configPath,
+  configReader,
   dataDir,
   defaultConfig,
   detectLanguage,
@@ -68,22 +70,52 @@ function makeRepo(name: string): string {
 // Defaults
 // ---------------------------------------------------------------------------
 
+describe('configReader', () => {
+  it('notices an edit made while the process is running', async () => {
+    // THE BUG THIS EXISTS FOR. The orchestrator was handed a snapshot taken at
+    // boot, so a captain who raised a ceiling after watching a task die to it
+    // changed nothing: the check that killed the next task still read the old
+    // number, and the only way to deliver a setting was to close the window
+    // running the work. Three rounds of healthy tasks died that way.
+    writeConfig(JSON.stringify({ maxTokensPerTask: 1000 }));
+    const read = configReader(0);
+    expect(read().maxTokensPerTask).toBe(1000);
+
+    writeConfig(JSON.stringify({ maxTokensPerTask: 9000 }));
+    expect(read().maxTokensPerTask).toBe(9000);
+  });
+
+  it('does not read the file on every call', () => {
+    // It is asked for the ceiling on every poll of every crew.
+    writeConfig(JSON.stringify({ maxRework: 1 }));
+    const read = configReader(60_000);
+    expect(read().maxRework).toBe(1);
+    writeConfig(JSON.stringify({ maxRework: 7 }));
+    expect(read().maxRework).toBe(1);
+  });
+});
+
 describe('defaults', () => {
   it('honours BLUESPACE_HOME for dataDir and configPath', () => {
     expect(dataDir()).toBe(home);
     expect(configPath()).toBe(path.join(home, 'config.json'));
   });
 
-  it('defaults to autonomous crews with a bounded token ceiling', () => {
+  it('defaults to autonomous crews and NO token ceiling', () => {
     expect(defaultConfig()).toEqual({
       permissionMode: 'auto',
       effort: 'high',
       maxTokensPerTask: DEFAULT_MAX_TOKENS_PER_TASK,
       maxBudgetUsdPerTask: 5,
-      maxConcurrentCrew: 4,
+      maxConcurrentCrew: DEFAULT_MAX_CONCURRENT_CREW,
       maxRework: 2,
       dataDir: home,
     });
+    // Both are the captain's decision, and both are stated rather than implied:
+    // 0 means nothing stops a runaway task, and 10 crews at once is a decision
+    // about the volume paragraph in docs/compliance.md.
+    expect(DEFAULT_MAX_TOKENS_PER_TASK).toBe(0);
+    expect(DEFAULT_MAX_CONCURRENT_CREW).toBe(10);
   });
 
   it('loadConfig creates the data dir and returns defaults when no file exists', () => {
@@ -380,7 +412,7 @@ describe('invalid values are dropped, not fatal', () => {
     );
     const cfg = loadConfig();
     expect(cfg.maxBudgetUsdPerTask).toBe(5);
-    expect(cfg.maxConcurrentCrew).toBe(4);
+    expect(cfg.maxConcurrentCrew).toBe(DEFAULT_MAX_CONCURRENT_CREW);
     expect(cfg.maxRework).toBe(2);
     expect(cfg.model).toBeUndefined();
     expect(warnSpy).toHaveBeenCalledTimes(4);
