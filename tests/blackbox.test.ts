@@ -319,6 +319,43 @@ describe('projectTasks', () => {
     expect(tasks.get('t2')?.state).toBe('failed');
   });
 
+  it('folds a dismissal without disturbing anything that happened', () => {
+    // Clearing a card off the Starmap board is a VIEW fact. It must not change
+    // the state, must not bump `updatedAt` (which would reorder the board and
+    // misreport last activity), and must not touch a single number.
+    createTask('t1');
+    bb.append({ type: 'task.failed', taskId: 't1', reason: 'token ceiling' });
+    bb.append({ type: 'crew.spawned', crewId: 'c1', taskId: 't1', cwd: '/wt/1' });
+    bb.append({ type: 'crew.usage', crewId: 'c1', costUsd: 0.5, inputTokens: 100, outputTokens: 20 });
+    const before = projectTasks(bb.read()).get('t1');
+
+    bb.append({ type: 'task.dismissed', taskId: 't1', dismissed: true });
+    const after = projectTasks(bb.read()).get('t1');
+
+    expect(after?.dismissedAt).toBeGreaterThan(0);
+    expect(after?.state).toBe('failed');
+    expect(after?.updatedAt).toBe(before?.updatedAt);
+    expect(after?.listPriceUsd).toBe(before?.listPriceUsd);
+    expect(totalTokens(after?.tokens.totals ?? { input: 0, output: 0, cacheRead: 0, cacheCreation: 0 }))
+      .toBe(totalTokens(before?.tokens.totals ?? { input: 0, output: 0, cacheRead: 0, cacheCreation: 0 }));
+  });
+
+  it('puts a dismissed task back with the same event', () => {
+    // Reversible by design: the log records the captain changing their mind
+    // rather than losing the fact that they once cleared it.
+    createTask('t1');
+    bb.append({ type: 'task.failed', taskId: 't1', reason: 'nope' });
+    bb.append({ type: 'task.dismissed', taskId: 't1', dismissed: true });
+    bb.append({ type: 'task.dismissed', taskId: 't1', dismissed: false });
+
+    expect(projectTasks(bb.read()).get('t1')?.dismissedAt).toBeUndefined();
+  });
+
+  it('ignores a dismissal for a task that does not exist', () => {
+    bb.append({ type: 'task.dismissed', taskId: 'ghost', dismissed: true });
+    expect(projectTasks(bb.read()).size).toBe(0);
+  });
+
   it('attributes crew.usage to the task that owns the crew', () => {
     createTask('t1');
     createTask('t2', 'Second');

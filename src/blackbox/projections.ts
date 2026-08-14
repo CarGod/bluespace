@@ -215,6 +215,15 @@ export function projectTasks(events: BlueEvent[]): Map<TaskId, Task> {
         break;
       }
 
+      case 'task.dismissed': {
+        // Not a transition: a dismissed task keeps the state it died in. This
+        // only decides whether the board draws it.
+        const task = tasks.get(e.taskId);
+        if (!task) break;
+        task.dismissedAt = e.dismissed ? e.at : undefined;
+        break;
+      }
+
       case 'crew.usage': {
         const task = touch(owners.get(e.crewId), e.at);
         if (!task) break;

@@ -213,6 +213,16 @@ export interface Task {
   mergeCommit?: string;
   mergedAt?: number;
   /**
+   * When the captain took this task off the board, if they have.
+   *
+   * Presentation only. It does not change the state, does not touch the
+   * worktree or the branch, and does not remove the task from any total — a
+   * dismissed failure is still a failure that spent tokens. Anything reporting
+   * what the fleet DID must ignore this field; only what the fleet SHOWS may
+   * read it. See `task.dismissed` in types/events.ts.
+   */
+  dismissedAt?: number;
+  /**
    * Tokens consumed by every Crew and Sentinel run for this task, by model.
    * THE quantity: it is measured, not inferred, and it is what `maxTokensPerTask`
    * bounds. See {@link TokenCounts}.

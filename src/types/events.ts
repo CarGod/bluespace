@@ -319,6 +319,31 @@ export interface ProjectRegistered {
 // Union
 // ---------------------------------------------------------------------------
 
+/**
+ * The captain has taken a finished task off the board, or put it back.
+ *
+ * A VIEW FACT, NOT A LIFECYCLE ONE — which is why it is a separate event rather
+ * than a state. Dismissing changes nothing about what happened: the task stays
+ * `failed`, its worktree stays on disk, its branch stays where it is, and its
+ * tokens still count towards every total. It says only that the captain is done
+ * looking at it.
+ *
+ * It is an EVENT rather than something the browser remembers because the board
+ * is a fold over this log and nothing else. A dismissal kept in `localStorage`
+ * would be invisible to `blue ps`, would not survive a different browser, and
+ * would be the one piece of fleet state that lives outside the Blackbox.
+ *
+ * Reversible on purpose, and by the same event: `dismissed: false` puts it back,
+ * so the log records the captain changing their mind rather than losing the fact
+ * that they once cleared it.
+ */
+export interface TaskDismissed {
+  type: 'task.dismissed';
+  taskId: TaskId;
+  /** False restores it to the board. */
+  dismissed: boolean;
+}
+
 export type BlueEventBody =
   | TaskCreated
   | TaskDispatched
@@ -326,6 +351,7 @@ export type BlueEventBody =
   | TaskCompleted
   | TaskFailed
   | TaskMerged
+  | TaskDismissed
   | CrewSpawned
   | CrewText
   | CrewThinking

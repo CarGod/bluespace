@@ -401,6 +401,39 @@ main { padding: 20px max(16px, env(safe-area-inset-left)) 64px max(16px, env(saf
 .tl-insight b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
 
 /* ---- toasts --------------------------------------------------------------- */
+/* ---- the live detail window ---------------------------------------------- */
+.modal-back {
+  position: fixed; inset: 0; z-index: 90; display: grid; place-items: center; padding: 24px;
+  background: color-mix(in srgb, #000 62%, transparent); backdrop-filter: blur(2px);
+  animation: rise .12s ease-out;
+}
+.modal {
+  width: min(920px, 100%); max-height: min(84vh, 900px); display: flex; flex-direction: column;
+  gap: 0; padding: 0; overflow: hidden; box-shadow: var(--shadow-lift);
+}
+.modal-head { display: flex; align-items: center; gap: 10px; padding: 12px 14px; border-bottom: 1px solid var(--border); }
+.modal-head strong { font-size: 14px; font-weight: 600; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.modal-facts { display: flex; flex-wrap: wrap; gap: 14px; padding: 9px 14px; font-size: 12.5px; color: var(--text-2); border-bottom: 1px solid var(--border); }
+.modal-facts b { color: var(--text-1); font-weight: 600; }
+.modal-facts .warn { color: var(--s-failed); }
+.modal-path {
+  padding: 7px 14px; font-size: 11.5px; color: var(--text-3); cursor: pointer;
+  border-bottom: 1px solid var(--border); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.modal-path:hover { color: var(--text-1); background: var(--surface-2); }
+.modal-foot { display: flex; align-items: center; gap: 8px; padding: 10px 14px; border-top: 1px solid var(--border); }
+.detail-feed { flex: 1; overflow-y: auto; padding: 8px 0; font-size: 12px; line-height: 1.55; }
+.detail-feed .ev { display: flex; gap: 10px; padding: 3px 14px; }
+.detail-feed .ev .at { color: var(--text-3); font-variant-numeric: tabular-nums; flex: none; font-size: 11px; padding-top: 1px; }
+.detail-feed .ev .tx { min-width: 0; white-space: pre-wrap; word-break: break-word; }
+.detail-feed .tool .tx { font-family: var(--mono); color: var(--text-1); }
+.detail-feed .res .tx { font-family: var(--mono); color: var(--text-3); }
+.detail-feed .say .tx { color: var(--text-1); }
+.detail-feed .dimline .tx { color: var(--text-3); }
+.detail-feed .mark .tx { color: var(--accent); }
+.detail-feed .fail .tx { color: var(--s-failed); }
+.board-foot { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 4px 2px 2px; font-size: 12px; color: var(--text-3); }
+
 .toasts { position: fixed; bottom: 16px; right: 16px; z-index: 100; display: grid; gap: 8px; max-width: min(380px, calc(100vw - 32px)); }
 .toast {
   padding: 10px 13px; border-radius: var(--radius-sm); font-size: 13px;
@@ -447,6 +480,8 @@ main { padding: 20px max(16px, env(safe-area-inset-left)) 64px max(16px, env(saf
   <section class="view" id="view-timeline" role="tabpanel" hidden></section>
 </main>
 
+<div class="detail-host" id="detail"></div>
+
 <div class="toasts" id="toasts" aria-live="polite"></div>
 
 <script>
@@ -485,7 +520,13 @@ const app = {
   conn: 'down',           // live | poll | down
   selected: null,         // task id for the diff view
   diff: { id: null, loading: false, data: null, error: null },
-  collapsed: new Set(),   // collapsed diff files
+  // Diff files the captain has OPENED. Everything starts closed: the question a
+  // diff answers first is "which files did this touch", and 1200 lines of Java
+  // in front of that answer is not a detail, it is the answer buried.
+  expanded: new Set(),
+  showDismissed: false,   // fleet: draw the tasks taken off the board
+  // The live detail window over one task. `id` is what is open, null is closed.
+  detail: { id: null, data: null, loading: false, error: null },
   steering: new Set(),    // task ids with the steer box open
   drafts: new Map(),      // free-text answers / steer messages
   busy: new Set(),        // in-flight ids (decision or task)
@@ -572,6 +613,19 @@ function projectName(id) {
   return p ? p.name : (id ? String(id).slice(0, 8) : 'unknown project');
 }
 function activeCrewCount() { return app.tasks.filter((t) => ACTIVE.has(t.state)).length; }
+
+/**
+ * What the board draws — everything, minus what the captain has cleared away.
+ *
+ * Deliberately NOT used by anything that counts: tokens, active crew and the
+ * header stats read `app.tasks`. Dismissing is about the eye, never about the
+ * record, and the moment a total starts moving when a card is hidden the two
+ * have been confused.
+ */
+function boardTasks() {
+  return app.showDismissed ? app.tasks : app.tasks.filter((t) => !t.dismissedAt);
+}
+function dismissedCount() { return app.tasks.filter((t) => t.dismissedAt).length; }
 
 /** Newest crew signal per task — what the Crew is doing right now, in one line. */
 function lastActivity() {
@@ -750,12 +804,25 @@ function renderHeader() {
   const badge = el('tab-dec');
   badge.textContent = String(open);
   badge.classList.toggle('hot', open > 0);
-  el('tab-fleet').textContent = String(app.tasks.length);
+  // The badge counts what the board draws. A cleared task is still in every
+  // total above; it is not in the list this number describes.
+  el('tab-fleet').textContent = String(boardTasks().length);
   document.title = (open > 0 ? '(' + open + ') ' : '') + 'Starmap — BlueSpace';
 }
 
+let renderedView = null;
 function render() {
   renderHeader();
+  // A live pane repaints every few seconds. Without this the captain reading
+  // line 400 of a diff is thrown back to the top by an event they did not cause.
+  const sameView = renderedView === app.view;
+  const pageY = window.scrollY;
+  const paneNode = document.querySelector('.diff-pane');
+  const paneY = paneNode ? paneNode.scrollTop : 0;
+  const feedNode = document.querySelector('.detail-feed');
+  const feedY = feedNode ? feedNode.scrollTop : 0;
+  const feedBottom = feedNode ? feedNode.scrollHeight - feedNode.clientHeight - feedY < 40 : true;
+
   for (const v of ['inbox','fleet','diff','timeline']) {
     const node = el('view-' + v);
     const on = app.view === v;
@@ -769,6 +836,17 @@ function render() {
   for (const t of document.querySelectorAll('.tab')) {
     t.setAttribute('aria-selected', String(t.dataset.view === app.view));
   }
+  renderDetail();
+  if (sameView) {
+    window.scrollTo(0, pageY);
+    const pane = document.querySelector('.diff-pane');
+    if (pane && paneY) pane.scrollTop = paneY;
+    const feed = document.querySelector('.detail-feed');
+    // A feed the captain has left at the bottom follows the Crew; one they have
+    // scrolled up in stays where they put it.
+    if (feed) feed.scrollTop = feedBottom ? feed.scrollHeight : feedY;
+  }
+  renderedView = app.view;
   restoreDrafts();
 }
 
@@ -901,8 +979,9 @@ function renderFleet() {
     dependents.get(d).push(t);
   }
 
+  const shown = boardTasks();
   const groups = STATES.map((state) => {
-    const list = app.tasks.filter((t) => t.state === state)
+    const list = shown.filter((t) => t.state === state)
       .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
     if (!list.length) return '';
     const cards = list.map((t) => taskCard(t, map, dependents, activity)).join('');
@@ -914,7 +993,21 @@ function renderFleet() {
       <div class="grid">${cards}</div>
     </section>`;
   }).join('');
-  return `<div class="board">${groups}</div>`;
+
+  const hidden = dismissedCount();
+  // Never a bare count with no way back to what it counts: a task the captain
+  // cleared is still a task that ran, still in `blue ps`, and still holding a
+  // worktree. This line is the door back to it.
+  const cleared = hidden > 0 || app.showDismissed
+    ? `<div class="board-foot">
+        <button class="btn ghost sm" data-act="show-dismissed">${app.showDismissed
+          ? 'Hide cleared' : hidden + ' cleared — show'}</button>
+        <span class="dim">Clearing a card hides it here. Nothing is deleted: the task, its worktree and its branch stay exactly where they are, and <span class="mono">blue ps</span> still lists it.</span>
+      </div>` : '';
+
+  const board = groups || `<div class="empty"><div class="ring" aria-hidden="true"></div><h3>Board cleared</h3>
+    <p>Every task has been taken off the board. Nothing was deleted.</p></div>`;
+  return `<div class="board">${board}${cleared}</div>`;
 }
 
 function taskCard(t, map, dependents, activity) {
@@ -952,10 +1045,14 @@ function taskCard(t, map, dependents, activity) {
     </div>` : ''}
     ${act ? `<div class="activity" title="${attr(act.line)}">${esc(truncate(act.line, 110))}</div>` : ''}
     <div class="controls">
+      ${live ? `<button class="btn ghost sm" data-act="open-detail" data-id="${attr(t.id)}" title="Watch this Crew work, without attaching to its tmux session">Live</button>` : ''}
       <button class="btn ghost sm" data-act="open-diff" data-id="${attr(t.id)}">Diff</button>
       ${!TERMINAL.has(t.state) ? `
         <button class="btn ghost sm" data-act="steer-toggle" data-id="${attr(t.id)}">${app.steering.has(t.id) ? 'Close' : 'Steer'}</button>
         <button class="btn ghost sm danger" data-act="cancel" data-id="${attr(t.id)}" ${busy ? 'disabled' : ''}>${busy ? '…' : 'Cancel'}</button>` : ''}
+      ${TERMINAL.has(t.state) ? (t.dismissedAt
+        ? `<button class="btn ghost sm" data-act="restore" data-id="${attr(t.id)}" style="margin-left:auto">Restore</button>`
+        : `<button class="btn ghost sm" data-act="dismiss" data-id="${attr(t.id)}" style="margin-left:auto" title="Take it off the board. Nothing is deleted.">Clear</button>`) : ''}
     </div>
     ${app.steering.has(t.id) ? `<div class="steer">
       <textarea class="field" rows="2" data-draft="s:${attr(t.id)}" placeholder="Message to the Crew — course correction, extra context, a constraint…"></textarea>
@@ -971,7 +1068,7 @@ function renderDiff() {
     return `<div class="empty"><div class="ring" aria-hidden="true"></div><h3>Nothing to review</h3>
       <p>When a Crew changes code, its diff shows up here — no click-through to anywhere else.</p></div>`;
   }
-  const order = app.tasks.slice().sort((a, b) => {
+  const order = boardTasks().slice().sort((a, b) => {
     const rank = (t) => (t.worktree ? 0 : 1);
     return rank(a) - rank(b) || (b.updatedAt || 0) - (a.updatedAt || 0);
   });
@@ -1011,28 +1108,33 @@ function renderDiffBody(task, data) {
   const files = parseDiff(data.diff);
   const adds = files.reduce((n, f) => n + f.adds, 0);
   const dels = files.reduce((n, f) => n + f.dels, 0);
+  const keys = files.map((f) => task.id + '::' + f.path);
+  const openCount = keys.filter((k) => app.expanded.has(k)).length;
+  const allOpen = keys.length > 0 && openCount === keys.length;
+  const live = ACTIVE.has(task.state);
   const head = `<div class="diff-head">
     <strong>${esc(task.title)}</strong>
-    <span class="chip" style="${sc(task.state)}" data-state><span class="dot"></span>${esc(STATE_LABEL[task.state] || task.state)}</span>
+    <span class="chip ${live ? 'pulse' : ''}" style="${sc(task.state)}" data-state><span class="dot"></span>${esc(STATE_LABEL[task.state] || task.state)}</span>
     <span class="dim num">${files.length} file${files.length === 1 ? '' : 's'}</span>
     <span class="stat-add num">+${adds}</span><span class="stat-del num">−${dels}</span>
     ${data.base ? `<span class="path">vs ${esc(data.base)}</span>` : ''}
-    <button class="btn ghost sm" data-act="reload-diff" style="margin-left:auto">Reload</button>
+    ${live ? `<span class="dim" title="A working Crew rewrites its worktree constantly; this pane re-reads it on the same tick the board uses.">auto</span>` : ''}
+    <button class="btn ghost sm" data-act="toggle-all" style="margin-left:auto">${allOpen ? 'Collapse all' : 'Expand all'}</button>
+    <button class="btn ghost sm" data-act="reload-diff">Reload</button>
   </div>`;
 
   const body = files.map((f, i) => {
-    const key = task.id + '::' + f.path;
-    const heavy = f.lines > 1200;
-    const collapsed = app.collapsed.has(key) || (heavy && !app.collapsed.has('!' + key));
-    const bar = `<div class="file-bar" data-act="toggle-file" data-key="${attr(key)}" data-heavy="${heavy}">
+    const key = keys[i];
+    const open = app.expanded.has(key);
+    const bar = `<div class="file-bar" data-act="toggle-file" data-key="${attr(key)}">
       <span class="fp">${esc(f.path)}</span>
       ${f.tag ? `<span class="tag">${esc(f.tag)}</span>` : ''}
       <span class="stat-add num">+${f.adds}</span><span class="stat-del num">−${f.dels}</span>
-      <span class="caret">${collapsed ? '▸ show' : '▾ hide'}</span>
+      <span class="caret">${open ? '▾ hide' : '▸ show'}</span>
     </div>`;
-    const lines = collapsed
-      ? `<div class="collapsed-note">${f.lines} lines hidden${heavy ? ' (large file)' : ''} — click the header to expand.</div>`
-      : `<div class="lines">${f.hunks.map(hunkHtml).join('')}</div>`;
+    const lines = open
+      ? `<div class="lines">${f.hunks.map(hunkHtml).join('')}</div>`
+      : `<div class="collapsed-note">${f.lines} line${f.lines === 1 ? '' : 's'} — click to expand.</div>`;
     return `<section class="file" data-i="${i}">${bar}${lines}</section>`;
   }).join('');
 
@@ -1096,18 +1198,57 @@ function gitPath(header) {
   return p;
 }
 
-async function loadDiff(id) {
-  app.diff = { id, loading: true, data: null, error: null };
-  paint();
+/**
+ * Read a task's worktree.
+ *
+ * `quiet` is what makes the auto-refresh bearable: it leaves the current diff on
+ * screen while the next one is fetched, so a working Crew's pane updates in
+ * place instead of blinking through "Reading the worktree…" every few seconds.
+ * A failure in quiet mode is swallowed for the same reason — the diff on screen
+ * is a second old, and replacing it with an error because one poll lost a race
+ * is worse than showing it.
+ */
+async function loadDiff(id, quiet) {
+  if (!quiet) { app.diff = { id, loading: true, data: null, error: null }; paint(); }
   try {
     const data = await api('/api/diff/' + encodeURIComponent(id));
-    if (app.diff.id !== id) return;
+    if (app.diff.id !== id && !quiet) return;
+    if (quiet && app.selected !== id) return;
     app.diff = { id, loading: false, data, error: null };
   } catch (err) {
+    if (quiet) return;
     if (app.diff.id !== id) return;
     app.diff = { id, loading: false, data: null, error: err.message };
   }
   paint();
+}
+
+/**
+ * The diff of a LIVE task is a moving target, so it moves.
+ *
+ * Only for a task that is actually running: a landed or failed worktree does not
+ * change, and re-reading it on a timer would be a git process every few seconds
+ * for an answer that cannot have changed.
+ */
+setInterval(() => {
+  if (document.hidden || app.view !== 'diff' || !app.selected) return;
+  const task = app.tasks.find((t) => t.id === app.selected);
+  if (!task || !ACTIVE.has(task.state)) return;
+  if (app.diff.id !== task.id || app.diff.loading) return;
+  loadDiff(task.id, true);
+}, 4000);
+
+/** Take a finished task off the board, or put it back. */
+async function dismiss(id, off) {
+  try {
+    await api('/api/task/' + encodeURIComponent(id) + '/dismiss', {
+      method: 'POST', body: JSON.stringify({ dismissed: off }),
+    });
+    await loadState();
+    paint();
+  } catch (err) {
+    toast(err.message, 'err');
+  }
 }
 
 /* ---- 4. timeline ---------------------------------------------------------- */
@@ -1293,21 +1434,158 @@ document.addEventListener('click', (ev) => {
   if (act === 'cancel') { cancelTask(id); return; }
   if (act === 'steer-toggle') { app.steering.has(id) ? app.steering.delete(id) : app.steering.add(id); paint(); return; }
   if (act === 'steer-send') { steer(id); return; }
-  if (act === 'open-diff') { app.selected = id; setView('diff'); return; }
+  if (act === 'open-diff') { app.detail.id = null; app.selected = id; setView('diff'); return; }
   if (act === 'select-task') { app.selected = id; history.replaceState(null, '', '#diff/' + id); paint(); return; }
   if (act === 'reload-diff') { if (app.selected) loadDiff(app.selected); return; }
+  if (act === 'toggle-all') { toggleAllFiles(); return; }
+  if (act === 'copy') { copyText(node.dataset.copy); return; }
+  if (act === 'dismiss') { dismiss(id, true); return; }
+  if (act === 'restore') { dismiss(id, false); return; }
+  if (act === 'show-dismissed') { app.showDismissed = !app.showDismissed; paint(); return; }
+  if (act === 'open-detail') { openDetail(id); return; }
+  if (act === 'close-detail') {
+    // The backdrop carries the action, and the window sits inside it — so a
+    // click on the window itself must not read as a click on the backdrop.
+    if (node.classList.contains('modal-back') && ev.target !== node) return;
+    closeDetail();
+    return;
+  }
   if (act === 'toggle-file') {
-    const heavy = node.dataset.heavy === 'true';
-    // Heavy files start collapsed, so their "expanded" marker is the negated key.
-    if (heavy) {
-      if (app.collapsed.has('!' + key)) { app.collapsed.delete('!' + key); }
-      else { app.collapsed.delete(key); app.collapsed.add('!' + key); }
-    } else {
-      app.collapsed.has(key) ? app.collapsed.delete(key) : app.collapsed.add(key);
-    }
+    app.expanded.has(key) ? app.expanded.delete(key) : app.expanded.add(key);
     paint();
   }
 });
+
+/* ---- the live detail window ----------------------------------------------
+ *
+ * "What is this Crew actually doing?" used to be answerable in two ways, both
+ * bad: read one truncated line on a card, or attach to the Crew's tmux session
+ * and risk typing into a live worker's composer. This is the third — the same
+ * event stream the board folds, for one task, read-only, updating on its own
+ * timer while it is open and costing nothing when it is closed.
+ */
+function openDetail(id) {
+  app.detail = { id, data: null, loading: true, error: null };
+  paint();
+  refreshDetail();
+}
+
+function closeDetail() {
+  app.detail = { id: null, data: null, loading: false, error: null };
+  paint();
+}
+
+async function refreshDetail() {
+  const id = app.detail.id;
+  if (!id) return;
+  try {
+    const data = await api('/api/task/' + encodeURIComponent(id));
+    if (app.detail.id !== id) return;
+    app.detail = { id, data, loading: false, error: null };
+  } catch (err) {
+    if (app.detail.id !== id) return;
+    // Keep whatever is on screen; a lost poll is not a reason to blank the
+    // window a captain is reading.
+    app.detail = { id, data: app.detail.data, loading: false, error: err.message };
+  }
+  paint();
+}
+
+/* Faster than the board, because this is the pane you open BECAUSE you want to
+   watch. Stops dead when nothing is open — the guard is the first line. */
+setInterval(() => { if (app.detail.id && !document.hidden) refreshDetail(); }, 2000);
+
+/** One line per crew signal, oldest first — the same events the cards sample. */
+function detailFeed(events) {
+  const rows = [];
+  for (const e of events) {
+    let cls = 'ev', line = null;
+    if (e.type === 'crew.tool_use') { cls = 'ev tool'; line = e.name + (e.inputPreview ? ' · ' + e.inputPreview : ''); }
+    else if (e.type === 'crew.tool_result') { cls = 'ev res'; line = truncate(e.resultPreview || '(no output)', 400); }
+    else if (e.type === 'crew.text') { cls = 'ev say'; line = e.text; }
+    else if (e.type === 'crew.thinking') { cls = 'ev dimline'; line = 'thinking…'; }
+    else if (e.type === 'crew.usage') { cls = 'ev dimline'; line = tokens(usageOf(e)) + ' tokens · ' + (e.model || ''); }
+    else if (e.type === 'crew.spawned') { cls = 'ev mark'; line = 'crew spawned'; }
+    else if (e.type === 'crew.exited') { cls = 'ev mark'; line = 'crew exited' + (e.reason ? ' · ' + e.reason : ''); }
+    else if (e.type === 'sentinel.started') { cls = 'ev mark'; line = 'sentinel reviewing the diff'; }
+    else if (e.type === 'sentinel.verdict') { cls = 'ev mark'; line = (e.pass ? 'verdict: pass — ' : 'verdict: fail — ') + e.reasoning; }
+    else if (e.type === 'task.state_changed') { cls = 'ev mark'; line = (STATE_LABEL[e.from] || e.from) + ' → ' + (STATE_LABEL[e.to] || e.to) + (e.reason ? ' · ' + e.reason : ''); }
+    else if (e.type === 'task.failed') { cls = 'ev fail'; line = e.reason || 'failed'; }
+    if (!line) continue;
+    rows.push(`<div class="${cls}"><span class="at">${esc(clock(e.at))}</span><span class="tx">${esc(line)}</span></div>`);
+  }
+  return rows;
+}
+
+function usageOf(e) {
+  return (e.inputTokens || 0) + (e.outputTokens || 0) + (e.cacheReadTokens || 0) + (e.cacheCreationTokens || 0);
+}
+
+function renderDetail() {
+  const host = el('detail');
+  if (!host) return;
+  if (!app.detail.id) { if (host.innerHTML) host.innerHTML = ''; return; }
+
+  const d = app.detail.data;
+  const t = (d && d.task) || app.tasks.find((x) => x.id === app.detail.id);
+  if (!t) {
+    host.innerHTML = `<div class="modal-back" data-act="close-detail"><div class="modal card">
+      <div class="modal-head"><strong>Loading…</strong>
+      <button class="btn ghost sm" data-act="close-detail" style="margin-left:auto">Close</button></div></div></div>`;
+    return;
+  }
+
+  const live = ACTIVE.has(t.state);
+  const feed = d ? detailFeed(d.events || []) : [];
+  const elapsed = TERMINAL.has(t.state)
+    ? 'ran ' + dur((t.updatedAt || t.createdAt) - t.createdAt)
+    : dur(app.now - (t.createdAt || app.now));
+  // The command is offered, never run for them: attaching puts a keyboard on a
+  // live Crew's composer, and that is the captain's decision to make.
+  const attach = t.crewId ? 'tmux -L bluespace attach -t blue:=blue-' + String(t.crewId).slice(0, 8) : null;
+
+  host.innerHTML = `<div class="modal-back" data-act="close-detail">
+    <div class="modal card" role="dialog" aria-modal="true">
+      <div class="modal-head">
+        <span class="chip ${live ? 'pulse' : ''}" style="${sc(t.state)}"><span class="dot"></span>${esc(STATE_LABEL[t.state] || t.state)}</span>
+        <strong>${esc(t.title)}</strong>
+        <span class="dim">${esc(projectName(t.projectId))}</span>
+        <button class="btn ghost sm" data-act="close-detail" style="margin-left:auto">Close</button>
+      </div>
+      <div class="modal-facts">
+        <span>tokens <b>${tokens(taskTokens(t.id))}</b></span>
+        <span>${esc(elapsed)}</span>
+        ${t.reworkCount > 0 ? `<span>rework <b>${t.reworkCount}</b></span>` : ''}
+        <span>${feed.length} event${feed.length === 1 ? '' : 's'}</span>
+        ${app.detail.error ? `<span class="warn" title="${attr(app.detail.error)}">poll failed — showing the last good read</span>` : ''}
+      </div>
+      ${t.worktree ? `<div class="modal-path mono" data-act="copy" data-copy="${attr(t.worktree)}" title="Click to copy">${esc(t.worktree)}</div>` : ''}
+      ${attach ? `<div class="modal-path mono" data-act="copy" data-copy="${attr(attach)}" title="Click to copy — attaching gives you a keyboard on a live Crew">${esc(attach)}</div>` : ''}
+      <div class="detail-feed">${feed.length ? feed.join('') : '<div class="collapsed-note">No crew signals yet.</div>'}</div>
+      <div class="modal-foot">
+        <button class="btn ghost sm" data-act="open-diff" data-id="${attr(t.id)}">Diff</button>
+        ${!TERMINAL.has(t.state) ? `<button class="btn ghost sm danger" data-act="cancel" data-id="${attr(t.id)}">Cancel</button>` : ''}
+        <span class="dim" style="margin-left:auto">Read-only. Esc closes.</span>
+      </div>
+    </div>
+  </div>`;
+}
+
+function copyText(text) {
+  if (!text) return;
+  const done = () => toast('Copied');
+  if (navigator.clipboard) navigator.clipboard.writeText(text).then(done, () => toast('Could not copy', 'err'));
+}
+
+/** Every file of the selected diff, open or closed together. */
+function toggleAllFiles() {
+  const task = app.tasks.find((t) => t.id === app.selected);
+  if (!task || !app.diff.data || !app.diff.data.diff) return;
+  const keys = parseDiff(app.diff.data.diff).map((f) => task.id + '::' + f.path);
+  const allOpen = keys.length > 0 && keys.every((k) => app.expanded.has(k));
+  for (const k of keys) allOpen ? app.expanded.delete(k) : app.expanded.add(k);
+  paint();
+}
 
 document.addEventListener('input', (ev) => {
   const node = ev.target.closest('[data-draft]');
@@ -1326,6 +1604,7 @@ document.addEventListener('keydown', (ev) => {
     }
     return;
   }
+  if (ev.key === 'Escape' && app.detail.id) { closeDetail(); return; }
   const map = { '1': 'inbox', '2': 'fleet', '3': 'diff', '4': 'timeline' };
   if (map[ev.key]) setView(map[ev.key]);
 });

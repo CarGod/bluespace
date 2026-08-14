@@ -42,6 +42,7 @@ import { dataDir, ProjectRegistry } from '../config/index.js';
 import { readHelmWindows } from '../helm/index.js';
 import { helmWindowsInView } from '../cli/ps.js';
 import type { Orchestrator } from '../orchestrator/index.js';
+import { isTerminal } from '../types/domain.js';
 import type { Decision, Project, Task, TaskId } from '../types/domain.js';
 import type { BlueEvent } from '../types/events.js';
 
@@ -380,6 +381,36 @@ export async function startServer(opts: StarmapOptions): Promise<StarmapHandle> 
         }
         mirror.refresh();
         sendJson(res, 200, { ok: true, task: lookupTask(b) ?? null });
+        return;
+      }
+
+      /**
+       * Take a finished task off the board, or put it back.
+       *
+       * Refused while the task is still alive, and that refusal is the point:
+       * "get it out of my sight" and "stop it" are different asks with different
+       * buttons, and a dismissal that silently hid a running Crew would hide the
+       * one row the captain most needs to see. Cancel first, then dismiss.
+       */
+      if (method === 'POST' && segs.length === 4 && c === 'dismiss') {
+        const body = await readJsonBody(req, res);
+        if (!body.ok) return;
+        const task = lookupTask(b);
+        if (!task) {
+          sendJson(res, 404, { error: 'no such task' });
+          return;
+        }
+        const raw = (body.value as Record<string, unknown>)['dismissed'];
+        const dismissed = raw === undefined ? true : raw === true;
+        if (dismissed && !isTerminal(task.state)) {
+          sendJson(res, 409, {
+            error: `${task.state} is not finished — cancel it before taking it off the board`,
+          });
+          return;
+        }
+        blackbox.append({ type: 'task.dismissed', taskId: task.id, dismissed });
+        mirror.refresh();
+        sendJson(res, 200, { ok: true, task: lookupTask(task.id) ?? null });
         return;
       }
 
