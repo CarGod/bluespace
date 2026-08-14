@@ -443,6 +443,7 @@ button.chip { font: inherit; font-size: 11.5px; font-weight: 560; appearance: no
   padding: 9px 12px; border: 1px dashed var(--border); border-radius: var(--radius-sm);
   color: var(--text-3); font-size: 12px;
 }
+.held-note { font-size: 11.5px; }
 .board-foot { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 4px 2px 2px; font-size: 12px; color: var(--text-3); }
 
 .cfg { display: grid; gap: 0; padding: 0; max-width: 720px; }
@@ -582,6 +583,9 @@ const app = {
   // `state`: it is a snapshot of files another process is writing, so it has
   // its own endpoint, its own slow timer, and its own "as of" label. See
   // /api/helm in src/server/index.ts.
+  // Task ids whose live Crew THIS server holds. A `blue map` without
+  // `--orchestrate` holds none — see /api/state in src/server/index.ts.
+  held: new Set(),
   helm: { windows: [], observedAt: 0 },
   lang: 'en',            // replaced by detectLang() before the first paint
   cfg: { data: null, loading: false, error: null, saving: false, saved: 0 },
@@ -764,6 +768,10 @@ const ZH = {
   'Helm’s own window': 'Helm 自己的窗口',
   'Read from the transcript on disk, not watched live — work that started in the last few seconds may not be here yet. These are Helm’s own sub-agents, not the fleet’s: no worktree, no Sentinel, no ceiling, and nothing above.':
     '这是从磁盘上的会话记录读出来的，不是实时监看——最近几秒才开始的工作可能还没出现。它们是 Helm 自己的子 agent，不是舰队的：没有 worktree，没有 Sentinel，没有上限，上面那些栏目里也不会有它们。',
+
+  'another process holds this Crew': '这个 Crew 属于另一个进程',
+  'A live Crew belongs to the process that spawned it. This Starmap is view-only — run it with --orchestrate, or steer from the Helm window.':
+    '活着的 Crew 归派遣它的那个进程所有。这个 Starmap 是只读的——用 --orchestrate 启动它，或者回 Helm 窗口里干预。',
 
   // settings
   'Settings': '设置',
@@ -968,6 +976,7 @@ async function api(path, opts) {
 async function loadState() {
   const s = await api('/api/state');
   app.tasks = s.tasks || [];
+  app.held = new Set(s.held || []);
   app.decisions = s.decisions || [];
   app.allDecisions = s.allDecisions || app.decisions;
   app.projects = s.projects || [];
@@ -1388,9 +1397,14 @@ function taskCard(t, map, dependents, activity) {
     <div class="controls">
       ${live ? `<button class="btn ghost sm" data-act="open-detail" data-id="${attr(t.id)}" title="${attr(tr('Watch this Crew work, without attaching to its tmux session'))}">${esc(tr('Live'))}</button>` : ''}
       <button class="btn ghost sm" data-act="open-diff" data-id="${attr(t.id)}">${esc(tr('Diff'))}</button>
-      ${!TERMINAL.has(t.state) ? `
+      ${!TERMINAL.has(t.state) ? (app.held.has(t.id) ? `
         <button class="btn ghost sm" data-act="steer-toggle" data-id="${attr(t.id)}">${esc(app.steering.has(t.id) ? tr('Close') : tr('Steer'))}</button>
-        <button class="btn ghost sm danger" data-act="cancel" data-id="${attr(t.id)}" ${busy ? 'disabled' : ''}>${busy ? '…' : esc(tr('Cancel'))}</button>` : ''}
+        <button class="btn ghost sm danger" data-act="cancel" data-id="${attr(t.id)}" ${busy ? 'disabled' : ''}>${busy ? '…' : esc(tr('Cancel'))}</button>`
+        // A live session is a handle in the memory of the process that spawned
+        // it. This map did not, so the buttons would fail on click — and a
+        // disabled button that says why beats a message typed into a box that
+        // was never going to deliver it.
+        : `<span class="dim held-note" title="${attr(tr('A live Crew belongs to the process that spawned it. This Starmap is view-only — run it with --orchestrate, or steer from the Helm window.'))}">${esc(tr('another process holds this Crew'))}</span>`) : ''}
       ${TERMINAL.has(t.state) ? (t.dismissedAt
         ? `<button class="btn ghost sm" data-act="restore" data-id="${attr(t.id)}" style="margin-left:auto">${esc(tr('Restore'))}</button>`
         : `<button class="btn ghost sm" data-act="dismiss" data-id="${attr(t.id)}" style="margin-left:auto" title="${attr(tr('Take it off the board. Nothing is deleted.'))}">${esc(tr('Clear'))}</button>`) : ''}

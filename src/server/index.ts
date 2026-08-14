@@ -548,6 +548,19 @@ export async function startServer(opts: StarmapOptions): Promise<StarmapHandle> 
           sendJson(res, 404, { error: 'no such task' });
           return;
         }
+        // A live session is a handle in ONE process's memory. This server has
+        // it only if this server dispatched the task, which a `blue map` without
+        // `--orchestrate` never does — so say where the Crew actually is rather
+        // than reporting the orchestrator's internal "no live crew".
+        if (safely(() => orch.holdsCrew(b)) !== true) {
+          sendJson(res, 409, {
+            error:
+              'this Starmap does not hold that Crew — a live session belongs to the process that ' +
+              'spawned it. Steer it from the Helm window that dispatched it, or run this map with ' +
+              '`blue map --orchestrate` so it owns the fleet itself.',
+          });
+          return;
+        }
         try {
           await orch.steer(b, message);
         } catch (err) {
@@ -602,6 +615,16 @@ export async function startServer(opts: StarmapOptions): Promise<StarmapHandle> 
     cost: ReturnType<typeof projectCost>;
     usage: ReturnType<typeof projectUsage>;
     projects: Project[];
+    /**
+     * Task ids whose live Crew THIS process is holding.
+     *
+     * A live session cannot be projected from the log — it is a handle in the
+     * memory of whichever process spawned it. A `blue map` without
+     * `--orchestrate` never spawned anything, so this is empty and every Steer
+     * and Cancel button on the page would fail. The page needs to know that
+     * before the captain types a message into one, not after.
+     */
+    held: TaskId[];
     seq: number;
     now: number;
   } {
@@ -612,6 +635,7 @@ export async function startServer(opts: StarmapOptions): Promise<StarmapHandle> 
     } catch {
       tasks = [];
     }
+    const held = tasks.filter((t) => safely(() => orch.holdsCrew(t.id)) === true).map((t) => t.id);
     let all: Decision[] = [];
     try {
       all = projectAllDecisions(events);
@@ -647,6 +671,7 @@ export async function startServer(opts: StarmapOptions): Promise<StarmapHandle> 
       cost,
       usage,
       projects: projects.list(events),
+      held,
       seq: mirror.latestSeq(),
       now: Date.now(),
     };
@@ -1136,6 +1161,15 @@ function intParam(value: string | undefined | null, fallback: number): number {
 
 function clamp(n: number, lo: number, hi: number): number {
   return n < lo ? lo : n > hi ? hi : n;
+}
+
+/** Run a read that must never take the dashboard down with it. */
+function safely<T>(fn: () => T): T | undefined {
+  try {
+    return fn();
+  } catch {
+    return undefined;
+  }
 }
 
 function messageOf(err: unknown): string {
