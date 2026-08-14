@@ -190,6 +190,11 @@ main { padding: 20px max(16px, env(safe-area-inset-left)) 64px max(16px, env(saf
 .chip .dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; flex: none; }
 .chip[data-state] { color: var(--sc); border-color: color-mix(in srgb, var(--sc) 32%, var(--border)); background: color-mix(in srgb, var(--sc) 9%, var(--surface)); }
 .chip.pulse .dot { animation: pulse 1.6s ease-in-out infinite; }
+/* A chip that is a button: the browser's own button styling has to come off
+   first, or it arrives with a grey background and the wrong font. */
+button.chip { font: inherit; font-size: 11.5px; font-weight: 560; appearance: none; }
+.chip.id { cursor: pointer; letter-spacing: .02em; font-family: var(--mono); }
+.chip.id:hover { border-color: color-mix(in srgb, var(--sc, var(--accent)) 55%, var(--border)); }
 @keyframes pulse { 0%,100% { opacity: 1; transform: scale(1); } 50% { opacity: .35; transform: scale(.8); } }
 @media (prefers-reduced-motion: reduce) { .chip.pulse .dot { animation: none; } }
 
@@ -834,6 +839,8 @@ const el = (id) => document.getElementById(id);
 const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
 const attr = (s) => esc(s).replace(/\n/g, '&#10;');
 const sc = (state) => `--sc: var(${STATE_VAR[state] || '--s-queued'})`;
+/** The eight characters `blue ps` prints and every `blue <cmd> <id>` accepts. */
+const shortId = (id) => String(id == null ? '' : id).slice(0, 8);
 /** A state's name in the reader's language; the raw state if it has none. */
 const stateLabel = (state) => tr(STATE_LABEL[state] || state);
 
@@ -1348,9 +1355,17 @@ function taskCard(t, map, dependents, activity) {
   const rework = t.reworkCount > 0
     ? `<span title="${attr(tr('Sentinel sent this back {0}×', t.reworkCount))}">${esc(tr('rework'))} <b>${t.reworkCount}</b></span>` : '';
 
+  // THE CHIP CARRIES THE ID, NOT THE STATE. The card is already sitting in a
+  // column headed with its state, so the chip was saying it twice — while the
+  // one identifier every `blue` command takes was nowhere on the card. The
+  // colour and the pulsing dot still carry the state, which is what that chip
+  // was actually being read for at a glance.
   return `<article class="card task" style="${sc(t.state)}">
     <div class="row">
-      <span class="chip ${live ? 'pulse' : ''}" style="${sc(t.state)}" data-state><span class="dot"></span>${esc(stateLabel(t.state))}</span>
+      <button class="chip mono id ${live ? 'pulse' : ''}" style="${sc(t.state)}" data-state
+        data-act="copy" data-copy="${attr(t.id)}"
+        title="${attr(t.id + ' · ' + stateLabel(t.state) + ' — ' + tr('Click to copy'))}"
+      ><span class="dot"></span>${esc(shortId(t.id))}</button>
       ${t.kind === 'recon' ? '<span class="chip">recon</span>' : ''}
       <span class="dim" style="margin-left:auto;font-size:11.5px">${esc(projectName(t.projectId))}</span>
     </div>
@@ -1992,6 +2007,8 @@ function renderDetail() {
     <div class="modal card" role="dialog" aria-modal="true">
       <div class="modal-head">
         <span class="chip ${live ? 'pulse' : ''}" style="${sc(t.state)}"><span class="dot"></span>${esc(stateLabel(t.state))}</span>
+        <button class="chip mono id" data-act="copy" data-copy="${attr(t.id)}"
+          title="${attr(t.id + ' — ' + tr('Click to copy'))}">${esc(shortId(t.id))}</button>
         <strong>${esc(t.title)}</strong>
         <span class="dim">${esc(projectName(t.projectId))}</span>
         <button class="btn ghost sm" data-act="close-detail" style="margin-left:auto">${esc(tr('Close'))}</button>
@@ -2039,10 +2056,30 @@ function renderDetail() {
   }
 }
 
+/**
+ * Copy, with a fallback rather than a button that silently does nothing.
+ *
+ * `navigator.clipboard` needs a secure context. `127.0.0.1` is one, so the fast
+ * path is the normal path — but a captain who reached the map over a LAN address
+ * would otherwise click an id and get no clipboard and no explanation.
+ */
 function copyText(text) {
   if (!text) return;
   const done = () => toast(tr('Copied'));
-  if (navigator.clipboard) navigator.clipboard.writeText(text).then(done, () => toast(tr('Could not copy'), 'err'));
+  const fallback = () => {
+    const node = document.createElement('textarea');
+    node.value = text;
+    node.setAttribute('readonly', '');
+    node.style.cssText = 'position:fixed;top:-1000px;opacity:0';
+    document.body.appendChild(node);
+    node.select();
+    let ok = false;
+    try { ok = document.execCommand('copy'); } catch { ok = false; }
+    node.remove();
+    ok ? done() : toast(tr('Could not copy'), 'err');
+  };
+  if (navigator.clipboard) navigator.clipboard.writeText(text).then(done, fallback);
+  else fallback();
 }
 
 /** Every file of the selected diff, open or closed together. */
