@@ -32,6 +32,13 @@ function declared(name: string): string[] {
   return [...obj![1]!.matchAll(/(?:^|[{,])\s*([a-z_]+):/gm)].map((m) => m[1]!);
 }
 
+/** The string values a dictionary-shaped `const` declares. */
+function declaredValues(name: string): string[] {
+  const obj = new RegExp(`const ${name} = \\{([\\s\\S]*?)\\n\\};`).exec(page);
+  expect(obj, `${name} not found in web/index.html`).not.toBeNull();
+  return [...obj![1]!.matchAll(/:\s*'((?:[^'\\]|\\.)*)'/g)].map((m) => m[1]!);
+}
+
 describe('the Starmap page and the domain agree about states', () => {
   it('draws a column for every state the domain can produce', () => {
     expect([...declared('STATES')].sort()).toEqual([...TASK_STATES].sort());
@@ -48,6 +55,19 @@ describe('the Starmap page and the domain agree about states', () => {
 
   it('gives every state a colour', () => {
     expect(declared('STATE_VAR').sort()).toEqual([...TASK_STATES].sort());
+  });
+
+  it('translates every state name and every explanation', () => {
+    // The page falls back to English for a missing translation rather than
+    // rendering a blank — but a captain who picked 中文 and gets half a screen
+    // of English has been told the toggle works when it does not.
+    const zh = new Set([...page.matchAll(/^  '((?:[^'\\]|\\.)*)':/gm)].map((m) => m[1]!));
+    const needed = [
+      ...declaredValues('STATE_LABEL'),
+      ...declaredValues('STATE_HELP'),
+      ...[...page.matchAll(/tr\('((?:[^'\\]|\\.)*)'/g)].map((m) => m[1]!),
+    ];
+    expect(needed.filter((k) => !zh.has(k))).toEqual([]);
   });
 
   it('never drops a state group for being empty', () => {

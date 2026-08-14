@@ -440,6 +440,7 @@ main { padding: 20px max(16px, env(safe-area-inset-left)) 64px max(16px, env(saf
 }
 .board-foot { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 4px 2px 2px; font-size: 12px; color: var(--text-3); }
 
+.lang { font-size: 12px; padding: 3px 9px; line-height: 1.6; }
 .toasts { position: fixed; bottom: 16px; right: 16px; z-index: 100; display: grid; gap: 8px; max-width: min(380px, calc(100vw - 32px)); }
 .toast {
   padding: 10px 13px; border-radius: var(--radius-sm); font-size: 13px;
@@ -464,6 +465,7 @@ main { padding: 20px max(16px, env(safe-area-inset-left)) 64px max(16px, env(saf
   <div class="conn" id="conn" data-mode="down" title="Live connection status">
     <span class="dot"></span><span class="label" id="conn-label">connecting</span>
   </div>
+  <button class="btn ghost sm lang" id="lang" data-act="lang" title="Switch to Chinese">中</button>
   <div class="stats">
     <div class="stat" id="stat-spend"><span class="k" id="k-spend">Tokens</span><span class="v" id="v-spend">0</span></div>
     <div class="stat" id="stat-crew"><span class="k">Active crew</span><span class="v" id="v-crew">0</span></div>
@@ -500,6 +502,7 @@ main { padding: 20px max(16px, env(safe-area-inset-left)) 64px max(16px, env(saf
    =========================================================================== */
 
 const STATES = ['awaiting_decision','working','verifying','needs_rework','dispatched','queued','ready','landed','failed','cancelled'];
+/** English is the key everywhere; `t()` is what turns these into 中文. */
 const STATE_LABEL = {
   queued: 'Queued', dispatched: 'Dispatched', working: 'Working',
   awaiting_decision: 'Awaiting you', verifying: 'Verifying', needs_rework: 'Needs rework',
@@ -562,13 +565,238 @@ const app = {
   // its own endpoint, its own slow timer, and its own "as of" label. See
   // /api/helm in src/server/index.ts.
   helm: { windows: [], observedAt: 0 },
+  lang: 'en',            // replaced by detectLang() before the first paint
 };
+
+/* ---- language ------------------------------------------------------------
+ *
+ * The ENGLISH STRING IS THE KEY. A missing translation therefore renders in
+ * English rather than as a blank or a key name, which is the failure mode that
+ * matters on a dashboard somebody is reading at 2am — and it keeps the diff for
+ * adding a language to one object instead of every render function.
+ *
+ * What is NOT translated, ever: task titles, project names, ids, branch names,
+ * paths, commands, and anything a Crew or a tool said. That is DATA. It is
+ * reproduced exactly as it is stored, inside a sentence written in the reader's
+ * language — the same rule Helm follows in CLAUDE.md, and for the same reason: a
+ * Chinese title wrapped in translated English prose is worse than either
+ * language alone.
+ *
+ * The fleet's own vocabulary is used where it is the accurate word — 派遣, 在飞,
+ * 靠岸 — and the plain word everywhere else. A term that makes a state sound
+ * more finished than it is has cost clarity, which is the one thing this
+ * vocabulary is not allowed to do.
+ */
+const LANG_KEY = 'starmap.lang';
+const ZH = {
+  // chrome
+  'BlueSpace fleet control': 'BlueSpace 舰队控制台',
+  'Tokens': 'Token',
+  'Active crew': '在飞 Crew',
+  'Needs you': '等你决定',
+  'Inbox': '待决',
+  'Fleet': '舰队',
+  'Diff': '改动',
+  'Timeline': '时间线',
+  'Live connection status': '连接状态',
+  'connecting': '连接中',
+  'live': '实时',
+  'polling': '轮询中',
+  'offline': '离线',
+  'Streaming events live': '正在实时接收事件流',
+  'Event stream unavailable — polling every 3s': '事件流不可用——每 3 秒轮询一次',
+  'Not connected to the Starmap server': '未连接到 Starmap 服务',
+  'Switch to Chinese': '切换到英文',
+  'Loading…': '加载中…',
+  'none': '无',
+
+  // states
+  'Queued': '排队中',
+  'Dispatched': '已派遣',
+  'Working': '在飞',
+  'Awaiting you': '等你决定',
+  'Verifying': '核验中',
+  'Needs rework': '需返工',
+  'Ready': '待合并',
+  'Landed': '靠岸',
+  'Failed': '失败',
+  'Cancelled': '已取消',
+  'Created and waiting — for its dependencies to land, or for a free crew slot. Nothing has run yet.':
+    '已创建，在等——等依赖靠岸，或等一个空闲的 Crew 席位。还没有跑过任何东西。',
+  'Its worktree is cut and a Claude Code session is starting. No work done yet.':
+    'worktree 已经切好，Claude Code 会话正在启动。还没开始干活。',
+  'A Crew is running in its own worktree right now.':
+    '一个 Crew 正在它自己的 worktree 里跑。',
+  'Stopped on a question only you can answer. Nothing moves until you do — see the Inbox.':
+    '卡在一个只有你能回答的问题上。你不答，它就不动——去「待决」里看。',
+  'The Crew is finished; the Sentinel is reading the diff against the brief.':
+    'Crew 已收工，Sentinel 正在对着任务书读这份 diff。',
+  'The Sentinel sent it back. The same Crew gets another pass, up to maxRework.':
+    'Sentinel 把它打回来了。同一个 Crew 会再来一轮，上限是 maxRework。',
+  'Verified and waiting to be landed.': '已通过核验，等你合并。',
+  'Verification is over and the branch is merged into blue/dev. NOT pushed, and not in main — that is a pull request you open by hand.':
+    '核验结束，分支已并入 blue/dev。没有 push，也不在 main——那是你手动开的 pull request。',
+  'It ended without a deliverable: the Crew died, the Sentinel refused it, or a ceiling stopped it. The worktree is still there.':
+    '它结束了，但没有交付物：Crew 死了、Sentinel 否了、或者撞上了某个上限。worktree 还在原地。',
+  'You stopped it.': '你把它停掉了。',
+
+  // inbox
+  'Nothing needs you': '没有需要你的事',
+  'The fleet has nothing to ask you. A card lands here the moment a Crew needs a call.':
+    '舰队没有要问你的。任何一个 Crew 需要你拿主意，卡片就会立刻出现在这里。',
+  'No tasks yet. Talk to Helm and the fleet will show up here.':
+    '还没有任务。跟 Helm 说一声，舰队就会出现在这里。',
+  'Everything is parked. Nothing is burning tokens right now.':
+    '全部停泊。此刻没有任何东西在烧 token。',
+  '{0} crew working · {1} queued · {2} tokens': '{0} 个 Crew 在飞 · {1} 个排队 · {2} token',
+  'Decision inbox': '决策待办',
+  '{0} open · oldest first': '{0} 项待答 · 最早的在前',
+  'waiting {0}': '已等 {0}',
+  'Show more': '展开',
+  'Show less': '收起',
+  'Sending…': '发送中…',
+  'Send': '发送',
+  'Or answer in your own words…': '也可以用你自己的话回答…',
+  'Type your answer…': '输入你的回答…',
+  'Free-text answer': '自由文本回答',
+  'task {0}': '任务 {0}',
+
+  // fleet
+  'No tasks yet': '还没有任务',
+  'Helm creates tasks; the orchestrator dispatches them. Everything the fleet does will appear here.':
+    'Helm 创建任务，orchestrator 负责派遣。舰队做的每一件事都会出现在这里。',
+  'tokens': 'token',
+  'ran {0}': '运行 {0}',
+  'rework': '返工',
+  'Tokens this task consumed — what a Crew actually spends. Dollars only exist for a metered (API-key) run.':
+    '这个任务消耗的 token——Crew 真正花掉的东西。只有计费运行（设了 API key）才谈得上美元。',
+  'Total lifetime': '全程耗时',
+  'Since created': '自创建起',
+  'Sentinel sent this back {0}×': 'Sentinel 把它打回来了 {0} 次',
+  'blocks {0}': '挡住 {0} 个',
+  'Watch this Crew work, without attaching to its tmux session':
+    '看着这个 Crew 干活，不用 attach 到它的 tmux 会话',
+  'Live': '实况',
+  'Steer': '干预',
+  'Close': '关闭',
+  'Cancel': '取消',
+  'Clear': '清理',
+  'Restore': '恢复',
+  'Take it off the board. Nothing is deleted.': '把它从看板上拿走。什么都不会被删除。',
+  'Hide cleared': '隐藏已清理',
+  '{0} cleared — show': '已清理 {0} 项 — 显示',
+  'Clearing a card hides it here. Nothing is deleted: the task, its worktree and its branch stay exactly where they are, and {0} still lists it.':
+    '清理只是把卡片从这里藏起来。什么都没有被删除：任务、它的 worktree、它的分支都原封不动，{0} 里照样列着它。',
+  'Message to the Crew — course correction, extra context, a constraint…':
+    '发给 Crew 的话——纠偏、补充背景、追加一条约束…',
+  'Send to Crew': '发给 Crew',
+
+  // diff
+  'Nothing to review': '没有可审阅的改动',
+  'When a Crew changes code, its diff shows up here — no click-through to anywhere else.':
+    'Crew 一改代码，它的 diff 就出现在这里——不用再点到别处去。',
+  'Tasks': '任务',
+  'Select a task.': '选一个任务。',
+  'Reading the worktree…': '正在读取 worktree…',
+  'Could not read the diff': '读不到这份 diff',
+  'No diff': '没有 diff',
+  'nothing to show yet': '暂时没有可显示的内容',
+  'vs {0}': '对比 {0}',
+  'auto': '自动',
+  'A working Crew rewrites its worktree constantly; this pane re-reads it on the same tick the board uses.':
+    '在飞的 Crew 一直在改自己的 worktree；这个面板按看板同样的节奏重新读取。',
+  'Expand all': '全部展开',
+  'Collapse all': '全部折叠',
+  'Reload': '重新读取',
+  '{0} lines — click to expand.': '{0} 行——点击展开。',
+  'Diff produced no file sections.': '这份 diff 没有产生任何文件段。',
+  'Diff was truncated by the server — open the worktree for the rest.':
+    'diff 被服务端截断了——其余部分请到 worktree 里看。',
+
+  // the live window
+  'No crew signals yet.': '还没有 Crew 的信号。',
+  'Read-only. Esc closes.': '只读。Esc 关闭。',
+  'poll failed — showing the last good read': '轮询失败——显示的是上一次成功读到的内容',
+  'Click to copy': '点击复制',
+  'Click to copy — attaching gives you a keyboard on a live Crew':
+    '点击复制——attach 上去等于把键盘接到一个活着的 Crew 上',
+  'Copied': '已复制',
+  'Could not copy': '复制失败',
+  '(no output)': '（无输出）',
+  'thinking…': '思考中…',
+  'crew spawned': 'Crew 已启动',
+  'crew exited': 'Crew 已退出',
+  'sentinel reviewing the diff': 'Sentinel 正在审阅 diff',
+  'verdict: pass — ': '裁决：通过 — ',
+  'verdict: fail — ': '裁决：未通过 — ',
+  'already in {0}': '已经在 {0} 里',
+  'merged into {0}': '已并入 {0}',
+
+  // timeline
+  'No history yet': '还没有历史',
+  'Once tasks run, this shows where the fleet ran in parallel, where it serialized, and where it waited on you.':
+    '任务跑起来之后，这里会显示舰队在哪里并行、在哪里串行、在哪里等你。',
+  '{0} tasks · {1} span': '{0} 个任务 · 跨度 {1}',
+  'peak parallel crew': '并行峰值',
+  'waited on you': '等你的时间',
+  'first dispatch': '首次派遣',
+
+  // helm
+  'Helm’s own window': 'Helm 自己的窗口',
+  'Read from the transcript on disk, not watched live — work that started in the last few seconds may not be here yet. These are Helm’s own sub-agents, not the fleet’s: no worktree, no Sentinel, no ceiling, and nothing above.':
+    '这是从磁盘上的会话记录读出来的，不是实时监看——最近几秒才开始的工作可能还没出现。它们是 Helm 自己的子 agent，不是舰队的：没有 worktree，没有 Sentinel，没有上限，上面那些栏目里也不会有它们。',
+
+  // transport
+  'Cannot reach the Starmap server': '连不上 Starmap 服务',
+  'Retrying every 3 seconds.': '每 3 秒重试一次。',
+};
+
+function detectLang() {
+  try {
+    const saved = localStorage.getItem(LANG_KEY);
+    if (saved === 'zh' || saved === 'en') return saved;
+  } catch { /* private mode, or storage disabled */ }
+  const nav = (navigator.language || '') + ' ' + (navigator.languages || []).join(' ');
+  return /\bzh\b|zh-/i.test(nav) ? 'zh' : 'en';
+}
+
+/**
+ * Translate, then fill {0}, {1}… — the arguments are DATA and go in verbatim.
+ *
+ * Named `tr` rather than `t` because `t` is already the TASK in half the render
+ * functions, and that collision would have been silent: `t('tokens')` on a task
+ * object only throws when that branch is reached.
+ */
+function tr(str, ...args) {
+  let out = (app.lang === 'zh' && ZH[str]) || str;
+  for (let i = 0; i < args.length; i++) out = out.split('{' + i + '}').join(String(args[i]));
+  return out;
+}
+
+/** Counted nouns, where English needs an -s and Chinese needs a measure word. */
+function nOf(n, one, many, zh) {
+  return app.lang === 'zh' ? n + ' ' + zh : n + ' ' + (n === 1 ? one : many);
+}
+
+function setLang(lang) {
+  app.lang = lang;
+  try { localStorage.setItem(LANG_KEY, lang); } catch { /* nothing to do about it */ }
+  document.documentElement.lang = lang === 'zh' ? 'zh-CN' : 'en';
+  // The connection label is set imperatively and only on change, so it has to be
+  // pushed again by hand or it stays in the language it was last painted in.
+  const mode = app.conn;
+  app.conn = null;
+  setConn(mode);
+  paint();
+}
 
 const MAX_EVENTS = 40000;
 const el = (id) => document.getElementById(id);
 const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
 const attr = (s) => esc(s).replace(/\n/g, '&#10;');
 const sc = (state) => `--sc: var(${STATE_VAR[state] || '--s-queued'})`;
+/** A state's name in the reader's language; the raw state if it has none. */
+const stateLabel = (state) => tr(STATE_LABEL[state] || state);
 
 /* ---- formatting ---------------------------------------------------------- */
 function tokens(n) {
@@ -665,13 +893,13 @@ function lastActivity() {
     let line = null;
     if (e.type === 'crew.tool_use') line = e.name + (e.inputPreview ? ' · ' + truncate(e.inputPreview, 70) : '');
     else if (e.type === 'crew.text') line = truncate(e.text, 90);
-    else if (e.type === 'crew.thinking') line = 'thinking…';
-    else if (e.type === 'sentinel.started') line = 'sentinel reviewing the diff';
-    else if (e.type === 'sentinel.verdict') line = (e.pass ? 'verdict: pass — ' : 'verdict: fail — ') + truncate(e.reasoning, 70);
-    else if (e.type === 'crew.exited') line = 'crew exited' + (e.reason ? ' · ' + truncate(e.reason, 50) : '');
+    else if (e.type === 'crew.thinking') line = tr('thinking…');
+    else if (e.type === 'sentinel.started') line = tr('sentinel reviewing the diff');
+    else if (e.type === 'sentinel.verdict') line = (e.pass ? tr('verdict: pass — ') : tr('verdict: fail — ')) + truncate(e.reasoning, 70);
+    else if (e.type === 'crew.exited') line = tr('crew exited') + (e.reason ? ' · ' + truncate(e.reason, 50) : '');
     // The only event here that records a write to a real repository. Named with
     // its target, because which branch it went to is the whole point of it.
-    else if (e.type === 'task.merged') line = e.alreadyMerged ? 'already in ' + e.into : 'merged into ' + e.into;
+    else if (e.type === 'task.merged') line = e.alreadyMerged ? tr('already in {0}', e.into) : tr('merged into {0}', e.into);
     if (line) out.set(taskId, { line, at: e.at });
   }
   return out;
@@ -751,10 +979,10 @@ function setConn(mode) {
   app.conn = mode;
   const node = el('conn');
   node.dataset.mode = mode;
-  el('conn-label').textContent = mode === 'live' ? 'live' : mode === 'poll' ? 'polling' : 'offline';
-  node.title = mode === 'live' ? 'Streaming events live'
-    : mode === 'poll' ? 'Event stream unavailable — polling every 3s'
-    : 'Not connected to the Starmap server';
+  el('conn-label').textContent = mode === 'live' ? tr('live') : mode === 'poll' ? tr('polling') : tr('offline');
+  node.title = mode === 'live' ? tr('Streaming events live')
+    : mode === 'poll' ? tr('Event stream unavailable — polling every 3s')
+    : tr('Not connected to the Starmap server');
 }
 
 function connect() {
@@ -818,7 +1046,32 @@ function paint() {
 }
 
 /* ---- header + chrome ------------------------------------------------------ */
+/** The parts of the page that are markup rather than a render function. */
+function renderChrome() {
+  const set = (sel, text) => { const n = document.querySelector(sel); if (n) n.textContent = text; };
+  set('.brand .sub', tr('BlueSpace fleet control'));
+  set('#k-spend', tr('Tokens'));
+  set('#stat-crew .k', tr('Active crew'));
+  set('#stat-dec .k', tr('Needs you'));
+  const conn = el('conn');
+  if (conn) conn.title = tr('Live connection status');
+  const lang = el('lang');
+  if (lang) {
+    // The button shows the language it switches TO, which is the only reading
+    // that is unambiguous at a glance in either language.
+    lang.textContent = app.lang === 'zh' ? 'EN' : '中';
+    lang.title = tr('Switch to Chinese');
+  }
+  const labels = { inbox: tr('Inbox'), fleet: tr('Fleet'), diff: tr('Diff'), timeline: tr('Timeline') };
+  for (const tab of document.querySelectorAll('.tab')) {
+    const badge = tab.querySelector('.badge, .num');
+    tab.textContent = labels[tab.dataset.view] || tab.dataset.view;
+    if (badge) { tab.append(' '); tab.appendChild(badge); }
+  }
+}
+
 function renderHeader() {
+  renderChrome();
   el('v-spend').textContent = tokens(app.usage.total);
   el('stat-spend').title = usdLabel();
   const crew = activeCrewCount();
@@ -913,29 +1166,27 @@ function renderHelm() {
     <div class="helm-win">
       <div class="helm-head">
         <span class="helm-cwd">${esc(w.cwd || '')}</span>
-        <span class="num">${esc(tokens(totalTokensOf(w.total)))} tokens</span>
+        <span class="num">${esc(tokens(totalTokensOf(w.total)))} ${esc(tr('tokens'))}</span>
       </div>
       ${((w.subagents || []).length) ? `<ul class="helm-agents">${helmAgentRows(w)}</ul>` : ''}
     </div>`).join('');
   return `<section class="helm">
-    <h4>Helm&rsquo;s own window <span class="hint">&middot; ${esc(tokens(all))} tokens${fanned ? ' &middot; ' + fanned + ' sub-agent' + (fanned === 1 ? '' : 's') : ''}</span></h4>
+    <h4>${esc(tr('Helm’s own window'))} <span class="hint">&middot; ${esc(tokens(all))} ${esc(tr('tokens'))}${fanned ? ' &middot; ' + esc(nOf(fanned, 'sub-agent', 'sub-agents', '个子 agent')) : ''}</span></h4>
     ${rows}
-    <p class="hint">Read from the transcript on disk, not watched live &mdash; work that started in the last few
-    seconds may not be here yet. These are Helm&rsquo;s own sub-agents, not the fleet&rsquo;s: no worktree,
-    no Sentinel, no ceiling, and nothing above.</p>
+    <p class="hint">${esc(tr('Read from the transcript on disk, not watched live — work that started in the last few seconds may not be here yet. These are Helm’s own sub-agents, not the fleet’s: no worktree, no Sentinel, no ceiling, and nothing above.'))}</p>
   </section>`;
 }
 
 /* ---- 1. inbox ------------------------------------------------------------- */
 function renderInbox() {
   const open = app.decisions.slice().sort((a, b) => (a.openedAt || 0) - (b.openedAt || 0));
-  if (!app.loaded) return '<div class="skeleton">Loading…</div>';
+  if (!app.loaded) return `<div class="skeleton">${esc(tr('Loading…'))}</div>`;
   if (open.length === 0) {
     const crew = activeCrewCount();
     const queued = app.tasks.filter((t) => t.state === 'queued').length;
-    let line = 'The fleet has nothing to ask you. A card lands here the moment a Crew needs a call.';
-    if (crew === 0 && app.tasks.length === 0) line = 'No tasks yet. Talk to Helm and the fleet will show up here.';
-    else if (crew === 0 && queued === 0) line = 'Everything is parked. Nothing is burning tokens right now.';
+    let line = tr('The fleet has nothing to ask you. A card lands here the moment a Crew needs a call.');
+    if (crew === 0 && app.tasks.length === 0) line = tr('No tasks yet. Talk to Helm and the fleet will show up here.');
+    else if (crew === 0 && queued === 0) line = tr('Everything is parked. Nothing is burning tokens right now.');
     // THE SCREEN THE CAPTAIN WAS LOOKING AT. "Nothing needs you · 0 crew
     // working" was true about the fleet and false about the machine: two of
     // Helm's sub-agents were running at the time. The fleet counts stay exactly
@@ -944,9 +1195,9 @@ function renderInbox() {
     // made the original screen a lie.
     return `<div class="empty">
       <div class="ring" aria-hidden="true"></div>
-      <h3>Nothing needs you</h3>
+      <h3>${esc(tr('Nothing needs you'))}</h3>
       <p>${esc(line)}</p>
-      <p class="hint num">${crew} crew working · ${queued} queued · ${tokens(app.usage.total)} tokens</p>
+      <p class="hint num">${esc(tr('{0} crew working · {1} queued · {2} tokens', crew, queued, tokens(app.usage.total)))}</p>
     </div>` + renderHelm();
   }
 
@@ -965,32 +1216,32 @@ function renderInbox() {
     const expanded = app.expandedContext.has(d.id);
     return `<article class="card decision">
       <div class="meta">
-        ${t ? `<span class="chip" style="${sc(t.state)}" data-state><span class="dot"></span>${esc(STATE_LABEL[t.state] || t.state)}</span>` : ''}
-        <span class="muted">${esc(t ? t.title : 'task ' + String(d.taskId).slice(0, 8))}</span>
+        ${t ? `<span class="chip" style="${sc(t.state)}" data-state><span class="dot"></span>${esc(stateLabel(t.state))}</span>` : ''}
+        <span class="muted">${esc(t ? t.title : tr('task {0}', String(d.taskId).slice(0, 8)))}</span>
         <span class="dim">·</span>
         <span class="dim">${esc(t ? projectName(t.projectId) : '')}</span>
-        <span class="wait ${heat}" style="margin-left:auto">waiting ${dur(waited)}</span>
+        <span class="wait ${heat}" style="margin-left:auto">${esc(tr('waiting {0}', dur(waited)))}</span>
       </div>
       <h3 class="q">${esc(d.question)}</h3>
       ${d.context ? `<div class="context ${long && !expanded ? 'clamped' : ''}">${esc(d.context)}</div>
-        ${long ? `<button class="btn ghost sm" data-act="ctx" data-id="${attr(d.id)}" style="margin:-8px 0 12px">${expanded ? 'Show less' : 'Show more'}</button>` : ''}` : ''}
+        ${long ? `<button class="btn ghost sm" data-act="ctx" data-id="${attr(d.id)}" style="margin:-8px 0 12px">${esc(expanded ? tr('Show less') : tr('Show more'))}</button>` : ''}` : ''}
       ${opts ? `<div class="opts">${opts}</div>` : ''}
-      ${busy ? '<div class="answered">Sending…</div>' : `
+      ${busy ? `<div class="answered">${esc(tr('Sending…'))}</div>` : `
       <div class="freeform">
         <input class="field" type="text" data-draft="d:${attr(d.id)}" data-act-key="answer-free" data-id="${attr(d.id)}"
-               placeholder="${opts ? 'Or answer in your own words…' : 'Type your answer…'}" aria-label="Free-text answer">
-        <button class="btn primary" data-act="answer-free" data-id="${attr(d.id)}">Send</button>
+               placeholder="${attr(opts ? tr('Or answer in your own words…') : tr('Type your answer…'))}" aria-label="${attr(tr('Free-text answer'))}">
+        <button class="btn primary" data-act="answer-free" data-id="${attr(d.id)}">${esc(tr('Send'))}</button>
       </div>`}
     </article>`;
   }).join('');
 
-  return `<div class="section-head"><h2>Decision inbox</h2><span class="count">${open.length} open · oldest first</span></div>
+  return `<div class="section-head"><h2>${esc(tr('Decision inbox'))}</h2><span class="count">${esc(tr('{0} open · oldest first', open.length))}</span></div>
     <div class="inbox">${cards}</div>`;
 }
 
 /* ---- 2. fleet ------------------------------------------------------------- */
 function renderFleet() {
-  if (!app.loaded) return '<div class="skeleton">Loading…</div>';
+  if (!app.loaded) return `<div class="skeleton">${esc(tr('Loading…'))}</div>`;
   const map = taskById();
   const activity = lastActivity();
   const dependents = new Map();
@@ -1010,10 +1261,10 @@ function renderFleet() {
       .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
     const cards = list.length
       ? list.map((t) => taskCard(t, map, dependents, activity)).join('')
-      : `<div class="slot-empty">none</div>`;
+      : `<div class="slot-empty">${esc(tr('none'))}</div>`;
     return `<section class="group${list.length ? '' : ' quiet'}">
-      <div class="section-head" title="${attr(STATE_HELP[state] || '')}">
-        <h2 style="${sc(state)};color:var(--sc)">${esc(STATE_LABEL[state] || state)}</h2>
+      <div class="section-head" title="${attr(tr(STATE_HELP[state] || ''))}">
+        <h2 style="${sc(state)};color:var(--sc)">${esc(stateLabel(state))}</h2>
         <span class="count">${list.length}</span>
       </div>
       <div class="grid">${cards}</div>
@@ -1026,16 +1277,16 @@ function renderFleet() {
   // worktree. This line is the door back to it.
   const cleared = hidden > 0 || app.showDismissed
     ? `<div class="board-foot">
-        <button class="btn ghost sm" data-act="show-dismissed">${app.showDismissed
-          ? 'Hide cleared' : hidden + ' cleared — show'}</button>
-        <span class="dim">Clearing a card hides it here. Nothing is deleted: the task, its worktree and its branch stay exactly where they are, and <span class="mono">blue ps</span> still lists it.</span>
+        <button class="btn ghost sm" data-act="show-dismissed">${esc(app.showDismissed
+          ? tr('Hide cleared') : tr('{0} cleared — show', hidden))}</button>
+        <span class="dim">${tr('Clearing a card hides it here. Nothing is deleted: the task, its worktree and its branch stay exactly where they are, and {0} still lists it.', '<span class="mono">blue ps</span>')}</span>
       </div>` : '';
 
   // Kept above the board rather than instead of it: a captain looking at their
   // first empty fleet should see both what will appear here and where.
   const nothing = app.tasks.length === 0
-    ? `<div class="empty"><div class="ring" aria-hidden="true"></div><h3>No tasks yet</h3>
-        <p>Helm creates tasks; the orchestrator dispatches them. Everything the fleet does will appear here.</p></div>`
+    ? `<div class="empty"><div class="ring" aria-hidden="true"></div><h3>${esc(tr('No tasks yet'))}</h3>
+        <p>${esc(tr('Helm creates tasks; the orchestrator dispatches them. Everything the fleet does will appear here.'))}</p></div>`
     : '';
   return nothing + `<div class="board">${groups}${cleared}</div>` + (app.tasks.length === 0 ? renderHelm() : '');
 }
@@ -1052,51 +1303,51 @@ function taskCard(t, map, dependents, activity) {
   }).join('');
   const blocks = dependents.get(t.id) || [];
   const elapsed = TERMINAL.has(t.state)
-    ? 'ran ' + dur((t.updatedAt || t.createdAt) - t.createdAt)
+    ? tr('ran {0}', dur((t.updatedAt || t.createdAt) - t.createdAt))
     : dur(app.now - (t.createdAt || app.now));
   const rework = t.reworkCount > 0
-    ? `<span title="Sentinel sent this back ${t.reworkCount}×">rework <b>${t.reworkCount}</b></span>` : '';
+    ? `<span title="${attr(tr('Sentinel sent this back {0}×', t.reworkCount))}">${esc(tr('rework'))} <b>${t.reworkCount}</b></span>` : '';
 
   return `<article class="card task" style="${sc(t.state)}">
     <div class="row">
-      <span class="chip ${live ? 'pulse' : ''}" style="${sc(t.state)}" data-state><span class="dot"></span>${esc(STATE_LABEL[t.state] || t.state)}</span>
+      <span class="chip ${live ? 'pulse' : ''}" style="${sc(t.state)}" data-state><span class="dot"></span>${esc(stateLabel(t.state))}</span>
       ${t.kind === 'recon' ? '<span class="chip">recon</span>' : ''}
       <span class="dim" style="margin-left:auto;font-size:11.5px">${esc(projectName(t.projectId))}</span>
     </div>
     <div class="title">${esc(t.title)}</div>
     <div class="facts">
-      <span title="Tokens this task consumed — what a Crew actually spends. Dollars only exist for a metered (API-key) run.">tokens <b>${tokens(taskTokens(t.id))}</b></span>
-      <span title="${TERMINAL.has(t.state) ? 'Total lifetime' : 'Since created'}">${esc(elapsed)}</span>
+      <span title="${attr(tr('Tokens this task consumed — what a Crew actually spends. Dollars only exist for a metered (API-key) run.'))}">${esc(tr('tokens'))} <b>${tokens(taskTokens(t.id))}</b></span>
+      <span title="${attr(TERMINAL.has(t.state) ? tr('Total lifetime') : tr('Since created'))}">${esc(elapsed)}</span>
       ${rework}
     </div>
     ${deps || blocks.length ? `<div class="deps">
       ${deps}
-      ${blocks.length ? `<span class="dep" title="${attr(blocks.map((b) => b.title).join(', '))}">↓ blocks ${blocks.length}</span>` : ''}
+      ${blocks.length ? `<span class="dep" title="${attr(blocks.map((b) => b.title).join(', '))}">↓ ${esc(tr('blocks {0}', blocks.length))}</span>` : ''}
     </div>` : ''}
     ${act ? `<div class="activity" title="${attr(act.line)}">${esc(truncate(act.line, 110))}</div>` : ''}
     <div class="controls">
-      ${live ? `<button class="btn ghost sm" data-act="open-detail" data-id="${attr(t.id)}" title="Watch this Crew work, without attaching to its tmux session">Live</button>` : ''}
-      <button class="btn ghost sm" data-act="open-diff" data-id="${attr(t.id)}">Diff</button>
+      ${live ? `<button class="btn ghost sm" data-act="open-detail" data-id="${attr(t.id)}" title="${attr(tr('Watch this Crew work, without attaching to its tmux session'))}">${esc(tr('Live'))}</button>` : ''}
+      <button class="btn ghost sm" data-act="open-diff" data-id="${attr(t.id)}">${esc(tr('Diff'))}</button>
       ${!TERMINAL.has(t.state) ? `
-        <button class="btn ghost sm" data-act="steer-toggle" data-id="${attr(t.id)}">${app.steering.has(t.id) ? 'Close' : 'Steer'}</button>
-        <button class="btn ghost sm danger" data-act="cancel" data-id="${attr(t.id)}" ${busy ? 'disabled' : ''}>${busy ? '…' : 'Cancel'}</button>` : ''}
+        <button class="btn ghost sm" data-act="steer-toggle" data-id="${attr(t.id)}">${esc(app.steering.has(t.id) ? tr('Close') : tr('Steer'))}</button>
+        <button class="btn ghost sm danger" data-act="cancel" data-id="${attr(t.id)}" ${busy ? 'disabled' : ''}>${busy ? '…' : esc(tr('Cancel'))}</button>` : ''}
       ${TERMINAL.has(t.state) ? (t.dismissedAt
-        ? `<button class="btn ghost sm" data-act="restore" data-id="${attr(t.id)}" style="margin-left:auto">Restore</button>`
-        : `<button class="btn ghost sm" data-act="dismiss" data-id="${attr(t.id)}" style="margin-left:auto" title="Take it off the board. Nothing is deleted.">Clear</button>`) : ''}
+        ? `<button class="btn ghost sm" data-act="restore" data-id="${attr(t.id)}" style="margin-left:auto">${esc(tr('Restore'))}</button>`
+        : `<button class="btn ghost sm" data-act="dismiss" data-id="${attr(t.id)}" style="margin-left:auto" title="${attr(tr('Take it off the board. Nothing is deleted.'))}">${esc(tr('Clear'))}</button>`) : ''}
     </div>
     ${app.steering.has(t.id) ? `<div class="steer">
-      <textarea class="field" rows="2" data-draft="s:${attr(t.id)}" placeholder="Message to the Crew — course correction, extra context, a constraint…"></textarea>
-      <div><button class="btn primary sm" data-act="steer-send" data-id="${attr(t.id)}">Send to Crew</button></div>
+      <textarea class="field" rows="2" data-draft="s:${attr(t.id)}" placeholder="${attr(tr('Message to the Crew — course correction, extra context, a constraint…'))}"></textarea>
+      <div><button class="btn primary sm" data-act="steer-send" data-id="${attr(t.id)}">${esc(tr('Send to Crew'))}</button></div>
     </div>` : ''}
   </article>`;
 }
 
 /* ---- 3. diff -------------------------------------------------------------- */
 function renderDiff() {
-  if (!app.loaded) return '<div class="skeleton">Loading…</div>';
+  if (!app.loaded) return `<div class="skeleton">${esc(tr('Loading…'))}</div>`;
   if (app.tasks.length === 0) {
-    return `<div class="empty"><div class="ring" aria-hidden="true"></div><h3>Nothing to review</h3>
-      <p>When a Crew changes code, its diff shows up here — no click-through to anywhere else.</p></div>`;
+    return `<div class="empty"><div class="ring" aria-hidden="true"></div><h3>${esc(tr('Nothing to review'))}</h3>
+      <p>${esc(tr('When a Crew changes code, its diff shows up here — no click-through to anywhere else.'))}</p></div>`;
   }
   const order = boardTasks().slice().sort((a, b) => {
     const rank = (t) => (t.worktree ? 0 : 1);
@@ -1109,27 +1360,27 @@ function renderDiff() {
   const rail = order.map((t) => `
     <button class="rail-item" data-act="select-task" data-id="${attr(t.id)}" style="${sc(t.state)}" aria-current="${t.id === app.selected}">
       <span class="t">${esc(truncate(t.title, 60))}</span>
-      <span class="s"><span class="dot"></span>${esc(STATE_LABEL[t.state] || t.state)} · ${esc(projectName(t.projectId))}</span>
+      <span class="s"><span class="dot"></span>${esc(stateLabel(t.state))} · ${esc(projectName(t.projectId))}</span>
     </button>`).join('');
 
   const task = app.tasks.find((t) => t.id === app.selected);
   let pane;
-  if (!task) pane = '<div class="skeleton">Select a task.</div>';
+  if (!task) pane = `<div class="skeleton">${esc(tr('Select a task.'))}</div>`;
   else if (app.diff.id !== task.id || app.diff.loading) {
-    pane = '<div class="skeleton">Reading the worktree…</div>';
+    pane = `<div class="skeleton">${esc(tr('Reading the worktree…'))}</div>`;
     if (app.diff.id !== task.id) loadDiff(task.id);
   } else if (app.diff.error) {
-    pane = `<div class="empty"><h3>Could not read the diff</h3><p>${esc(app.diff.error)}</p></div>`;
+    pane = `<div class="empty"><h3>${esc(tr('Could not read the diff'))}</h3><p>${esc(app.diff.error)}</p></div>`;
   } else if (!app.diff.data || !app.diff.data.diff) {
-    const reason = (app.diff.data && app.diff.data.reason) || 'nothing to show yet';
-    pane = `<div class="empty"><div class="ring" aria-hidden="true"></div><h3>No diff</h3><p>${esc(reason)}.</p>
+    const reason = (app.diff.data && app.diff.data.reason) || tr('nothing to show yet');
+    pane = `<div class="empty"><div class="ring" aria-hidden="true"></div><h3>${esc(tr('No diff'))}</h3><p>${esc(reason)}.</p>
       ${app.diff.data && app.diff.data.path ? `<p class="hint mono">${esc(app.diff.data.path)}</p>` : ''}</div>`;
   } else {
     pane = renderDiffBody(task, app.diff.data);
   }
 
   return `<div class="diff-wrap">
-    <aside class="card rail" aria-label="Tasks">${rail}</aside>
+    <aside class="card rail" aria-label="${attr(tr('Tasks'))}">${rail}</aside>
     <div class="card diff-pane">${pane}</div>
   </div>`;
 }
@@ -1145,12 +1396,12 @@ function renderDiffBody(task, data) {
   const head = `<div class="diff-head">
     <strong>${esc(task.title)}</strong>
     <span class="chip ${live ? 'pulse' : ''}" style="${sc(task.state)}" data-state><span class="dot"></span>${esc(STATE_LABEL[task.state] || task.state)}</span>
-    <span class="dim num">${files.length} file${files.length === 1 ? '' : 's'}</span>
+    <span class="dim num">${esc(nOf(files.length, 'file', 'files', '个文件'))}</span>
     <span class="stat-add num">+${adds}</span><span class="stat-del num">−${dels}</span>
-    ${data.base ? `<span class="path">vs ${esc(data.base)}</span>` : ''}
-    ${live ? `<span class="dim" title="A working Crew rewrites its worktree constantly; this pane re-reads it on the same tick the board uses.">auto</span>` : ''}
-    <button class="btn ghost sm" data-act="toggle-all" style="margin-left:auto">${allOpen ? 'Collapse all' : 'Expand all'}</button>
-    <button class="btn ghost sm" data-act="reload-diff">Reload</button>
+    ${data.base ? `<span class="path">${esc(tr('vs {0}', data.base))}</span>` : ''}
+    ${live ? `<span class="dim" title="${attr(tr('A working Crew rewrites its worktree constantly; this pane re-reads it on the same tick the board uses.'))}">${esc(tr('auto'))}</span>` : ''}
+    <button class="btn ghost sm" data-act="toggle-all" style="margin-left:auto">${esc(allOpen ? tr('Collapse all') : tr('Expand all'))}</button>
+    <button class="btn ghost sm" data-act="reload-diff">${esc(tr('Reload'))}</button>
   </div>`;
 
   const body = files.map((f, i) => {
@@ -1164,12 +1415,12 @@ function renderDiffBody(task, data) {
     </div>`;
     const lines = open
       ? `<div class="lines">${f.hunks.map(hunkHtml).join('')}</div>`
-      : `<div class="collapsed-note">${f.lines} line${f.lines === 1 ? '' : 's'} — click to expand.</div>`;
+      : `<div class="collapsed-note">${esc(tr('{0} lines — click to expand.', f.lines))}</div>`;
     return `<section class="file" data-i="${i}">${bar}${lines}</section>`;
   }).join('');
 
-  return head + (files.length ? body : '<div class="collapsed-note">Diff produced no file sections.</div>')
-    + (data.truncated ? '<div class="collapsed-note">Diff was truncated by the server — open the worktree for the rest.</div>' : '');
+  return head + (files.length ? body : `<div class="collapsed-note">${esc(tr('Diff produced no file sections.'))}</div>`)
+    + (data.truncated ? `<div class="collapsed-note">${esc(tr('Diff was truncated by the server — open the worktree for the rest.'))}</div>` : '');
 }
 
 function hunkHtml(h) {
@@ -1244,7 +1495,11 @@ async function loadDiff(id, quiet) {
     const data = await api('/api/diff/' + encodeURIComponent(id));
     if (app.diff.id !== id && !quiet) return;
     if (quiet && app.selected !== id) return;
+    // Same rule as the feed: a poll that returns what is already on screen is
+    // not a reason to rebuild the pane the captain is reading.
+    const unchanged = quiet && app.diff.data && app.diff.data.diff === data.diff;
     app.diff = { id, loading: false, data, error: null };
+    if (unchanged) return;
   } catch (err) {
     if (quiet) return;
     if (app.diff.id !== id) return;
@@ -1313,11 +1568,11 @@ function buildTimeline() {
 }
 
 function renderTimeline() {
-  if (!app.loaded) return '<div class="skeleton">Loading…</div>';
+  if (!app.loaded) return `<div class="skeleton">${esc(tr('Loading…'))}</div>`;
   const { rows, now } = buildTimeline();
   if (!rows.length) {
-    return `<div class="empty"><div class="ring" aria-hidden="true"></div><h3>No history yet</h3>
-      <p>Once tasks run, this shows where the fleet ran in parallel, where it serialized, and where it waited on you.</p></div>`;
+    return `<div class="empty"><div class="ring" aria-hidden="true"></div><h3>${esc(tr('No history yet'))}</h3>
+      <p>${esc(tr('Once tasks run, this shows where the fleet ran in parallel, where it serialized, and where it waited on you.'))}</p></div>`;
   }
   const t0 = rows.reduce((m, r) => Math.min(m, r.start), Infinity);
   const t1 = Math.max(rows.reduce((m, r) => Math.max(m, r.end), -Infinity), now);
@@ -1351,12 +1606,12 @@ function renderTimeline() {
       const left = pct(s.from), right = pct(s.to);
       const w = Math.max(0.25, right - left);
       return `<div class="tl-seg" style="${sc(s.state)};left:${left.toFixed(3)}%;width:${w.toFixed(3)}%"
-        title="${attr((STATE_LABEL[s.state] || s.state) + ' · ' + dur(s.to - s.from) + ' · ' + clock(s.from))}"></div>`;
+        title="${attr((stateLabel(s.state)) + ' · ' + dur(s.to - s.from) + ' · ' + clock(s.from))}"></div>`;
     }).join('');
     return `<div class="tl-row">
       <div class="tl-label" style="${sc(r.state)}">
-        <span class="end" title="${attr(STATE_LABEL[r.state] || r.state)}"></span>
-        <button data-act="open-diff" data-id="${attr(r.task.id)}" title="${attr(r.task.title + ' — ' + (STATE_LABEL[r.state] || r.state))}">${esc(truncate(r.task.title, 40))}</button>
+        <span class="end" title="${attr(stateLabel(r.state))}"></span>
+        <button data-act="open-diff" data-id="${attr(r.task.id)}" title="${attr(r.task.title + ' — ' + (stateLabel(r.state)))}">${esc(truncate(r.task.title, 40))}</button>
       </div>
       <div class="tl-track"><div class="tl-grid">${grid}</div>${segs}
         <div class="tl-now" style="left:${pct(now).toFixed(3)}%"></div></div>
@@ -1364,13 +1619,13 @@ function renderTimeline() {
   }).join('');
 
   const legend = STATES.filter((s) => rows.some((r) => r.segs.some((g) => g.state === s)))
-    .map((s) => `<span><i style="${sc(s)};background:var(--sc)"></i>${esc(STATE_LABEL[s] || s)}</span>`).join('');
+    .map((s) => `<span><i style="${sc(s)};background:var(--sc)"></i>${esc(stateLabel(s))}</span>`).join('');
 
-  return `<div class="section-head"><h2>Timeline</h2><span class="count">${rows.length} tasks · ${dur(t1 - t0)} span</span></div>
+  return `<div class="section-head"><h2>${esc(tr('Timeline'))}</h2><span class="count">${esc(tr('{0} tasks · {1} span', rows.length, dur(t1 - t0)))}</span></div>
     <div class="tl-insight">
-      <span>peak parallel crew <b>${peak}</b></span>
-      <span>waited on you <b>${dur(waited)}</b></span>
-      <span>first dispatch <b>${esc(clock(t0))}</b></span>
+      <span>${esc(tr('peak parallel crew'))} <b>${peak}</b></span>
+      <span>${esc(tr('waited on you'))} <b>${dur(waited)}</b></span>
+      <span>${esc(tr('first dispatch'))} <b>${esc(clock(t0))}</b></span>
     </div>
     <div class="tl-legend">${legend}</div>
     <div class="card tl-scroll" style="padding:12px 14px">
@@ -1458,6 +1713,7 @@ document.addEventListener('click', (ev) => {
   if (!node) return;
   const { act, id, view, key, answer: ans } = node.dataset;
   if (act === 'tab') { setView(view); return; }
+  if (act === 'lang') { setLang(app.lang === 'zh' ? 'en' : 'zh'); return; }
   if (act === 'answer') { answer(id, ans); return; }
   if (act === 'answer-free') { answer(id, (app.drafts.get('d:' + id) || '').trim()); return; }
   if (act === 'ctx') { app.expandedContext.has(id) ? app.expandedContext.delete(id) : app.expandedContext.add(id); paint(); return; }
@@ -1518,7 +1774,11 @@ async function refreshDetail() {
     // window a captain is reading.
     app.detail = { id, data: app.detail.data, loading: false, error: err.message };
   }
-  paint();
+  // NOT `paint()`. A full repaint every two seconds rebuilt the view behind the
+  // window and re-ran the overlay's entry animation with it, so the captain saw
+  // the whole page flash on a timer. The window updates itself; nothing else
+  // has moved.
+  renderDetail();
 }
 
 /* Faster than the board, because this is the pane you open BECAUSE you want to
@@ -1531,15 +1791,15 @@ function detailFeed(events) {
   for (const e of events) {
     let cls = 'ev', line = null;
     if (e.type === 'crew.tool_use') { cls = 'ev tool'; line = e.name + (e.inputPreview ? ' · ' + e.inputPreview : ''); }
-    else if (e.type === 'crew.tool_result') { cls = 'ev res'; line = truncate(e.resultPreview || '(no output)', 400); }
+    else if (e.type === 'crew.tool_result') { cls = 'ev res'; line = truncate(e.resultPreview || tr('(no output)'), 400); }
     else if (e.type === 'crew.text') { cls = 'ev say'; line = e.text; }
-    else if (e.type === 'crew.thinking') { cls = 'ev dimline'; line = 'thinking…'; }
-    else if (e.type === 'crew.usage') { cls = 'ev dimline'; line = tokens(usageOf(e)) + ' tokens · ' + (e.model || ''); }
-    else if (e.type === 'crew.spawned') { cls = 'ev mark'; line = 'crew spawned'; }
-    else if (e.type === 'crew.exited') { cls = 'ev mark'; line = 'crew exited' + (e.reason ? ' · ' + e.reason : ''); }
-    else if (e.type === 'sentinel.started') { cls = 'ev mark'; line = 'sentinel reviewing the diff'; }
-    else if (e.type === 'sentinel.verdict') { cls = 'ev mark'; line = (e.pass ? 'verdict: pass — ' : 'verdict: fail — ') + e.reasoning; }
-    else if (e.type === 'task.state_changed') { cls = 'ev mark'; line = (STATE_LABEL[e.from] || e.from) + ' → ' + (STATE_LABEL[e.to] || e.to) + (e.reason ? ' · ' + e.reason : ''); }
+    else if (e.type === 'crew.thinking') { cls = 'ev dimline'; line = tr('thinking…'); }
+    else if (e.type === 'crew.usage') { cls = 'ev dimline'; line = tokens(usageOf(e)) + ' ' + tr('tokens') + ' · ' + (e.model || ''); }
+    else if (e.type === 'crew.spawned') { cls = 'ev mark'; line = tr('crew spawned'); }
+    else if (e.type === 'crew.exited') { cls = 'ev mark'; line = tr('crew exited') + (e.reason ? ' · ' + e.reason : ''); }
+    else if (e.type === 'sentinel.started') { cls = 'ev mark'; line = tr('sentinel reviewing the diff'); }
+    else if (e.type === 'sentinel.verdict') { cls = 'ev mark'; line = (e.pass ? tr('verdict: pass — ') : tr('verdict: fail — ')) + e.reasoning; }
+    else if (e.type === 'task.state_changed') { cls = 'ev mark'; line = (stateLabel(e.from)) + ' → ' + (stateLabel(e.to)) + (e.reason ? ' · ' + e.reason : ''); }
     else if (e.type === 'task.failed') { cls = 'ev fail'; line = e.reason || 'failed'; }
     if (!line) continue;
     rows.push(`<div class="${cls}"><span class="at">${esc(clock(e.at))}</span><span class="tx">${esc(line)}</span></div>`);
@@ -1551,60 +1811,98 @@ function usageOf(e) {
   return (e.inputTokens || 0) + (e.outputTokens || 0) + (e.cacheReadTokens || 0) + (e.cacheCreationTokens || 0);
 }
 
+/**
+ * Draw the window, and then STOP DRAWING IT.
+ *
+ * The first version rebuilt `innerHTML` on every call. Three things made that
+ * visible rather than merely wasteful: `.modal-back` carries an entry animation,
+ * so every rebuild re-ran the fade; the feed lost its scroll position; and the
+ * elapsed time ticks every second, so no cheap "did anything change" test could
+ * ever answer no. The shell is now built once per open, and only the two things
+ * that actually move are written again.
+ */
 function renderDetail() {
   const host = el('detail');
   if (!host) return;
-  if (!app.detail.id) { if (host.innerHTML) host.innerHTML = ''; return; }
+  if (!app.detail.id) {
+    if (host.innerHTML) { host.innerHTML = ''; host.dataset.taskId = ''; host.dataset.feed = ''; }
+    return;
+  }
 
   const d = app.detail.data;
   const t = (d && d.task) || app.tasks.find((x) => x.id === app.detail.id);
   if (!t) {
     host.innerHTML = `<div class="modal-back" data-act="close-detail"><div class="modal card">
-      <div class="modal-head"><strong>Loading…</strong>
-      <button class="btn ghost sm" data-act="close-detail" style="margin-left:auto">Close</button></div></div></div>`;
+      <div class="modal-head"><strong>${esc(tr('Loading…'))}</strong>
+      <button class="btn ghost sm" data-act="close-detail" style="margin-left:auto">${esc(tr('Close'))}</button></div></div></div>`;
+    host.dataset.taskId = '';
     return;
   }
 
   const live = ACTIVE.has(t.state);
   const feed = d ? detailFeed(d.events || []) : [];
   const elapsed = TERMINAL.has(t.state)
-    ? 'ran ' + dur((t.updatedAt || t.createdAt) - t.createdAt)
+    ? tr('ran {0}', dur((t.updatedAt || t.createdAt) - t.createdAt))
     : dur(app.now - (t.createdAt || app.now));
   // The command is offered, never run for them: attaching puts a keyboard on a
   // live Crew's composer, and that is the captain's decision to make.
   const attach = t.crewId ? 'tmux -L bluespace attach -t blue:=blue-' + String(t.crewId).slice(0, 8) : null;
 
-  host.innerHTML = `<div class="modal-back" data-act="close-detail">
+  const shell = `<div class="modal-back" data-act="close-detail">
     <div class="modal card" role="dialog" aria-modal="true">
       <div class="modal-head">
-        <span class="chip ${live ? 'pulse' : ''}" style="${sc(t.state)}"><span class="dot"></span>${esc(STATE_LABEL[t.state] || t.state)}</span>
+        <span class="chip ${live ? 'pulse' : ''}" style="${sc(t.state)}"><span class="dot"></span>${esc(stateLabel(t.state))}</span>
         <strong>${esc(t.title)}</strong>
         <span class="dim">${esc(projectName(t.projectId))}</span>
-        <button class="btn ghost sm" data-act="close-detail" style="margin-left:auto">Close</button>
+        <button class="btn ghost sm" data-act="close-detail" style="margin-left:auto">${esc(tr('Close'))}</button>
       </div>
-      <div class="modal-facts">
-        <span>tokens <b>${tokens(taskTokens(t.id))}</b></span>
-        <span>${esc(elapsed)}</span>
-        ${t.reworkCount > 0 ? `<span>rework <b>${t.reworkCount}</b></span>` : ''}
-        <span>${feed.length} event${feed.length === 1 ? '' : 's'}</span>
-        ${app.detail.error ? `<span class="warn" title="${attr(app.detail.error)}">poll failed — showing the last good read</span>` : ''}
-      </div>
-      ${t.worktree ? `<div class="modal-path mono" data-act="copy" data-copy="${attr(t.worktree)}" title="Click to copy">${esc(t.worktree)}</div>` : ''}
-      ${attach ? `<div class="modal-path mono" data-act="copy" data-copy="${attr(attach)}" title="Click to copy — attaching gives you a keyboard on a live Crew">${esc(attach)}</div>` : ''}
-      <div class="detail-feed">${feed.length ? feed.join('') : '<div class="collapsed-note">No crew signals yet.</div>'}</div>
+      <div class="modal-facts"></div>
+      ${t.worktree ? `<div class="modal-path mono" data-act="copy" data-copy="${attr(t.worktree)}" title="${attr(tr('Click to copy'))}">${esc(t.worktree)}</div>` : ''}
+      ${attach ? `<div class="modal-path mono" data-act="copy" data-copy="${attr(attach)}" title="${attr(tr('Click to copy — attaching gives you a keyboard on a live Crew'))}">${esc(attach)}</div>` : ''}
+      <div class="detail-feed"></div>
       <div class="modal-foot">
-        <button class="btn ghost sm" data-act="open-diff" data-id="${attr(t.id)}">Diff</button>
-        ${!TERMINAL.has(t.state) ? `<button class="btn ghost sm danger" data-act="cancel" data-id="${attr(t.id)}">Cancel</button>` : ''}
-        <span class="dim" style="margin-left:auto">Read-only. Esc closes.</span>
+        <button class="btn ghost sm" data-act="open-diff" data-id="${attr(t.id)}">${esc(tr('Diff'))}</button>
+        ${!TERMINAL.has(t.state) ? `<button class="btn ghost sm danger" data-act="cancel" data-id="${attr(t.id)}">${esc(tr('Cancel'))}</button>` : ''}
+        <span class="dim" style="margin-left:auto">${esc(tr('Read-only. Esc closes.'))}</span>
       </div>
     </div>
   </div>`;
+
+  // Rebuilt only when the window opens, or opens on a different task.
+  if (host.dataset.taskId !== t.id) {
+    host.innerHTML = shell;
+    host.dataset.taskId = t.id;
+    host.dataset.feed = '';
+  }
+
+  // Small, no animation, and genuinely different every second.
+  const facts = host.querySelector('.modal-facts');
+  if (facts) {
+    facts.innerHTML = `<span>${esc(tr('tokens'))} <b>${tokens(taskTokens(t.id))}</b></span>
+      <span>${esc(elapsed)}</span>
+      ${t.reworkCount > 0 ? `<span>${esc(tr('rework'))} <b>${t.reworkCount}</b></span>` : ''}
+      <span>${esc(nOf(feed.length, 'event', 'events', '条事件'))}</span>
+      ${app.detail.error ? `<span class="warn" title="${attr(app.detail.error)}">${esc(tr('poll failed — showing the last good read'))}</span>` : ''}`;
+  }
+
+  // The feed is rewritten only when it has actually grown — otherwise a captain
+  // reading row 3 of 200 is thrown to the bottom by a poll that returned the
+  // same 200 rows. The language is in the signature because switching it
+  // rewrites every line.
+  const node = host.querySelector('.detail-feed');
+  const sig = app.lang + ':' + feed.length;
+  if (node && host.dataset.feed !== sig) {
+    const atBottom = !node.childElementCount || node.scrollHeight - node.clientHeight - node.scrollTop < 40;
+    node.innerHTML = feed.length ? feed.join('') : `<div class="collapsed-note">${esc(tr('No crew signals yet.'))}</div>`;
+    if (atBottom) node.scrollTop = node.scrollHeight;
+    host.dataset.feed = sig;
+  }
 }
 
 function copyText(text) {
   if (!text) return;
-  const done = () => toast('Copied');
-  if (navigator.clipboard) navigator.clipboard.writeText(text).then(done, () => toast('Could not copy', 'err'));
+  const done = () => toast(tr('Copied'));
+  if (navigator.clipboard) navigator.clipboard.writeText(text).then(done, () => toast(tr('Could not copy'), 'err'));
 }
 
 /** Every file of the selected diff, open or closed together. */
@@ -1675,14 +1973,16 @@ document.addEventListener('visibilitychange', () => {
 setInterval(() => { if (!document.hidden) loadHelm(); }, 15000);
 
 /* ---- boot ----------------------------------------------------------------- */
+app.lang = detectLang();
+document.documentElement.lang = app.lang === 'zh' ? 'zh-CN' : 'en';
 applyHash();
 loadState()
   .then(loadEvents)
   .then(() => { connect(); paint(); loadHelm(); })
   .catch((err) => {
     setConn('down');
-    el('view-inbox').innerHTML = `<div class="empty"><h3>Cannot reach the Starmap server</h3>
-      <p>${esc(err.message)}</p><p class="hint">Retrying every 3 seconds.</p></div>`;
+    el('view-inbox').innerHTML = `<div class="empty"><h3>${esc(tr('Cannot reach the Starmap server'))}</h3>
+      <p>${esc(err.message)}</p><p class="hint">${esc(tr('Retrying every 3 seconds.'))}</p></div>`;
     startPolling();
   });
 </script>
