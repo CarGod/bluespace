@@ -432,6 +432,12 @@ main { padding: 20px max(16px, env(safe-area-inset-left)) 64px max(16px, env(saf
 .detail-feed .dimline .tx { color: var(--text-3); }
 .detail-feed .mark .tx { color: var(--accent); }
 .detail-feed .fail .tx { color: var(--s-failed); }
+.group.quiet .section-head h2 { color: var(--text-3) !important; }
+.group.quiet .section-head { opacity: .72; }
+.slot-empty {
+  padding: 9px 12px; border: 1px dashed var(--border); border-radius: var(--radius-sm);
+  color: var(--text-3); font-size: 12px;
+}
 .board-foot { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 4px 2px 2px; font-size: 12px; color: var(--text-3); }
 
 .toasts { position: fixed; bottom: 16px; right: 16px; z-index: 100; display: grid; gap: 8px; max-width: min(380px, calc(100vw - 32px)); }
@@ -498,6 +504,26 @@ const STATE_LABEL = {
   queued: 'Queued', dispatched: 'Dispatched', working: 'Working',
   awaiting_decision: 'Awaiting you', verifying: 'Verifying', needs_rework: 'Needs rework',
   ready: 'Ready', landed: 'Landed', failed: 'Failed', cancelled: 'Cancelled',
+};
+/**
+ * What each state MEANS, one line, on the column header.
+ *
+ * The board draws all ten whether or not anything is in them, so the empty ones
+ * are the vocabulary: a captain who has never seen `needs_rework` should be able
+ * to find out what it would mean without leaving the page. Taken from the
+ * lifecycle diagram in src/types/domain.ts — keep them in step.
+ */
+const STATE_HELP = {
+  queued: 'Created and waiting — for its dependencies to land, or for a free crew slot. Nothing has run yet.',
+  dispatched: 'Its worktree is cut and a Claude Code session is starting. No work done yet.',
+  working: 'A Crew is running in its own worktree right now.',
+  awaiting_decision: 'Stopped on a question only you can answer. Nothing moves until you do — see the Inbox.',
+  verifying: 'The Crew is finished; the Sentinel is reading the diff against the brief.',
+  needs_rework: 'The Sentinel sent it back. The same Crew gets another pass, up to maxRework.',
+  ready: 'Verified and waiting to be landed.',
+  landed: 'Verification is over and the branch is merged into blue/dev. NOT pushed, and not in main — that is a pull request you open by hand.',
+  failed: 'It ended without a deliverable: the Crew died, the Sentinel refused it, or a ceiling stopped it. The worktree is still there.',
+  cancelled: 'You stopped it.',
 };
 const STATE_VAR = {
   queued: '--s-queued', dispatched: '--s-dispatched', working: '--s-working',
@@ -965,12 +991,6 @@ function renderInbox() {
 /* ---- 2. fleet ------------------------------------------------------------- */
 function renderFleet() {
   if (!app.loaded) return '<div class="skeleton">Loading…</div>';
-  if (app.tasks.length === 0) {
-    // Same correction as the inbox: an empty fleet is not an idle machine.
-    return `<div class="empty"><div class="ring" aria-hidden="true"></div><h3>No tasks yet</h3>
-      <p>Helm creates tasks; the orchestrator dispatches them. Everything the fleet does will appear here.</p></div>`
-      + renderHelm();
-  }
   const map = taskById();
   const activity = lastActivity();
   const dependents = new Map();
@@ -980,13 +1000,19 @@ function renderFleet() {
   }
 
   const shown = boardTasks();
+  // EVERY state, every time. An absent column reads as "this cannot happen
+  // here"; a column showing 0 reads as "nothing is here right now", which is the
+  // true statement and the one that makes the lifecycle legible — the captain
+  // can see that `needs_rework` and `awaiting_decision` exist before the first
+  // time one of them is holding up their work.
   const groups = STATES.map((state) => {
     const list = shown.filter((t) => t.state === state)
       .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
-    if (!list.length) return '';
-    const cards = list.map((t) => taskCard(t, map, dependents, activity)).join('');
-    return `<section class="group">
-      <div class="section-head">
+    const cards = list.length
+      ? list.map((t) => taskCard(t, map, dependents, activity)).join('')
+      : `<div class="slot-empty">none</div>`;
+    return `<section class="group${list.length ? '' : ' quiet'}">
+      <div class="section-head" title="${attr(STATE_HELP[state] || '')}">
         <h2 style="${sc(state)};color:var(--sc)">${esc(STATE_LABEL[state] || state)}</h2>
         <span class="count">${list.length}</span>
       </div>
@@ -1005,9 +1031,13 @@ function renderFleet() {
         <span class="dim">Clearing a card hides it here. Nothing is deleted: the task, its worktree and its branch stay exactly where they are, and <span class="mono">blue ps</span> still lists it.</span>
       </div>` : '';
 
-  const board = groups || `<div class="empty"><div class="ring" aria-hidden="true"></div><h3>Board cleared</h3>
-    <p>Every task has been taken off the board. Nothing was deleted.</p></div>`;
-  return `<div class="board">${board}${cleared}</div>`;
+  // Kept above the board rather than instead of it: a captain looking at their
+  // first empty fleet should see both what will appear here and where.
+  const nothing = app.tasks.length === 0
+    ? `<div class="empty"><div class="ring" aria-hidden="true"></div><h3>No tasks yet</h3>
+        <p>Helm creates tasks; the orchestrator dispatches them. Everything the fleet does will appear here.</p></div>`
+    : '';
+  return nothing + `<div class="board">${groups}${cleared}</div>` + (app.tasks.length === 0 ? renderHelm() : '');
 }
 
 function taskCard(t, map, dependents, activity) {

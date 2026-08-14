@@ -58,6 +58,27 @@ export type TaskState =
   | 'failed'
   | 'cancelled';
 
+/**
+ * Every state a task can be in, in lifecycle order.
+ *
+ * Exported because more than one surface has to enumerate them and they must not
+ * drift: the Starmap board draws a column per state whether or not anything is
+ * in it, and a state missing from that list would be a state the captain never
+ * learns exists until it is holding up their work.
+ */
+export const TASK_STATES: readonly TaskState[] = [
+  'queued',
+  'dispatched',
+  'working',
+  'awaiting_decision',
+  'verifying',
+  'needs_rework',
+  'ready',
+  'landed',
+  'failed',
+  'cancelled',
+] as const;
+
 /** States from which no further work happens without a new dispatch. */
 export const TERMINAL_TASK_STATES: readonly TaskState[] = [
   'landed',
